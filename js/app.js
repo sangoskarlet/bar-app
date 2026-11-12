@@ -9,6 +9,7 @@
 //    Фото уборки — зона, фото с камеры (сжимаются на телефоне)
 //    ТТК         — список коктейлей с поиском, карточка с фото (работает офлайн)
 //    Инвентаризация — место → категория → вид → позиция → полные + остаток
+//    Переработка — акты: простые (было/стало) и по рецепту (ключевое → пересчёт)
 //    Очередь     — что ещё не отправлено, что отклонено, история
 // =====================================================================
 
@@ -239,6 +240,7 @@ function screenHome() {
       tile('📸', 'Фото уборки', () => go(screenPhoto)),
       tile('📖', 'ТТК', () => go(screenTtkList)),
       tile('📋', 'Инвентаризация', () => go(screenInventory)),
+      tile('⚖️', 'Переработка', () => go(screenActs)),
     ),
   );
 }
@@ -712,12 +714,134 @@ function screenInvCount(item) {
 }
 
 // =====================================================================
+//  АКТЫ ПЕРЕРАБОТКИ
+//  Простые: было → стало (мята без веточек, лимоны → фреш), выход в %.
+//  По рецепту: вводишь ключевое сырьё — остальное пересчитывается
+//  по пропорции рецепта (цифры можно поправить), «стало» — по факту.
+// =====================================================================
+
+/** Аккуратное округление для пересчитанных количеств. */
+function smartRound(v) {
+  if (!isFinite(v)) return '';
+  if (v >= 100) return Math.round(v);
+  if (v >= 10) return Math.round(v * 10) / 10;
+  if (v >= 1) return Math.round(v * 100) / 100;
+  return Number(v.toPrecision(2));
+}
+
+function screenActs() {
+  const root = h('main', { class: 'screen' }, header('Переработка'));
+  const acts = config.acts || [];
+  const search = h('input', { type: 'search', placeholder: 'Поиск: мята, фреш, кордиал…', class: 'search' });
+  const list = h('div', {});
+  function draw() {
+    const q = search.value.trim().toLowerCase();
+    const found = acts.filter(a => !q || a.name.toLowerCase().includes(q) ||
+      a.inputs.some(i => i.item.toLowerCase().includes(q)));
+    if (!found.length) { list.replaceChildren(h('p', { class: 'hint' }, acts.length ? 'Ничего не найдено' : 'Шаблонов пока нет')); return; }
+    const groups = [['простой', 'Простые: было → стало'], ['по рецепту', 'По рецепту']];
+    list.replaceChildren(...groups.map(([type, title]) => {
+      const arr = found.filter(a => (a.type === 'по рецепту' ? 'по рецепту' : 'простой') === type);
+      return arr.length ? h('div', {}, h('p', { class: 'group' }, title),
+        ...arr.map(a => h('button', { class: 'row', onclick: () => go(screenAct, a) },
+          h('span', {}, a.name), h('span', { class: 'muted' }, a.output.unit)))) : null;
+    }));
+  }
+  search.addEventListener('input', draw);
+  draw();
+  root.append(search, list);
+  return root;
+}
+
+function screenAct(act) {
+  const isRecipe = act.type === 'по рецепту';
+  const key = act.inputs.find(i => i.key) || act.inputs[0];
+  const others = act.inputs.filter(i => i !== key);
+  const root = h('main', { class: 'screen' }, header(act.name));
+
+  // Поля ввода
+  const keyInput = h('input', { type: 'text', inputmode: 'decimal', placeholder: '0', class: 'qty big' });
+  const outInput = h('input', { type: 'text', inputmode: 'decimal', placeholder: '0', class: 'qty big' });
+  let outDirty = false;
+  const otherInputs = others.map(i => {
+    const el = h('input', { type: 'text', inputmode: 'decimal', placeholder: '0', class: 'qty' });
+    el.dataset.dirty = '';
+    el.addEventListener('input', () => { el.dataset.dirty = '1'; });
+    return el;
+  });
+  const info = h('p', { class: 'total' });
+
+  // Пересчёт по ключевому сырью
+  function recalc() {
+    const k = parseQty(keyInput.value);
+    if (isRecipe && key.qty > 0 && k > 0) {
+      const f = k / key.qty;
+      others.forEach((i, idx) => {
+        if (!otherInputs[idx].dataset.dirty && i.qty > 0) otherInputs[idx].value = String(smartRound(i.qty * f)).replace('.', ',');
+      });
+      if (!outDirty && act.output.qty > 0) outInput.value = String(smartRound(act.output.qty * f)).replace('.', ',');
+    }
+    const o = parseQty(outInput.value);
+    if (!isRecipe && k > 0 && o >= 0) info.textContent = `Выход: ${fmtNum(o / k * 100)}%`;
+    else if (isRecipe && key.qty > 0 && k > 0) info.textContent = `Замес: ×${fmtNum(k / key.qty)} от рецепта`;
+    else info.textContent = '';
+  }
+  keyInput.addEventListener('input', recalc);
+  outInput.addEventListener('input', () => { outDirty = true; recalc(); });
+
+  const comment = h('textarea', { rows: '2', placeholder: 'Комментарий (необязательно)' });
+  const saveBtn = h('button', { class: 'primary' }, 'Сохранить акт');
+  saveBtn.addEventListener('click', async () => {
+    const k = parseQty(keyInput.value);
+    const o = parseQty(outInput.value);
+    if (!(k > 0)) return toast(isRecipe ? `Введите: ${key.item}` : 'Введите, сколько было', 'bad');
+    if (!(o > 0)) return toast('Введите, сколько получилось', 'bad');
+    const lines = [{ role: 'Сырьё', item: key.item, unit: key.unit, qty: k }];
+    for (let idx = 0; idx < others.length; idx++) {
+      const v = otherInputs[idx].value.trim();
+      const q = v === '' ? 0 : parseQty(v);
+      if (!(q >= 0)) return toast(`Проверьте: ${others[idx].item}`, 'bad');
+      lines.push({ role: 'Сырьё', item: others[idx].item, unit: others[idx].unit, qty: q });
+    }
+    lines.push({ role: 'Результат', item: act.output.item, unit: act.output.unit, qty: o });
+    saveBtn.disabled = true;
+    await enqueue({ type: 'processing', name: session.name, pin: session.pin, act: act.name, lines, comment: comment.value.trim() });
+    toast('Акт сохранён');
+    back();
+  });
+
+  if (isRecipe) {
+    root.append(
+      key.qty > 0 ? h('p', { class: 'muted' }, `Рецепт рассчитан на ${fmtNum(key.qty)} ${key.unit} «${key.item}»`) : null,
+      h('p', { class: 'label' }, `${key.item}, ${key.unit} — ключевое`), keyInput,
+      others.length ? h('p', { class: 'label' }, 'Остальное сырьё (считается само, можно поправить)') : null,
+      h('div', { class: 'lines' }, ...others.map((i, idx) => h('div', { class: 'act-line' },
+        h('span', {}, i.item), otherInputs[idx], h('span', { class: 'unit' }, i.unit)))),
+      h('p', { class: 'label' }, `Получилось: ${act.output.item}, ${act.output.unit}`), outInput,
+    );
+  } else {
+    root.append(
+      h('p', { class: 'label' }, `Было: ${key.item}, ${key.unit}`), keyInput,
+      h('p', { class: 'label' }, `Стало: ${act.output.item}, ${act.output.unit}`), outInput,
+    );
+  }
+  root.append(info, comment, saveBtn);
+  setTimeout(() => keyInput.focus(), 50);
+  return root;
+}
+
+// =====================================================================
 //  ЭКРАН: ОЧЕРЕДЬ И ИСТОРИЯ
 // =====================================================================
 function describe(r) {
   if (r.type === 'transfer') return `Перенос · ${r.direction} · ${r.item} ${r.qty} ${r.unit}`;
   if (r.type === 'writeoff') return `Списание · ${r.item} ${r.qty} ${r.unit} · ${r.reason}`;
   if (r.type === 'photo') return `Фото уборки · ${r.zone}`;
+  if (r.type === 'processing') {
+    const res = (r.lines || []).find(l => l.role === 'Результат');
+    const first = (r.lines || []).find(l => l.role === 'Сырьё' && l.qty > 0);
+    return `Переработка · ${r.act} · ${first ? first.qty + ' ' + first.unit : ''} → ${res ? res.qty + ' ' + res.unit : ''}`;
+  }
   if (r.type === 'inventory') return `Инвентаризация · ${r.location} · ${r.item} · ${invSummary(r)}`;
   return r.type;
 }

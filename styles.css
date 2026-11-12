@@ -147,6 +147,10 @@ textarea { margin-top: 16px; resize: vertical; }
 .stepper + .chips { margin-top: 16px; }
 .total { font-size: 22px; font-weight: 700; text-align: center; margin: 20px 0 0; color: var(--accent); }
 
+/* Акты переработки */
+.act-line { display: grid; grid-template-columns: 1fr 96px 30px; gap: 8px; align-items: center; }
+.act-line span:first-child { font-size: 15px; }
+
 /* Очередь */
 .qrow { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 10px 14px; margin-bottom: 6px; }
 .qrow p { margin: 2px 0 0; }

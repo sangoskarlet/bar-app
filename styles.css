@@ -1,0 +1,176 @@
+/* =====================================================================
+   ВНЕШНИЙ ВИД
+   Тёмная тема (в баре темно), крупные кнопки под палец, без мелочей.
+   ===================================================================== */
+
+:root {
+  --bg: #14181f;
+  --panel: #1d232d;
+  --panel-2: #262e3a;
+  --line: #333d4b;
+  --text: #eef1f5;
+  --muted: #8d97a5;
+  --accent: #e0a64a;      /* янтарный — как виски */
+  --accent-text: #1a1308;
+  --ok: #4cc38a;
+  --bad: #ef5d5d;
+  --wait: #e0a64a;
+  --radius: 14px;
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body { margin: 0; background: var(--bg); color: var(--text); }
+body {
+  font: 17px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+  padding-bottom: calc(64px + var(--safe-bottom));
+  -webkit-text-size-adjust: 100%;
+}
+button, input, select, textarea { font: inherit; color: inherit; }
+
+.screen { max-width: 560px; margin: 0 auto; padding: 0 16px 24px; padding-top: env(safe-area-inset-top, 0px); }
+
+/* Шапка */
+.top {
+  display: grid; grid-template-columns: 44px 1fr 44px; align-items: center;
+  position: sticky; top: 0; z-index: 5; background: var(--bg);
+  padding: 10px 0; margin-bottom: 8px; border-bottom: 1px solid var(--line);
+}
+.top h1 { margin: 0; font-size: 20px; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.back { background: none; border: 0; font-size: 34px; line-height: 1; padding: 0 8px; color: var(--accent); cursor: pointer; }
+
+.label { margin: 18px 0 8px; color: var(--muted); font-size: 14px; text-transform: uppercase; letter-spacing: .04em; }
+.hint { color: var(--muted); text-align: center; margin: 24px 0; }
+.muted { color: var(--muted); font-size: 14px; margin: 0; }
+.ok-text { color: var(--ok); font-size: 14px; }
+.group { margin: 20px 0 6px; color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: .05em; }
+.group.bad { color: var(--bad); }
+
+/* Кнопки */
+.primary, .secondary, .danger {
+  display: block; width: 100%; min-height: 54px; margin-top: 16px;
+  border-radius: var(--radius); border: 0; font-weight: 600; cursor: pointer;
+}
+.primary { background: var(--accent); color: var(--accent-text); }
+.primary:disabled { opacity: .5; }
+.secondary { background: var(--panel-2); border: 1px solid var(--line); }
+.danger { background: transparent; border: 1px solid var(--bad); color: var(--bad); }
+.link { background: none; border: 0; color: var(--accent); cursor: pointer; padding: 6px; }
+.two { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.two .secondary { margin-top: 0; }
+
+/* Плитки главного экрана */
+.tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
+.tile {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 18px;
+  aspect-ratio: 1 / .85; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 8px; font-size: 17px; font-weight: 600; cursor: pointer;
+}
+.tile .icon { font-size: 40px; }
+.tile:active { background: var(--panel-2); }
+.who { display: flex; justify-content: space-between; align-items: center; color: var(--muted); margin: 4px 0; }
+.who b { color: var(--text); }
+
+/* Кнопки-выбор (направление, причина, зона, имя) */
+.chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 999px;
+  padding: 10px 16px; min-height: 44px; cursor: pointer;
+}
+.chip.on { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+
+/* Поля ввода */
+input[type=text], input[type=search], input[type=password], select, textarea {
+  width: 100%; background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  padding: 12px 14px; min-height: 48px; outline: none;
+}
+input:focus, textarea:focus, select:focus { border-color: var(--accent); }
+textarea { margin-top: 16px; resize: vertical; }
+.pin { margin-top: 18px; font-size: 24px; letter-spacing: .4em; text-align: center; }
+.search { margin-bottom: 8px; }
+
+/* Строки «позиция — количество» */
+.lines { display: flex; flex-direction: column; gap: 8px; }
+.line { display: grid; grid-template-columns: 1fr 86px 34px 36px; gap: 6px; align-items: center; }
+.pick {
+  text-align: left; background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  min-height: 48px; padding: 8px 12px; cursor: pointer; overflow: hidden; text-overflow: ellipsis;
+}
+.pick.empty { color: var(--accent); border-style: dashed; }
+.qty { text-align: center; font-size: 18px; }
+.qty.big { font-size: 24px; }
+.unit { color: var(--muted); font-size: 14px; }
+.x { background: none; border: 0; color: var(--muted); font-size: 18px; cursor: pointer; min-height: 44px; }
+.x-space { width: 36px; }
+
+/* Списки (ТТК, выбор позиции, инвентаризация) */
+.row {
+  display: flex; justify-content: space-between; align-items: center; gap: 12px; width: 100%;
+  text-align: left; background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  padding: 12px 14px; min-height: 52px; margin-bottom: 6px; cursor: pointer;
+}
+.row:active { background: var(--panel-2); }
+
+/* Окно выбора позиции */
+.overlay { position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 50; display: flex; align-items: flex-end; }
+.sheet {
+  background: var(--bg); width: 100%; max-width: 560px; margin: 0 auto; height: 92vh;
+  border-radius: 18px 18px 0 0; display: flex; flex-direction: column; padding-bottom: var(--safe-bottom);
+}
+.sheet-head { display: flex; gap: 8px; padding: 12px 12px 4px; align-items: center; }
+.sheet-head .search { margin: 0; }
+.picker-list { overflow-y: auto; padding: 0 12px 24px; flex: 1; }
+.custom-row { display: grid; grid-template-columns: 1fr 76px 64px; gap: 6px; }
+.custom-row .secondary { margin-top: 0; min-height: 48px; }
+
+/* Фото */
+.previews { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px; }
+.preview { position: relative; }
+.preview img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 10px; display: block; }
+.preview .x { position: absolute; top: 2px; right: 2px; background: rgba(0,0,0,.6); border-radius: 50%; width: 32px; height: 32px; min-height: 0; color: #fff; }
+
+/* ТТК */
+.ttk-photo {
+  background: var(--panel); border-radius: var(--radius); min-height: 180px; display: flex;
+  align-items: center; justify-content: center; color: var(--muted); overflow: hidden; margin-top: 8px;
+}
+.ttk-photo img { width: 100%; display: block; }
+.card { background: var(--panel); border-radius: var(--radius); padding: 4px 16px 16px; margin-top: 12px; }
+.field p { margin: 0; }
+.field .label { margin-top: 14px; margin-bottom: 4px; }
+.ingredients { margin: 0; padding-left: 20px; }
+.ingredients li { margin: 4px 0; }
+
+/* Инвентаризация */
+.stepper { display: grid; grid-template-columns: 64px 1fr 64px; gap: 8px; }
+.stepper .secondary { margin-top: 0; font-size: 26px; }
+.stepper + .chips { margin-top: 16px; }
+.total { font-size: 22px; font-weight: 700; text-align: center; margin: 20px 0 0; color: var(--accent); }
+
+/* Очередь */
+.qrow { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 10px 14px; margin-bottom: 6px; }
+.qrow p { margin: 2px 0 0; }
+.qrow.bad { border-color: var(--bad); }
+.qrow.done { opacity: .7; }
+.qrow .err { color: var(--bad); font-size: 14px; }
+.qbtns { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.qbtns button { min-height: 44px; margin-top: 10px; }
+
+/* Полоска статуса внизу */
+.status {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 20; cursor: pointer;
+  padding: 12px 16px calc(12px + var(--safe-bottom)); text-align: center; font-size: 15px; font-weight: 600;
+  background: var(--panel); border-top: 1px solid var(--line);
+}
+.status.ok { color: var(--ok); }
+.status.wait { color: var(--wait); }
+.status.bad { color: #fff; background: var(--bad); }
+
+/* Всплывающие сообщения */
+.toast {
+  position: fixed; left: 50%; bottom: calc(80px + var(--safe-bottom)); transform: translate(-50%, 20px);
+  background: var(--ok); color: #06210f; padding: 12px 18px; border-radius: 12px; font-weight: 600;
+  opacity: 0; transition: .25s; z-index: 100; max-width: 90vw; text-align: center;
+}
+.toast.bad { background: var(--bad); color: #fff; }
+.toast.show { opacity: 1; transform: translate(-50%, 0); }

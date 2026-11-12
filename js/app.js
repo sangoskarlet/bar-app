@@ -227,19 +227,23 @@ function screenLogin() {
 // =====================================================================
 //  РОЛИ (лист «Сотрудники», столбец «Роль»)
 //  бармен   — всё, кроме инвентаризации Gift-shop
-//  админ    — только перенос, списание и инвентаризация Gift-shop
+//  админ    — только перенос, списание и инвентаризация Gift-shop (Кабинет / Витрина)
 //  менеджер — всё, включая Gift-shop
+//  Места Gift-shop задаются в таблице: «Списки», столбец E.
 // =====================================================================
 const GIFT = 'Gift-shop';
 const roleOf = () => String((session && session.role) || 'бармен').toLowerCase();
 const isAdmin = () => roleOf().startsWith('админ');
 const isManager = () => roleOf().startsWith('менедж');
 
+const giftLocs = () => (config.inventory && config.inventory.giftLocations) || ['Кабинет', 'Витрина'];
+
 /** Что показывать в инвентаризации этому сотруднику: позиции и места. */
 function invScope() {
   const inv = config.inventory || { locations: [], items: [] };
-  if (isAdmin()) return { items: inv.items.filter(it => it.category === GIFT), locations: [GIFT] };
-  if (isManager()) return { items: inv.items, locations: [...inv.locations, GIFT] };
+  const gift = giftLocs();
+  if (isAdmin()) return { items: inv.items.filter(it => it.category === GIFT), locations: gift };
+  if (isManager()) return { items: inv.items, locations: [...inv.locations, ...gift] };
   return { items: inv.items.filter(it => it.category !== GIFT), locations: inv.locations };
 }
 
@@ -750,7 +754,7 @@ function screenInventory() {
   const body = h('div', {});
   const locBox = h('div', { class: 'chips' });
   const scope = invScope();
-  // Одно место (у админа — Gift-shop): не спрашиваем, выбираем сразу
+  // Если место одно — не спрашиваем, выбираем сразу
   if (scope.locations.length > 1) root.append(h('p', { class: 'label' }, 'Где считаете?'), locBox);
   root.append(body);
 
@@ -767,8 +771,9 @@ function screenInventory() {
     if (!loc || !scope.locations.includes(loc)) { body.replaceChildren(h('p', { class: 'hint' }, 'Выберите место')); return; }
 
     const counts = await myCounts(loc);
-    // В Gift-shop считаем только Gift-shop, на барах и складах — всё остальное
-    const here = scope.items.filter(it => (loc === GIFT) === (it.category === GIFT));
+    // В Кабинете и на Витрине считаем только Gift-shop, на барах и складах — всё остальное
+    const isGiftPlace = giftLocs().includes(loc);
+    const here = scope.items.filter(it => isGiftPlace === (it.category === GIFT));
     const voice = voiceButton(() => voiceInventory(here));
     const cats = {};
     here.forEach(it => {

@@ -20,6 +20,7 @@ import {
   enqueue, startAutoSync, onSyncChange, getStatus, syncNow,
   listQueue, listSent, removeFromQueue, retryRejected,
 } from './sync.js';
+import { voiceSupported, listenOnce, voiceErrorText, parseInventoryPhrase, confident, parseCustomPhrase } from './voice.js';
 
 const app = document.getElementById('app');
 const statusEl = document.getElementById('status');
@@ -32,6 +33,15 @@ let session = null;  // { name, pin, role } — кто сейчас работа
 //  h('button', { class: 'big', onclick: fn }, 'Текст')
 //  Текст всегда вставляется как текст (не HTML) — так безопаснее.
 // ---------------------------------------------------------------------
+// Встроенные append/replaceChildren превращают null в текст «null».
+// Убираем пустые элементы, чтобы можно было писать: условие ? кнопка : null
+for (const m of ['append', 'replaceChildren']) {
+  const orig = Element.prototype[m];
+  Element.prototype[m] = function (...kids) {
+    return orig.apply(this, kids.filter(k => k !== null && k !== undefined && k !== false));
+  };
+}
+
 function h(tag, attrs = {}, ...children) {
   const el = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs || {})) {
@@ -543,6 +553,7 @@ function invTotal(item, full, openMl, weight) {
   return Math.round((full * (item.volume || 0) + open) * 10) / 10;
 }
 function invSummary(r) {
+  if (r.category === 'Нет в описи') return `нет в описи, ${r.unit === 'шт' ? r.full : r.openMl} ${r.unit}`;
   const parts = [`полных ${r.full || 0}`];
   if (r.openMl !== null && r.openMl !== undefined) parts.push(`открытая ${r.openMl} мл`);
   if (r.weight !== null && r.weight !== undefined) parts.push(`вес ${r.weight} г`);
@@ -562,6 +573,143 @@ async function myCounts(location) {
     if (item) map.set(r.category + '|' + r.item, invTotal(item, r.full || 0, r.openMl ?? null, r.weight ?? null));
   }
   return map;
+}
+
+// ---------------------------------------------------------------------
+//  Голос в инвентаризации: «Бомбей, две полных, открытая триста пятьдесят»
+// ---------------------------------------------------------------------
+function voiceButton(onclick, text = '🎤 Сказать позицию и количество') {
+  if (!voiceSupported()) {
+    // Браузер не умеет распознавать речь (Firefox, Яндекс Браузер, Opera, некоторые встроенные браузеры)
+    return h('p', { class: 'hint left' }, '🎤 Голосовой ввод в этом браузере не работает. ' +
+      'Откройте приложение в Chrome, Safari или Edge — или пользуйтесь микрофоном на клавиатуре телефона.');
+  }
+  return h('button', { class: 'secondary voice-btn', onclick }, text);
+}
+
+/** Показывает «Слушаю…», ждёт фразу. Возвращает варианты распознавания или null. */
+async function listenWithUi() {
+  if (!voiceSupported()) {
+    toast('Голос здесь не поддерживается — нажмите микрофон на клавиатуре', 'bad');
+    return null;
+  }
+  const overlay = h('div', { class: 'overlay center' },
+    h('div', { class: 'listen' }, h('div', { class: 'mic-pulse' }, '🎤'), h('p', {}, 'Слушаю…'),
+      h('p', { class: 'muted' }, 'Например: «Бомбей, две полных, открытая триста»')));
+  document.body.append(overlay);
+  try {
+    return await listenOnce();
+  } catch (e) {
+    toast(voiceErrorText(e), 'bad');
+    return null;
+  } finally {
+    overlay.remove();
+  }
+}
+
+/** Голосовой поиск позиции среди scopeItems и переход к вводу с подставленными цифрами. */
+async function voiceInventory(scopeItems) {
+  const alts = await listenWithUi();
+  if (!alts) return;
+  // Берём вариант распознавания, где позиция нашлась увереннее всего
+  let best = null;
+  for (const text of alts) {
+    const r = parseInventoryPhrase(text, { items: scopeItems });
+    if (r.candidates.length && (!best || r.candidates[0].score > best.r.candidates[0].score)) best = { text, r };
+  }
+  const heard = alts[0];
+  if (!best) {
+    // Ничего похожего в Описи — предлагаем записать как новую позицию
+    return offerCustom(heard, scopeItems);
+  }
+  const open = (item) => {
+    const q = parseInventoryPhrase(best.text, { item });
+    go(screenInvCount, item, { full: q.full, open: q.open, weight: q.weight, heard: best.text });
+  };
+  if (confident(best.r.candidates)) return open(best.r.candidates[0].item);
+
+  // Не уверены — даём выбрать из похожих
+  const overlay = h('div', { class: 'overlay' });
+  const close = () => overlay.remove();
+  overlay.append(h('div', { class: 'sheet short' },
+    h('div', { class: 'sheet-head' }, h('p', { class: 'label' }, `Услышал: «${best.text}». Что именно?`),
+      h('button', { class: 'x', onclick: close }, '✕')),
+    h('div', { class: 'picker-list' },
+      ...best.r.candidates.map(c => h('button', { class: 'row', onclick: () => { close(); open(c.item); } },
+        h('span', {}, c.item.name), h('span', { class: 'muted' }, c.item.kind || c.item.category))),
+      h('button', { class: 'secondary', onclick: () => {
+        close();
+        go(screenInvCustom, { ...parseCustomPhrase(best.text), heard: best.text });
+      } }, '+ Нет в списке — новая позиция'),
+      h('button', { class: 'secondary', onclick: () => { close(); voiceInventory(scopeItems); } }, '🎤 Сказать ещё раз'))));
+  document.body.append(overlay);
+}
+
+/** Позиция не нашлась голосом: добавить как новую или сказать ещё раз. */
+function offerCustom(heard, scopeItems) {
+  const overlay = h('div', { class: 'overlay' });
+  const close = () => overlay.remove();
+  overlay.append(h('div', { class: 'sheet short' },
+    h('div', { class: 'sheet-head' }, h('p', { class: 'label' }, `Услышал: «${heard}». В описи такого нет.`),
+      h('button', { class: 'x', onclick: close }, '✕')),
+    h('div', { class: 'picker-list' },
+      h('button', { class: 'primary', onclick: () => {
+        close();
+        go(screenInvCustom, { ...parseCustomPhrase(heard), heard });
+      } }, '+ Добавить как новую позицию'),
+      h('button', { class: 'secondary', onclick: () => { close(); voiceInventory(scopeItems); } }, '🎤 Сказать ещё раз'))));
+  document.body.append(overlay);
+}
+
+/**
+ * Позиция, которой нет в Описи (новая или забыли добавить).
+ * Бармен пишет название, выбирает единицу и вводит ОБЩЕЕ количество.
+ * В таблице такие строки собираются на листе «Нет в описи» — менеджер добавит их в Опись.
+ */
+function screenInvCustom(prefill = {}) {
+  const inv = config.inventory;
+  const root = h('main', { class: 'screen' }, header('Нет в описи'));
+  const cap = s => s ? s.charAt(0).toUpperCase() + s.slice(1) : '';
+  const nameInput = h('input', { type: 'text', placeholder: 'Название, например: Джин Монки 47 0,5', value: cap(prefill.name || '') });
+  let unit = prefill.unit || 'мл';
+  const unitBox = h('div', { class: 'chips' });
+  const qtyLabel = h('p', { class: 'label' });
+  const qty = h('input', { type: 'text', inputmode: 'decimal', placeholder: '0', class: 'qty big',
+    value: prefill.amount !== null && prefill.amount !== undefined ? String(prefill.amount).replace('.', ',') : '' });
+  function drawUnits() {
+    unitBox.replaceChildren(...['мл', 'г', 'шт'].map(u => h('button', {
+      class: 'chip' + (u === unit ? ' on' : ''), onclick: () => { unit = u; drawUnits(); },
+    }, u)));
+    qtyLabel.textContent = unit === 'шт' ? 'Сколько штук всего' : `Сколько всего, ${unit} (все бутылки вместе)`;
+  }
+  drawUnits();
+  const comment = h('textarea', { rows: '2', placeholder: 'Комментарий: объём бутылки, где стоит, сколько полных…' });
+  const saveBtn = h('button', { class: 'primary' }, 'Сохранить');
+  saveBtn.addEventListener('click', async () => {
+    const name = nameInput.value.trim();
+    const q = parseQty(qty.value);
+    if (!name) return toast('Введите название', 'bad');
+    if (!(q >= 0)) return toast('Введите количество (можно 0)', 'bad');
+    if (unit === 'шт' && !Number.isInteger(q)) return toast('Штуки — целое число', 'bad');
+    const loc = await db.get('kv', 'invLocation');
+    saveBtn.disabled = true;
+    await enqueue({
+      type: 'inventory', name: session.name, pin: session.pin,
+      session: inv.active, location: loc, category: 'Нет в описи', kind: '', item: name, unit,
+      full: unit === 'шт' ? q : 0, openMl: unit === 'шт' ? null : q, weight: null,
+      comment: comment.value.trim(),
+    });
+    toast('Записано. Менеджер добавит позицию в опись');
+    back();
+  });
+  root.append(
+    prefill.heard ? h('p', { class: 'heard' }, `🎤 «${prefill.heard}» — проверьте название и цифры`) : null,
+    h('p', { class: 'hint left' }, 'Позиции нет в описи? Запишите её здесь — цифра не потеряется, а менеджер потом добавит позицию в опись.'),
+    h('p', { class: 'label' }, 'Название'), nameInput,
+    h('p', { class: 'label' }, 'Единица'), unitBox,
+    qtyLabel, qty, comment, saveBtn);
+  if (!prefill.name) setTimeout(() => nameInput.focus(), 50);
+  return root;
 }
 
 function screenInventory() {
@@ -587,15 +735,18 @@ function screenInventory() {
     if (!loc || !inv.locations.includes(loc)) { body.replaceChildren(h('p', { class: 'hint' }, 'Выберите место')); return; }
 
     const counts = await myCounts(loc);
+    const voice = voiceButton(() => voiceInventory(inv.items));
     const cats = {};
     inv.items.forEach(it => {
       const c = (cats[it.category] = cats[it.category] || { total: 0, done: 0 });
       c.total++;
       if (counts.has(it.category + '|' + it.name)) c.done++;
     });
-    body.replaceChildren(h('p', { class: 'label' }, 'Категория'),
+    const customBtn = h('button', { class: 'secondary', onclick: () => go(screenInvCustom, {}) }, '+ Нет в описи');
+    body.replaceChildren(voice, h('p', { class: 'label' }, 'Категория'),
       ...Object.entries(cats).map(([cat, c]) => h('button', { class: 'row', onclick: () => go(screenInvItems, cat, null) },
-        h('span', {}, cat), h('span', { class: c.done === c.total ? 'ok-text' : 'muted' }, `${c.done} / ${c.total}`))));
+        h('span', {}, cat), h('span', { class: c.done === c.total ? 'ok-text' : 'muted' }, `${c.done} / ${c.total}`))),
+      customBtn);
   }
   draw();
   return root;
@@ -610,7 +761,8 @@ function screenInvItems(category, kind) {
   const root = h('main', { class: 'screen' }, header(title));
   const body = h('div', {});
   const search = h('input', { type: 'search', placeholder: 'Поиск…', class: 'search' });
-  root.append(search, body);
+  const scope = inCat.filter(it => !kind || it.kind === kind);
+  root.append(voiceButton(() => voiceInventory(scope)), search, body);
 
   async function draw() {
     const loc = await db.get('kv', 'invLocation');
@@ -628,7 +780,8 @@ function screenInvItems(category, kind) {
       return;
     }
     const list = inCat.filter(it => (!kind || it.kind === kind) && (!q || it.name.toLowerCase().includes(q)));
-    body.replaceChildren(...(list.length ? list.map(itemRow) : [h('p', { class: 'hint' }, 'Ничего не найдено')]));
+    body.replaceChildren(...(list.length ? list.map(itemRow) : [h('p', { class: 'hint' }, 'Ничего не найдено')]),
+      h('button', { class: 'secondary', onclick: () => go(screenInvCustom, { name: search.value.trim() }) }, '+ Нет в описи'));
 
     function itemRow(it) {
       const key = it.category + '|' + it.name;
@@ -643,12 +796,20 @@ function screenInvItems(category, kind) {
 }
 
 /** Ввод: полные + остаток (мл или вес). Итог считается сразу на экране. */
-function screenInvCount(item) {
+function screenInvCount(item, prefill = null) {
   const inv = config.inventory;
   const canWeigh = item.unit !== 'шт' && item.tare > 0 && (item.unit === 'г' || item.density > 0);
   // Нет объёма тары (фрукты, ПФ, разливное) — «полных бутылок» не бывает, вводим общее количество
   const byBottle = item.unit !== 'шт' && item.volume > 0;
   const state = { full: '', open: '', mode: 'ml' }; // mode: 'ml' | 'weight'
+  const fmtIn = v => (v === null || v === undefined ? '' : String(v).replace('.', ','));
+  function applyVoice(p) {
+    if (!p) return;
+    if (p.full !== null && p.full !== undefined) state.full = fmtIn(p.full);
+    if (p.weight !== null && p.weight !== undefined && canWeigh) { state.mode = 'weight'; state.open = fmtIn(p.weight); }
+    else if (p.open !== null && p.open !== undefined) { state.mode = 'ml'; state.open = fmtIn(p.open); }
+  }
+  applyVoice(prefill);
   const root = h('main', { class: 'screen' }, header(item.name));
 
   const totalEl = h('p', { class: 'total' });
@@ -660,13 +821,13 @@ function screenInvCount(item) {
     totalEl.textContent = `Итого: ${fmtNum(t)} ${item.unit}`;
   }
 
-  const fullInput = h('input', { type: 'text', inputmode: 'numeric', placeholder: '0', class: 'qty big', oninput: e => { state.full = e.target.value; update(); } });
+  const fullInput = h('input', { type: 'text', inputmode: 'numeric', placeholder: '0', class: 'qty big', value: state.full, oninput: e => { state.full = e.target.value; update(); } });
   const stepper = h('div', { class: 'stepper' },
     h('button', { class: 'secondary', onclick: () => { const n = Math.max(0, (parseQty(state.full) || 0) - 1); state.full = String(n); fullInput.value = n; update(); } }, '−'),
     fullInput,
     h('button', { class: 'secondary', onclick: () => { const n = (parseQty(state.full) || 0) + 1; state.full = String(n); fullInput.value = n; update(); } }, '+'));
 
-  const openInput = h('input', { type: 'text', inputmode: 'decimal', placeholder: '0', class: 'qty big', oninput: e => { state.open = e.target.value; update(); } });
+  const openInput = h('input', { type: 'text', inputmode: 'decimal', placeholder: '0', class: 'qty big', value: state.open, oninput: e => { state.open = e.target.value; update(); } });
   const openLabel = h('p', { class: 'label' });
   const modeBox = h('div', { class: 'chips' });
   function drawMode() {
@@ -701,15 +862,28 @@ function screenInvCount(item) {
     back();
   });
 
+  const heardBox = h('p', { class: 'heard' + (prefill && prefill.heard ? '' : ' hidden') },
+    prefill && prefill.heard ? `🎤 «${prefill.heard}» — проверьте цифры` : '');
+  const voiceAgain = voiceButton(async () => {
+    const alts = await listenWithUi();
+    if (!alts) return;
+    const p = parseInventoryPhrase(alts[0], { item });
+    applyVoice(p);
+    fullInput.value = state.full; openInput.value = state.open;
+    drawMode(); update();
+    heardBox.textContent = `🎤 «${alts[0]}» — проверьте цифры`;
+    heardBox.classList.remove('hidden');
+  }, '🎤 Сказать цифры');
   root.append(
     h('p', { class: 'muted' }, [item.category, item.kind, item.volume ? `тара ${item.volume} ${item.unit}` : ''].filter(Boolean).join(' · ')),
+    heardBox, voiceAgain,
     ...(item.unit === 'шт' || byBottle
       ? [h('p', { class: 'label' }, item.unit === 'шт' ? 'Количество, шт' : 'Полных (закрытых)'), stepper] : []),
     ...(item.unit !== 'шт' ? [modeBox, openLabel, openInput] : []),
     totalEl, comment, saveBtn,
   );
   update();
-  setTimeout(() => (item.unit === 'шт' || byBottle ? fullInput : openInput).focus(), 50);
+  if (!prefill) setTimeout(() => (item.unit === 'шт' || byBottle ? fullInput : openInput).focus(), 50);
   return root;
 }
 

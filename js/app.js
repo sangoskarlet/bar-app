@@ -755,54 +755,98 @@ function screenActs() {
 
 function screenAct(act) {
   const isRecipe = act.type === 'по рецепту';
-  const key = act.inputs.find(i => i.key) || act.inputs[0];
-  const others = act.inputs.filter(i => i !== key);
   const root = h('main', { class: 'screen' }, header(act.name));
-
-  // Поля ввода
-  const keyInput = h('input', { type: 'text', inputmode: 'decimal', placeholder: '0', class: 'qty big' });
-  const outInput = h('input', { type: 'text', inputmode: 'decimal', placeholder: '0', class: 'qty big' });
-  let outDirty = false;
-  const otherInputs = others.map(i => {
-    const el = h('input', { type: 'text', inputmode: 'decimal', placeholder: '0', class: 'qty' });
-    el.dataset.dirty = '';
-    el.addEventListener('input', () => { el.dataset.dirty = '1'; });
-    return el;
-  });
+  const numInput = (big) => h('input', { type: 'text', inputmode: 'decimal', placeholder: '0', class: 'qty' + (big ? ' big' : '') });
   const info = h('p', { class: 'total' });
-
-  // Пересчёт по ключевому сырью
-  function recalc() {
-    const k = parseQty(keyInput.value);
-    if (isRecipe && key.qty > 0 && k > 0) {
-      const f = k / key.qty;
-      others.forEach((i, idx) => {
-        if (!otherInputs[idx].dataset.dirty && i.qty > 0) otherInputs[idx].value = String(smartRound(i.qty * f)).replace('.', ',');
-      });
-      if (!outDirty && act.output.qty > 0) outInput.value = String(smartRound(act.output.qty * f)).replace('.', ',');
-    }
-    const o = parseQty(outInput.value);
-    if (!isRecipe && k > 0 && o >= 0) info.textContent = `Выход: ${fmtNum(o / k * 100)}%`;
-    else if (isRecipe && key.qty > 0 && k > 0) info.textContent = `Замес: ×${fmtNum(k / key.qty)} от рецепта`;
-    else info.textContent = '';
-  }
-  keyInput.addEventListener('input', recalc);
-  outInput.addEventListener('input', () => { outDirty = true; recalc(); });
-
   const comment = h('textarea', { rows: '2', placeholder: 'Комментарий (необязательно)' });
   const saveBtn = h('button', { class: 'primary' }, 'Сохранить акт');
+  const outInput = numInput(true);
+  let outDirty = false;
+
+  // ---------- Простой акт: было → стало ----------
+  if (!isRecipe) {
+    const key = act.inputs[0];
+    const keyInput = numInput(true);
+    const recalc = () => {
+      const k = parseQty(keyInput.value), o = parseQty(outInput.value);
+      info.textContent = k > 0 && o >= 0 ? `Выход: ${fmtNum(o / k * 100)}%` : '';
+    };
+    keyInput.addEventListener('input', recalc);
+    outInput.addEventListener('input', recalc);
+    saveBtn.addEventListener('click', async () => {
+      const k = parseQty(keyInput.value), o = parseQty(outInput.value);
+      if (!(k > 0)) return toast('Введите, сколько было', 'bad');
+      if (!(o > 0)) return toast('Введите, сколько стало', 'bad');
+      saveBtn.disabled = true;
+      await enqueue({ type: 'processing', name: session.name, pin: session.pin, act: act.name, comment: comment.value.trim(),
+        lines: [{ role: 'Сырьё', item: key.item, unit: key.unit, qty: k },
+                { role: 'Результат', item: act.output.item, unit: act.output.unit, qty: o }] });
+      toast('Акт сохранён');
+      back();
+    });
+    root.append(
+      h('p', { class: 'label' }, `Было: ${key.item}, ${key.unit}`), keyInput,
+      h('p', { class: 'label' }, `Стало: ${act.output.item}, ${act.output.unit}`), outInput,
+      info, comment, saveBtn);
+    setTimeout(() => keyInput.focus(), 50);
+    return root;
+  }
+
+  // ---------- Акт по рецепту ----------
+  // Для каждого сырья: поле «в дело» (amount) и, если его надо чистить, поле «до чистки» (raw).
+  // Количество в рецепте — это вес «в дело» (для чистки — чистый вес).
+  const key = act.inputs.find(i => i.key) || act.inputs[0];
+  const rows = act.inputs.map(i => {
+    const amount = numInput(i === key);
+    const raw = i.clean ? numInput(false) : null;
+    amount.dataset.dirty = '';
+    amount.addEventListener('input', () => { if (i !== key) amount.dataset.dirty = '1'; });
+    if (i.fixed && i.qty > 0) amount.value = String(i.qty).replace('.', ',');
+    return { i, amount, raw };
+  });
+  const keyRow = rows.find(r => r.i === key);
+
+  function recalc() {
+    const k = parseQty(keyRow.amount.value);
+    if (key.qty > 0 && k > 0) {
+      const f = k / key.qty;
+      rows.forEach(r => {
+        if (r.i === key || r.i.fixed || r.amount.dataset.dirty || !(r.i.qty > 0)) return;
+        r.amount.value = String(smartRound(r.i.qty * f)).replace('.', ',');
+      });
+      if (!outDirty && act.output.qty > 0) outInput.value = String(smartRound(act.output.qty * f)).replace('.', ',');
+      info.textContent = `Замес: ×${fmtNum(k / key.qty)} от рецепта`;
+    } else info.textContent = '';
+    // процент чистки
+    rows.forEach(r => {
+      if (!r.raw) return;
+      const a = parseQty(r.amount.value), w = parseQty(r.raw.value);
+      r.pct.textContent = a > 0 && w > 0 ? `чистый вес: ${fmtNum(a / w * 100)}% от грязного` : '';
+    });
+  }
+  rows.forEach(r => {
+    r.amount.addEventListener('input', recalc);
+    if (r.raw) { r.raw.addEventListener('input', recalc); r.pct = h('p', { class: 'muted' }); }
+  });
+  outInput.addEventListener('input', () => { outDirty = true; });
+
   saveBtn.addEventListener('click', async () => {
-    const k = parseQty(keyInput.value);
-    const o = parseQty(outInput.value);
-    if (!(k > 0)) return toast(isRecipe ? `Введите: ${key.item}` : 'Введите, сколько было', 'bad');
-    if (!(o > 0)) return toast('Введите, сколько получилось', 'bad');
-    const lines = [{ role: 'Сырьё', item: key.item, unit: key.unit, qty: k }];
-    for (let idx = 0; idx < others.length; idx++) {
-      const v = otherInputs[idx].value.trim();
-      const q = v === '' ? 0 : parseQty(v);
-      if (!(q >= 0)) return toast(`Проверьте: ${others[idx].item}`, 'bad');
-      lines.push({ role: 'Сырьё', item: others[idx].item, unit: others[idx].unit, qty: q });
+    const lines = [];
+    for (const r of rows) {
+      const a = r.amount.value.trim() === '' ? 0 : parseQty(r.amount.value);
+      if (!(a >= 0)) return toast(`Проверьте: ${r.i.item}`, 'bad');
+      if (r.i === key && !(a > 0)) return toast(`Введите: ${r.i.item}`, 'bad');
+      if (r.raw) {
+        const w = parseQty(r.raw.value);
+        if (a > 0 && !(w > 0)) return toast(`${r.i.item}: введите вес до чистки`, 'bad');
+        if (a > w) return toast(`${r.i.item}: чистый вес больше, чем до чистки`, 'bad');
+        lines.push({ role: 'Сырьё', item: r.i.item, unit: r.i.unit, qty: a > 0 ? w : 0, clean: a });
+      } else {
+        lines.push({ role: 'Сырьё', item: r.i.item, unit: r.i.unit, qty: a });
+      }
     }
+    const o = parseQty(outInput.value);
+    if (!(o > 0)) return toast('Введите, сколько получилось', 'bad');
     lines.push({ role: 'Результат', item: act.output.item, unit: act.output.unit, qty: o });
     saveBtn.disabled = true;
     await enqueue({ type: 'processing', name: session.name, pin: session.pin, act: act.name, lines, comment: comment.value.trim() });
@@ -810,23 +854,33 @@ function screenAct(act) {
     back();
   });
 
-  if (isRecipe) {
-    root.append(
-      key.qty > 0 ? h('p', { class: 'muted' }, `Рецепт рассчитан на ${fmtNum(key.qty)} ${key.unit} «${key.item}»`) : null,
-      h('p', { class: 'label' }, `${key.item}, ${key.unit} — ключевое`), keyInput,
-      others.length ? h('p', { class: 'label' }, 'Остальное сырьё (считается само, можно поправить)') : null,
-      h('div', { class: 'lines' }, ...others.map((i, idx) => h('div', { class: 'act-line' },
-        h('span', {}, i.item), otherInputs[idx], h('span', { class: 'unit' }, i.unit)))),
-      h('p', { class: 'label' }, `Получилось: ${act.output.item}, ${act.output.unit}`), outInput,
-    );
-  } else {
-    root.append(
-      h('p', { class: 'label' }, `Было: ${key.item}, ${key.unit}`), keyInput,
-      h('p', { class: 'label' }, `Стало: ${act.output.item}, ${act.output.unit}`), outInput,
-    );
-  }
-  root.append(info, comment, saveBtn);
-  setTimeout(() => keyInput.focus(), 50);
+  const block = (r) => {
+    const i = r.i;
+    const tag = i === key ? ' — ключевое' : i.fixed ? ' — постоянно' : '';
+    if (r.raw) {
+      // Одна строка: грязный = чистый. Пропорция считается от чистого веса.
+      r.raw.placeholder = 'грязный';
+      r.amount.placeholder = 'чистый';
+      return h('div', { class: 'clean-block' + (i === key ? ' key' : '') },
+        h('p', { class: 'label' }, `${i.item}${tag}`),
+        h('div', { class: 'clean-line' }, r.raw, h('span', { class: 'arrow' }, '='), r.amount, h('span', { class: 'unit' }, i.unit)),
+        h('div', { class: 'clean-caps' }, h('span', {}, 'грязный'), h('span', {}), h('span', {}, 'чистый (идёт в рецепт)'), h('span', {})),
+        r.pct);
+    }
+    if (i === key) return h('div', {}, h('p', { class: 'label' }, `${i.item}, ${i.unit}${tag}`), r.amount);
+    return h('div', { class: 'act-line' }, h('span', {}, i.item + (i.fixed ? ' · пост.' : '')), r.amount, h('span', { class: 'unit' }, i.unit));
+  };
+  const keyFirst = [keyRow, ...rows.filter(r => r !== keyRow)];
+  const restRows = keyFirst.slice(1);
+  root.append(
+    key.qty > 0 ? h('p', { class: 'muted' }, `Рецепт рассчитан на ${fmtNum(key.qty)} ${key.unit} «${key.item}»${key.clean ? ' (чистый вес)' : ''}`) : null,
+    block(keyRow),
+    restRows.length ? h('p', { class: 'label' }, 'Остальное сырьё (считается само, можно поправить)') : null,
+    h('div', { class: 'lines' }, ...restRows.map(block)),
+    h('p', { class: 'label' }, `Получилось: ${act.output.item}, ${act.output.unit}`), outInput,
+    info, comment, saveBtn);
+  recalc();
+  setTimeout(() => (keyRow.raw || keyRow.amount).focus(), 50);
   return root;
 }
 

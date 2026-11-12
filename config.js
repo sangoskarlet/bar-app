@@ -4,7 +4,7 @@
 
 // Адрес веб-приложения Apps Script. Его выдаёт Google после
 // «Начать развёртывание → Веб-приложение». Заканчивается на /exec
-export const API_URL = 'https://script.google.com/macros/s/AKfycbzRXm4P2dC_xEmSrw4RjAXWk6J-Hav54iHrXK8xddGH9o5NcsdchIKkaZArwGqvAJN7-w/exec';
+export const API_URL = 'ВСТАВЬТЕ_СЮДА_URL_ИЗ_APPS_SCRIPT';
 
 // Как часто приложение пытается отправить очередь, пока открыто (мс)
 export const SYNC_INTERVAL_MS = 30_000;

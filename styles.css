@@ -157,6 +157,20 @@ textarea { margin-top: 16px; resize: vertical; }
 .clean-line .arrow { text-align: center; color: var(--muted); font-size: 20px; }
 .clean-caps { margin-top: -4px; color: var(--muted); font-size: 12px; text-align: center; }
 
+/* Голосовой ввод */
+.voice-btn { margin-top: 8px; margin-bottom: 8px; border-color: var(--accent); color: var(--accent); }
+.overlay.center { align-items: center; justify-content: center; }
+.listen { background: var(--bg); border: 1px solid var(--line); border-radius: 18px; padding: 28px 24px; text-align: center; width: 85%; max-width: 360px; }
+.listen p { margin: 10px 0 0; }
+.mic-pulse { font-size: 48px; width: 96px; height: 96px; line-height: 96px; margin: 0 auto; border-radius: 50%;
+  background: rgba(224,166,74,.15); animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 0%,100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(224,166,74,.5); } 50% { transform: scale(1.06); box-shadow: 0 0 0 14px rgba(224,166,74,0); } }
+.sheet.short { height: auto; max-height: 80vh; padding-bottom: 16px; }
+.sheet.short .sheet-head .label { margin: 0; flex: 1; text-transform: none; letter-spacing: 0; font-size: 15px; color: var(--text); }
+.heard { background: rgba(224,166,74,.12); border: 1px solid var(--accent); border-radius: 12px; padding: 10px 12px; margin: 10px 0 0; font-size: 15px; }
+.hidden { display: none; }
+.hint.left { text-align: left; margin: 12px 0 0; font-size: 15px; }
+
 /* Очередь */
 .qrow { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 10px 14px; margin-bottom: 6px; }
 .qrow p { margin: 2px 0 0; }

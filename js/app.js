@@ -224,6 +224,25 @@ function screenLogin() {
 // =====================================================================
 //  ЭКРАН: ГЛАВНАЯ
 // =====================================================================
+// =====================================================================
+//  РОЛИ (лист «Сотрудники», столбец «Роль»)
+//  бармен   — всё, кроме инвентаризации Gift-shop
+//  админ    — только перенос, списание и инвентаризация Gift-shop
+//  менеджер — всё, включая Gift-shop
+// =====================================================================
+const GIFT = 'Gift-shop';
+const roleOf = () => String((session && session.role) || 'бармен').toLowerCase();
+const isAdmin = () => roleOf().startsWith('админ');
+const isManager = () => roleOf().startsWith('менедж');
+
+/** Что показывать в инвентаризации этому сотруднику: позиции и места. */
+function invScope() {
+  const inv = config.inventory || { locations: [], items: [] };
+  if (isAdmin()) return { items: inv.items.filter(it => it.category === GIFT), locations: [GIFT] };
+  if (isManager()) return { items: inv.items, locations: [...inv.locations, GIFT] };
+  return { items: inv.items.filter(it => it.category !== GIFT), locations: inv.locations };
+}
+
 function screenHome() {
   const tile = (icon, title, onclick) =>
     h('button', { class: 'tile', onclick }, h('span', { class: 'icon' }, icon), h('span', {}, title));
@@ -244,14 +263,20 @@ function screenHome() {
         },
       }, 'Сменить'),
     ),
-    h('div', { class: 'tiles' },
-      tile('📦', 'Перенос', () => go(screenItemsForm, 'transfer')),
-      tile('🗑', 'Списание', () => go(screenItemsForm, 'writeoff')),
-      tile('📸', 'Фото уборки', () => go(screenPhoto)),
-      tile('📖', 'ТТК', () => go(screenTtkList)),
-      tile('📋', 'Инвентаризация', () => go(screenInventory)),
-      tile('⚖️', 'Переработка', () => go(screenActs)),
-    ),
+    h('div', { class: 'tiles' }, isAdmin()
+      ? [ // Админ: только эти три плитки
+        tile('📦', 'Перенос', () => go(screenItemsForm, 'transfer')),
+        tile('🗑', 'Списание', () => go(screenItemsForm, 'writeoff')),
+        tile('🎁', 'Инвентаризация Gift-shop', () => go(screenInventory)),
+      ]
+      : [
+        tile('📦', 'Перенос', () => go(screenItemsForm, 'transfer')),
+        tile('🗑', 'Списание', () => go(screenItemsForm, 'writeoff')),
+        tile('📸', 'Фото уборки', () => go(screenPhoto)),
+        tile('📖', 'ТТК', () => go(screenTtkList)),
+        tile('📋', 'Инвентаризация', () => go(screenInventory)),
+        tile('⚖️', 'Переработка', () => go(screenActs)),
+      ]),
   );
 }
 
@@ -724,25 +749,50 @@ function screenInventory() {
 
   const body = h('div', {});
   const locBox = h('div', { class: 'chips' });
-  root.append(h('p', { class: 'label' }, 'Где считаете?'), locBox, body);
+  const scope = invScope();
+  // Одно место (у админа — Gift-shop): не спрашиваем, выбираем сразу
+  if (scope.locations.length > 1) root.append(h('p', { class: 'label' }, 'Где считаете?'), locBox);
+  root.append(body);
 
   async function draw() {
-    const loc = await db.get('kv', 'invLocation');
-    locBox.replaceChildren(...inv.locations.map(l => h('button', {
+    let loc = await db.get('kv', 'invLocation');
+    if (scope.locations.length === 1 && loc !== scope.locations[0]) {
+      loc = scope.locations[0];
+      await db.put('kv', loc, 'invLocation');
+    }
+    locBox.replaceChildren(...scope.locations.map(l => h('button', {
       class: 'chip' + (l === loc ? ' on' : ''),
       onclick: async () => { await db.put('kv', l, 'invLocation'); draw(); },
     }, l)));
-    if (!loc || !inv.locations.includes(loc)) { body.replaceChildren(h('p', { class: 'hint' }, 'Выберите место')); return; }
+    if (!loc || !scope.locations.includes(loc)) { body.replaceChildren(h('p', { class: 'hint' }, 'Выберите место')); return; }
 
     const counts = await myCounts(loc);
-    const voice = voiceButton(() => voiceInventory(inv.items));
+    // В Gift-shop считаем только Gift-shop, на барах и складах — всё остальное
+    const here = scope.items.filter(it => (loc === GIFT) === (it.category === GIFT));
+    const voice = voiceButton(() => voiceInventory(here));
     const cats = {};
-    inv.items.forEach(it => {
+    here.forEach(it => {
       const c = (cats[it.category] = cats[it.category] || { total: 0, done: 0 });
       c.total++;
       if (counts.has(it.category + '|' + it.name)) c.done++;
     });
     const customBtn = h('button', { class: 'secondary', onclick: () => go(screenInvCustom, {}) }, '+ Нет в описи');
+    const catNames = Object.keys(cats);
+    if (catNames.length === 1) {
+      // Одна категория (Gift-shop у админа) — сразу показываем её разделы: CD, Книги, Сувениры…
+      const cat = catNames[0];
+      const kinds = {};
+      here.forEach(it => {
+        const k = (kinds[it.kind || ''] = kinds[it.kind || ''] || { total: 0, done: 0 });
+        k.total++;
+        if (counts.has(it.category + '|' + it.name)) k.done++;
+      });
+      body.replaceChildren(voice, h('p', { class: 'label' }, cat),
+        ...Object.entries(kinds).map(([kind, k]) => h('button', { class: 'row', onclick: () => go(screenInvItems, cat, kind || null) },
+          h('span', {}, kind || 'Без раздела'), h('span', { class: k.done === k.total ? 'ok-text' : 'muted' }, `${k.done} / ${k.total}`))),
+        customBtn);
+      return;
+    }
     body.replaceChildren(voice, h('p', { class: 'label' }, 'Категория'),
       ...Object.entries(cats).map(([cat, c]) => h('button', { class: 'row', onclick: () => go(screenInvItems, cat, null) },
         h('span', {}, cat), h('span', { class: c.done === c.total ? 'ok-text' : 'muted' }, `${c.done} / ${c.total}`))),

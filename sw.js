@@ -9,7 +9,7 @@
 //  иначе телефоны продолжат показывать старую версию.
 // =====================================================================
 
-const VERSION = 'v14';
+const VERSION = 'v15';
 const CACHE = 'bar-app-' + VERSION;
 const FILES = [
   './',
@@ -32,7 +32,11 @@ const FILES = [
 
 // Установка: скачиваем и кладём в кэш все файлы
 self.addEventListener('install', (event) => {
-  event.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES)).then(() => self.skipWaiting()));
+  // cache: 'reload' — берём файлы прямо с сервера, мимо кэша браузера.
+  // Иначе GitHub Pages ~10 минут отдаёт старые копии, и новая версия кэшировала бы старые файлы.
+  event.waitUntil(caches.open(CACHE)
+    .then(c => c.addAll(FILES.map(f => new Request(f, { cache: 'reload' }))))
+    .then(() => self.skipWaiting()));
 });
 
 // Активация: удаляем кэши старых версий

@@ -1336,7 +1336,17 @@ async function start() {
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
 
   // Service Worker — сохраняет само приложение на телефоне, чтобы оно открывалось без сети
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(e => console.warn(e));
+  if ('serviceWorker' in navigator) {
+    // Когда пришла новая версия приложения — один раз перезагружаемся, чтобы сразу её показать
+    const hadController = !!navigator.serviceWorker.controller;
+    let reloaded = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (hadController && !reloaded) { reloaded = true; location.reload(); }
+    });
+    navigator.serviceWorker.register('./sw.js')
+      .then(reg => reg.update())       // проверяем обновление при каждом открытии
+      .catch(e => console.warn(e));
+  }
 
   session = (await db.get('kv', 'session')) || null;
   onSyncChange(renderStatus);

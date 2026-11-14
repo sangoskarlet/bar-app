@@ -198,3 +198,13 @@ textarea { margin-top: 16px; resize: vertical; }
 }
 .toast.bad { background: var(--bad); color: #fff; }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
+
+/* Акты «в работе» */
+.tile { position: relative; }
+.tile .badge { position: absolute; top: 8px; right: 8px; font-size: 12px; padding: 2px 8px; border-radius: 10px;
+  background: #e0a84a; color: #1a1a1a; font-weight: 600; }
+.tile .badge.late { background: #d9534f; color: #fff; }
+.row.open-act { border-left: 4px solid #e0a84a; }
+.row.open-act.late { border-left-color: #d9534f; background: rgba(217, 83, 79, .12); }
+.act-summary { margin: 8px 0 4px; }
+.total.warn { color: #d9534f; }

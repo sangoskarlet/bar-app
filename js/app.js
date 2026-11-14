@@ -279,9 +279,104 @@ function screenHome() {
         tile('📸', 'Фото уборки', () => go(screenPhoto)),
         tile('📖', 'ТТК', () => go(screenTtkList)),
         tile('📋', 'Инвентаризация', () => go(screenInventory)),
-        tile('⚖️', 'Переработка', () => go(screenActs)),
+        actsTile(),
       ]),
   );
+}
+
+/** Плитка «Переработка» со значком «⏳ N в работе» (число подтягивается в фоне). */
+function actsTile() {
+  const badge = h('span', { class: 'badge hidden' });
+  const btn = h('button', { class: 'tile', onclick: () => go(screenActs) },
+    h('span', { class: 'icon' }, '⚖️'), h('span', {}, 'Переработка'), badge);
+  const show = list => {
+    const n = list.length;
+    badge.textContent = n ? `⏳ ${n} в работе` : '';
+    badge.classList.toggle('hidden', !n);
+    badge.classList.toggle('late', list.some(isLate));
+  };
+  getOpenActs(false).then(show);
+  getOpenActs(true).then(show).catch(() => {});
+  return btn;
+}
+
+// =====================================================================
+//  АКТЫ «В РАБОТЕ»: выход запишем позже
+//  Список берём с сервера (его видят все бармены) + свои ещё не отправленные.
+// =====================================================================
+const LATE_HOURS = 24; // через сколько часов незакрытый акт подсвечивается красным
+const isLate = a => a.date && (Date.now() - new Date(a.date).getTime()) > LATE_HOURS * 3600e3;
+
+async function getOpenActs(fresh) {
+  let server = (await db.get('kv', 'openActs')) || [];
+  if (fresh) {
+    try {
+      server = (await apiGet({ action: 'openActs' })).acts || [];
+      await db.put('kv', server, 'openActs');
+    } catch (e) { /* нет связи — показываем то, что было */ }
+  }
+  const queue = await listQueue();
+  const closing = new Set(queue.filter(r => r.type === 'processingClose').map(r => r.actId));
+  // свои акты «в работе», которые ещё в очереди (нет связи) — тоже показываем
+  const local = queue.filter(r => r.type === 'processing' && r.pending && !server.some(a => a.id === r.id))
+    .map(r => {
+      const out = (r.lines || []).find(l => l.role === 'Результат') || {};
+      return { id: r.id, act: r.act, name: r.name, date: r.createdAt, item: out.item, unit: out.unit,
+        inputs: (r.lines || []).filter(l => l.role === 'Сырьё' && l.qty > 0), expected: r.expected || null,
+        basis: r.expected ? 'по рецепту' : '', local: true };
+    });
+  return [...server, ...local].filter(a => !closing.has(a.id))
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)));
+}
+
+function fmtDateTime(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return '';
+  const p = n => String(n).padStart(2, '0');
+  return `${p(d.getDate())}.${p(d.getMonth() + 1)} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/** Закрыть акт: вписать, сколько получилось. Может любой бармен. */
+function screenCloseAct(a) {
+  const root = h('main', { class: 'screen' }, header('Закрыть акт'));
+  const qty = h('input', { type: 'text', inputmode: 'decimal', placeholder: '0', class: 'qty big' });
+  const info = h('p', { class: 'total' });
+  const comment = h('textarea', { rows: '2', placeholder: 'Комментарий (необязательно)' });
+  const saveBtn = h('button', { class: 'primary' }, '✅ Закрыть акт');
+  const dev = v => (a.expected > 0 ? (v - a.expected) / a.expected * 100 : 0);
+  qty.addEventListener('input', () => {
+    const v = parseQty(qty.value);
+    if (!(v > 0) || !(a.expected > 0)) { info.textContent = ''; return; }
+    const d = dev(v);
+    info.textContent = Math.abs(d) < 1 ? 'Точно как ожидалось' : `${d > 0 ? '+' : ''}${fmtNum(d)}% от ожидаемого`;
+    info.classList.toggle('warn', Math.abs(d) >= 15);
+  });
+  saveBtn.addEventListener('click', async () => {
+    const v = parseQty(qty.value);
+    if (!(v > 0)) return toast('Введите, сколько получилось', 'bad');
+    // Выход сильно отличается от ожидаемого — переспрашиваем и просим комментарий
+    if (a.expected > 0 && Math.abs(dev(v)) >= 15) {
+      if (!confirm(`Выход ${fmtNum(v)} ${a.unit}, а ожидалось ≈ ${fmtNum(a.expected)} ${a.unit}. Всё верно?`)) return;
+      if (!comment.value.trim()) { comment.focus(); return toast('Напишите в комментарии, почему выход другой', 'bad'); }
+    }
+    saveBtn.disabled = true;
+    await enqueue({ type: 'processingClose', name: session.name, pin: session.pin, actId: a.id, act: a.act,
+      qty: v, unit: a.unit, comment: comment.value.trim() });
+    toast('Акт закрыт');
+    back();
+  });
+  root.append(
+    h('p', { class: 'label' }, a.act),
+    h('p', { class: 'muted' }, `Начат ${fmtDateTime(a.date)} · ${a.name}${a.local ? ' · ещё не отправлен' : ''}`),
+    h('div', { class: 'act-summary' }, ...(a.inputs || []).map(i =>
+      h('div', { class: 'act-line' }, h('span', {}, i.item), h('span', {}, `${fmtNum(i.qty)} ${i.unit}` +
+        (i.clean ? ` (чистый ${fmtNum(i.clean)})` : ''))))),
+    a.comment ? h('p', { class: 'muted' }, '💬 ' + a.comment) : null,
+    h('p', { class: 'label' }, `Получилось: ${a.item}, ${a.unit}`),
+    a.expected > 0 ? h('p', { class: 'hint left' }, `Ожидается ≈ ${fmtNum(a.expected)} ${a.unit} · ${a.basis}`) : null,
+    qty, info, comment, saveBtn);
+  setTimeout(() => qty.focus(), 50);
+  return root;
 }
 
 // =====================================================================
@@ -950,6 +1045,11 @@ function screenInvCount(item, prefill = null) {
 // =====================================================================
 
 /** Аккуратное округление для пересчитанных количеств. */
+/** Кнопка сохранения: «Сохранить акт» или «⏳ Сохранить, выход позже», если выход пустой. */
+function setSaveLabel(btn, outInput) {
+  btn.textContent = outInput.value.trim() === '' ? '⏳ Сохранить, выход позже' : 'Сохранить акт';
+}
+
 function smartRound(v) {
   if (!isFinite(v)) return '';
   if (v >= 100) return Math.round(v);
@@ -978,7 +1078,16 @@ function screenActs() {
   }
   search.addEventListener('input', draw);
   draw();
-  root.append(search, list);
+  // Сверху — акты «в работе»: их может закрыть любой бармен
+  const openBox = h('div', {});
+  const drawOpen = arr => openBox.replaceChildren(...(arr.length ? [
+    h('p', { class: 'group' }, `⏳ В работе — впишите выход (${arr.length})`),
+    ...arr.map(a => h('button', { class: 'row open-act' + (isLate(a) ? ' late' : ''), onclick: () => go(screenCloseAct, a) },
+      h('span', {}, a.act), h('span', { class: 'muted' }, `${fmtDateTime(a.date)} · ${a.name}`))),
+  ] : []));
+  getOpenActs(false).then(drawOpen);
+  getOpenActs(true).then(drawOpen);
+  root.append(openBox, search, list);
   return root;
 }
 
@@ -990,7 +1099,7 @@ function screenAct(act) {
   const comment = h('textarea', { rows: '2', placeholder: 'Комментарий (необязательно)' });
   const saveBtn = h('button', { class: 'primary' }, 'Сохранить акт');
   const outInput = numInput(true);
-  let outDirty = false;
+  let expectedOut = null;
 
   // ---------- Простой акт: было → стало ----------
   if (!isRecipe) {
@@ -1002,20 +1111,27 @@ function screenAct(act) {
     };
     keyInput.addEventListener('input', recalc);
     outInput.addEventListener('input', recalc);
+    outInput.placeholder = 'пусто = впишу позже';
+    outInput.addEventListener('input', () => setSaveLabel(saveBtn, outInput));
     saveBtn.addEventListener('click', async () => {
-      const k = parseQty(keyInput.value), o = parseQty(outInput.value);
+      const k = parseQty(keyInput.value);
+      const later = outInput.value.trim() === '';
+      const o = later ? 0 : parseQty(outInput.value);
       if (!(k > 0)) return toast('Введите, сколько было', 'bad');
-      if (!(o > 0)) return toast('Введите, сколько стало', 'bad');
+      if (!later && !(o > 0)) return toast('Проверьте, сколько стало', 'bad');
       saveBtn.disabled = true;
       await enqueue({ type: 'processing', name: session.name, pin: session.pin, act: act.name, comment: comment.value.trim(),
+        pending: later,
         lines: [{ role: 'Сырьё', item: key.item, unit: key.unit, qty: k },
                 { role: 'Результат', item: act.output.item, unit: act.output.unit, qty: o }] });
-      toast('Акт сохранён');
+      toast(later ? 'Сохранено. Выход впишете позже в «⏳ В работе»' : 'Акт сохранён');
       back();
     });
+    setSaveLabel(saveBtn, outInput);
     root.append(
       h('p', { class: 'label' }, `Было: ${key.item}, ${key.unit}`), keyInput,
       h('p', { class: 'label' }, `Стало: ${act.output.item}, ${act.output.unit}`), outInput,
+      h('p', { class: 'muted' }, 'Ещё не готово? Оставьте «стало» пустым — допишете потом.'),
       info, comment, saveBtn);
     setTimeout(() => keyInput.focus(), 50);
     return root;
@@ -1043,7 +1159,8 @@ function screenAct(act) {
         if (r.i === key || r.i.fixed || r.amount.dataset.dirty || !(r.i.qty > 0)) return;
         r.amount.value = String(smartRound(r.i.qty * f)).replace('.', ',');
       });
-      if (!outDirty && act.output.qty > 0) outInput.value = String(smartRound(act.output.qty * f)).replace('.', ',');
+      // Выход не подставляем — только подсказка: его вписывают, когда заготовка готова
+      if (act.output.qty > 0) { expectedOut = smartRound(act.output.qty * f); outInput.placeholder = `≈ ${String(expectedOut).replace('.', ',')} по рецепту, или пусто — позже`; }
       info.textContent = `Замес: ×${fmtNum(k / key.qty)} от рецепта`;
     } else info.textContent = '';
     // процент чистки
@@ -1057,7 +1174,6 @@ function screenAct(act) {
     r.amount.addEventListener('input', recalc);
     if (r.raw) { r.raw.addEventListener('input', recalc); r.pct = h('p', { class: 'muted' }); }
   });
-  outInput.addEventListener('input', () => { outDirty = true; });
 
   saveBtn.addEventListener('click', async () => {
     const lines = [];
@@ -1074,14 +1190,18 @@ function screenAct(act) {
         lines.push({ role: 'Сырьё', item: r.i.item, unit: r.i.unit, qty: a });
       }
     }
-    const o = parseQty(outInput.value);
-    if (!(o > 0)) return toast('Введите, сколько получилось', 'bad');
+    const later = outInput.value.trim() === '';
+    const o = later ? 0 : parseQty(outInput.value);
+    if (!later && !(o > 0)) return toast('Проверьте, сколько получилось', 'bad');
     lines.push({ role: 'Результат', item: act.output.item, unit: act.output.unit, qty: o });
     saveBtn.disabled = true;
-    await enqueue({ type: 'processing', name: session.name, pin: session.pin, act: act.name, lines, comment: comment.value.trim() });
-    toast('Акт сохранён');
+    await enqueue({ type: 'processing', name: session.name, pin: session.pin, act: act.name, lines, comment: comment.value.trim(),
+      pending: later, expected: later ? expectedOut : null });
+    toast(later ? 'Сохранено. Выход впишете позже в «⏳ В работе»' : 'Акт сохранён');
     back();
   });
+  outInput.addEventListener('input', () => setSaveLabel(saveBtn, outInput));
+  setSaveLabel(saveBtn, outInput);
 
   const block = (r) => {
     const i = r.i;
@@ -1107,6 +1227,7 @@ function screenAct(act) {
     restRows.length ? h('p', { class: 'label' }, 'Остальное сырьё (считается само, можно поправить)') : null,
     h('div', { class: 'lines' }, ...restRows.map(block)),
     h('p', { class: 'label' }, `Получилось: ${act.output.item}, ${act.output.unit}`), outInput,
+    h('p', { class: 'muted' }, 'Ещё варится? Оставьте пустым — выход впишете потом.'),
     info, comment, saveBtn);
   recalc();
   setTimeout(() => (keyRow.raw || keyRow.amount).focus(), 50);
@@ -1123,8 +1244,9 @@ function describe(r) {
   if (r.type === 'processing') {
     const res = (r.lines || []).find(l => l.role === 'Результат');
     const first = (r.lines || []).find(l => l.role === 'Сырьё' && l.qty > 0);
-    return `Переработка · ${r.act} · ${first ? first.qty + ' ' + first.unit : ''} → ${res ? res.qty + ' ' + res.unit : ''}`;
+    return `Переработка · ${r.act} · ${first ? first.qty + ' ' + first.unit : ''} → ${r.pending ? '⏳ выход позже' : res ? res.qty + ' ' + res.unit : ''}`;
   }
+  if (r.type === 'processingClose') return `Закрытие акта · ${r.act} · выход ${r.qty} ${r.unit}`;
   if (r.type === 'inventory') return `Инвентаризация · ${r.location} · ${r.item} · ${invSummary(r)}`;
   return r.type;
 }

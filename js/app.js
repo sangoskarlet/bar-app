@@ -647,7 +647,6 @@ function screenTtkCard(t) {
   const field = (label, value) => value ? h('div', { class: 'field' }, h('p', { class: 'label' }, label), h('p', {}, value)) : null;
   return h('main', { class: 'screen' },
     header(t.name),
-    photo,
     h('div', { class: 'card' },
       field('Категория', t.category),
       field('Бокал', t.glass),
@@ -657,6 +656,7 @@ function screenTtkCard(t) {
       field('Гарнир', t.garnish),
       field('Подача и заметки', t.notes),
     ),
+    t.photoId ? photo : null, // фото — после рецепта (если фото нет, блок не показываем)
   );
 }
 

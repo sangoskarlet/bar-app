@@ -3,20 +3,39 @@
    Тёмная тема (в баре темно), крупные кнопки под палец, без мелочей.
    ===================================================================== */
 
+/* Обычная тема — «ESSE»: чёрный + белый, как логотип клуба */
 :root {
-  --bg: #14181f;
-  --panel: #1d232d;
-  --panel-2: #262e3a;
-  --line: #333d4b;
-  --text: #eef1f5;
-  --muted: #8d97a5;
-  --accent: #e0a64a;      /* янтарный — как виски */
-  --accent-text: #1a1308;
+  --bg: #0b0b0c;
+  --panel: #161618;
+  --panel-2: #212124;
+  --line: #2e2e32;
+  --text: #f5f2ec;
+  --muted: #8f8a83;
+  --accent: #efe9df;      /* слоновая кость — кнопки и выделение */
+  --accent-text: #0b0b0c;
   --ok: #4cc38a;
   --bad: #ef5d5d;
   --wait: #e0a64a;
+  --logo: url(icons/logo-white.png);
   --radius: 14px;
   --safe-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/* Зимняя тема — бордовый + золото, как новогодний логотип ESSE.
+   Включается в таблице («Списки», F2) или сама с 1 декабря по 15 января. */
+:root[data-theme="winter"] {
+  --bg: #3d0712;
+  --panel: #520b1a;
+  --panel-2: #651224;
+  --line: #7d2335;
+  --text: #fbefe7;
+  --muted: #d9aca3;
+  --accent: #e2a882;      /* золото логотипа */
+  --accent-text: #3d0712;
+  --ok: #7ad3a4;
+  --bad: #ffb0a8;
+  --wait: #e2a882;
+  --logo: url(icons/logo-gold.png);
 }
 
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -59,15 +78,18 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .two { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .two .secondary { margin-top: 0; }
 
-/* Плитки главного экрана */
-.tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
+/* Плитки главного экрана — стиль «Афиша»: как программка концерта */
+.tiles { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: 18px; margin-top: 6px; }
 .tile {
-  background: var(--panel); border: 1px solid var(--line); border-radius: 18px;
-  aspect-ratio: 1 / .85; display: flex; flex-direction: column; align-items: center; justify-content: center;
-  gap: 8px; font-size: 17px; font-weight: 600; cursor: pointer;
+  position: relative; background: transparent; border: 0; border-top: 1px solid var(--line); border-radius: 0;
+  min-height: 132px; padding: 22px 2px 18px; color: var(--text); text-align: left; cursor: pointer;
+  display: flex; flex-direction: column; align-items: flex-start; justify-content: flex-end; gap: 8px;
 }
-.tile .icon { font-size: 40px; }
-.tile:active { background: var(--panel-2); }
+.tile .ico { width: 30px; height: 30px; color: var(--accent); margin-bottom: 4px; }
+.tile .t-name { text-transform: uppercase; letter-spacing: .13em; font-size: clamp(11.5px, 3.5vw, 14px); font-weight: 500;
+  white-space: nowrap; }
+.tile .t-sub { font-size: 12px; color: var(--muted); letter-spacing: .06em; }
+.tile:active { background: var(--panel); }
 .who { display: flex; justify-content: space-between; align-items: center; color: var(--muted); margin: 4px 0; }
 .who b { color: var(--text); }
 
@@ -200,11 +222,17 @@ textarea { margin-top: 16px; resize: vertical; }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
 
 /* Акты «в работе» */
-.tile { position: relative; }
-.tile .badge { position: absolute; top: 8px; right: 8px; font-size: 12px; padding: 2px 8px; border-radius: 10px;
+.tile .badge { position: absolute; top: 22px; right: 0; font-size: 11px; padding: 2px 8px; border-radius: 10px;
   background: #e0a84a; color: #1a1a1a; font-weight: 600; }
 .tile .badge.late { background: #d9534f; color: #fff; }
-.row.open-act { border-left: 4px solid #e0a84a; }
-.row.open-act.late { border-left-color: #d9534f; background: rgba(217, 83, 79, .12); }
+.row.open-act { border-left: 4px solid var(--accent); }
+.row.open-act.late { border-left-color: var(--bad); background: rgba(217, 83, 79, .12); }
 .act-summary { margin: 8px 0 4px; }
-.total.warn { color: #d9534f; }
+.total.warn { color: var(--bad); }
+
+/* Логотип ESSE (картинка зависит от темы) */
+.logo { background: var(--logo) center / contain no-repeat; }
+.top .logo { height: 34px; width: 100%; }
+.login-logo { height: 120px; margin: 28px auto 8px; max-width: 300px; }
+.tile .badge { background: var(--accent); color: var(--accent-text); }
+.tile .badge.late { background: var(--bad); color: #fff; }

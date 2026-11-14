@@ -21,6 +21,7 @@ import {
   listQueue, listSent, removeFromQueue, retryRejected,
 } from './sync.js';
 import { voiceSupported, listenOnce, voiceErrorText, parseInventoryPhrase, confident, parseCustomPhrase } from './voice.js';
+import { icon } from './icons.js';
 
 const app = document.getElementById('app');
 const statusEl = document.getElementById('status');
@@ -115,12 +116,28 @@ function header(title, { showBack = true } = {}) {
 // ---------------------------------------------------------------------
 //  Загрузка справочника и ТТК
 // ---------------------------------------------------------------------
+// ---------------------------------------------------------------------
+//  Оформление: обычное (чёрное ESSE) или зимнее (бордо + золото).
+//  Берём из таблицы («Списки», F2: обычное / зимнее / авто).
+//  «авто» или пусто: зимнее с 1 декабря по 15 января.
+// ---------------------------------------------------------------------
+function applyTheme() {
+  const t = String((config && config.theme) || 'авто').toLowerCase();
+  const now = new Date(), m = now.getMonth(), d = now.getDate();
+  const winterSeason = m === 11 || (m === 0 && d <= 15);
+  const winter = t.startsWith('зим') || (!t.startsWith('обыч') && winterSeason);
+  document.documentElement.dataset.theme = winter ? 'winter' : '';
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.content = winter ? '#3d0712' : '#0b0b0c';
+}
+
 async function loadConfig() {
   const cached = await db.get('kv', 'config');
   if (cached) config = cached;
   try {
     const fresh = await apiGet({ action: 'config' });
     config = fresh;
+    applyTheme();
     await db.put('kv', fresh, 'config');
     prefetchTtkPhotos(); // в фоне докачиваем фото ТТК для офлайна
   } catch (e) {
@@ -175,7 +192,9 @@ statusEl.addEventListener('click', () => {
 //  ЭКРАН: ВХОД
 // =====================================================================
 function screenLogin() {
-  const wrap = h('main', { class: 'screen' }, h('header', { class: 'top' }, h('span'), h('h1', {}, 'Бар · вход'), h('span')));
+  const wrap = h('main', { class: 'screen' },
+    h('div', { class: 'logo login-logo', role: 'img', 'aria-label': 'ESSE Jazz Club' }),
+    h('p', { class: 'hint' }, 'Журнал бара'));
 
   if (!config) {
     wrap.append(
@@ -248,11 +267,12 @@ function invScope() {
 }
 
 function screenHome() {
-  const tile = (icon, title, onclick) =>
-    h('button', { class: 'tile', onclick }, h('span', { class: 'icon' }, icon), h('span', {}, title));
+  // Плитка в стиле «Афиша»: тонкая иконка, название заглавными, короткая подпись
+  const tile = (ico, title, sub, onclick) =>
+    h('button', { class: 'tile', onclick }, icon(ico), h('span', { class: 't-name' }, title), h('span', { class: 't-sub' }, sub));
 
   return h('main', { class: 'screen' },
-    h('header', { class: 'top' }, h('span'), h('h1', {}, 'Бар'), h('span')),
+    h('header', { class: 'top' }, h('span'), h('div', { class: 'logo', role: 'img', 'aria-label': 'ESSE Jazz Club' }), h('span')),
     h('div', { class: 'who' },
       h('span', {}, 'Смена: ', h('b', {}, session.name)),
       h('button', {
@@ -269,16 +289,16 @@ function screenHome() {
     ),
     h('div', { class: 'tiles' }, isAdmin()
       ? [ // Админ: только эти три плитки
-        tile('📦', 'Перенос', () => go(screenItemsForm, 'transfer')),
-        tile('🗑', 'Списание', () => go(screenItemsForm, 'writeoff')),
-        tile('🎁', 'Инвентаризация Gift-shop', () => go(screenInventory)),
+        tile('transfer', 'Перенос', 'между точками', () => go(screenItemsForm, 'transfer')),
+        tile('writeoff', 'Списание', 'бой, порча, брак', () => go(screenItemsForm, 'writeoff')),
+        tile('gift', 'Gift-shop', 'инвентаризация', () => go(screenInventory)),
       ]
       : [
-        tile('📦', 'Перенос', () => go(screenItemsForm, 'transfer')),
-        tile('🗑', 'Списание', () => go(screenItemsForm, 'writeoff')),
-        tile('📸', 'Фото уборки', () => go(screenPhoto)),
-        tile('📖', 'ТТК', () => go(screenTtkList)),
-        tile('📋', 'Инвентаризация', () => go(screenInventory)),
+        tile('transfer', 'Перенос', 'кухня ⇄ бар', () => go(screenItemsForm, 'transfer')),
+        tile('writeoff', 'Списание', 'бой, порча, проливы', () => go(screenItemsForm, 'writeoff')),
+        tile('photo', 'Фото уборки', 'зоны после смены', () => go(screenPhoto)),
+        tile('ttk', 'ТТК', 'рецептуры', () => go(screenTtkList)),
+        tile('inv', 'Инвентаризация', 'подсчёт остатков', () => go(screenInventory)),
         actsTile(),
       ]),
   );
@@ -288,7 +308,7 @@ function screenHome() {
 function actsTile() {
   const badge = h('span', { class: 'badge hidden' });
   const btn = h('button', { class: 'tile', onclick: () => go(screenActs) },
-    h('span', { class: 'icon' }, '⚖️'), h('span', {}, 'Переработка'), badge);
+    icon('acts'), h('span', { class: 't-name' }, 'Переработка'), h('span', { class: 't-sub' }, 'заготовки и выход'), badge);
   const show = list => {
     const n = list.length;
     badge.textContent = n ? `⏳ ${n} в работе` : '';
@@ -1322,6 +1342,7 @@ async function start() {
   onSyncChange(renderStatus);
 
   config = (await db.get('kv', 'config')) || null;
+  applyTheme();
   if (session && config) {
     resetTo(screenHome);
     loadConfig(); // обновим справочник в фоне

@@ -1,13 +1,13 @@
 {
-  "name": "Бар — журнал",
-  "short_name": "Бар",
+  "name": "ESSE — журнал бара",
+  "short_name": "ESSE Бар",
   "lang": "ru",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
   "orientation": "portrait",
-  "background_color": "#14181f",
-  "theme_color": "#14181f",
+  "background_color": "#0b0b0c",
+  "theme_color": "#0b0b0c",
   "icons": [
     { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
     { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png" },

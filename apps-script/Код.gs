@@ -9,9 +9,10 @@
  *    PIN, проверяет данные, защищает от дублей и записывает строку.
  *
  *  Два типа запросов:
- *    GET  (doGet)  — приложение что-то ЧИТАЕТ: справочник, ТТК, фото ТТК, вопросы викторины.
+ *    GET  (doGet)  — приложение что-то ЧИТАЕТ: справочник, ТТК, фото ТТК, вопросы викторины,
+ *                    состояние дуэли, рейтинг.
  *    POST (doPost) — приложение что-то ПИШЕТ: вход, переносы, списания, фото,
- *                    обжалование вопроса викторины.
+ *                    обжалование вопроса викторины, ответы дуэли.
  *
  *  Главные правила надёжности:
  *    1. У каждой записи есть уникальный ID, который придумывает телефон.
@@ -43,6 +44,8 @@ const SHEETS = {
   refs:      'Эталоны уборки',      // зона → что проверять + эталонное фото (для ИИ-проверки)
   questions: 'Вопросы',             // банк вопросов викторины (создаётся setupQuiz)
   disputes:  'Обжалования',         // жалобы на вопросы викторины (создаётся setupQuiz)
+  duels:     'Дуэли',               // история матчей (создаётся автоматически)
+  ratings:   'Рейтинг',             // Elo сотрудников (создаётся автоматически)
 };
 
 // В каком столбце листа лежит ID записи (считаем с 1: A=1, B=2 ...).
@@ -77,6 +80,9 @@ function doGet(e) {
     if (action === 'ttkPhoto') return json_(getTtkPhoto_(e.parameter.id));
     if (action === 'openActs') return json_({ ok: true, acts: openActs_(ss_()) });
     if (action === 'questions') return json_(getQuestions_());
+    if (action === 'duelState') return json_(duelState_(e.parameter.duelId, e.parameter.employee));
+    if (action === 'duelCancel') return json_(duelCancel_(e.parameter.duelId, e.parameter.employee));
+    if (action === 'duelRating') return json_(duelRating_(e.parameter.employee));
     if (action === 'ping') return json_({ ok: true, time: new Date().toISOString() });
     return json_({ ok: false, error: 'Неизвестное действие: ' + action });
   } catch (err) {
@@ -92,6 +98,9 @@ function doPost(e) {
     if (body.action === 'login') return json_(login_(body.name, body.pin));
     if (body.action === 'submit') return json_(submit_(body.records));
     if (body.action === 'dispute') return json_(dispute_(body));
+    if (body.action === 'duelCreate') return json_(duelCreate_(body));
+    if (body.action === 'duelJoin') return json_(duelJoin_(body));
+    if (body.action === 'duelAnswer') return json_(duelAnswer_(body));
     return json_({ ok: false, error: 'Неизвестное действие: ' + body.action });
   } catch (err) {
     log_('ОШИБКА POST', String(err && err.stack || err));
@@ -660,7 +669,9 @@ function setup() {
   const ss = ss_();
   // «Эталоны уборки» и листы викторины к обязательным не относятся:
   // эталоны необязательны, а листы викторины создаёт отдельная функция setupQuiz().
-  const missing = Object.keys(SHEETS).filter(k => k !== 'refs' && k !== 'questions' && k !== 'disputes')
+  // Листы дуэли и рейтинга создаются сами при первой дуэли (ensureDuelSheets_).
+  const auto = ['refs', 'questions', 'disputes', 'duels', 'ratings'];
+  const missing = Object.keys(SHEETS).filter(k => auto.indexOf(k) === -1)
     .map(k => SHEETS[k]).filter(n => !ss.getSheetByName(n));
   if (missing.length) throw new Error('В таблице нет листов: ' + missing.join(', '));
   const folder = photoFolderFor_(new Date());
@@ -1081,4 +1092,696 @@ function cleanupPhotos() {
   });
   if (removed) log_('Чистка фото', 'В корзину: ' + removed);
   return removed;
+}
+
+
+/* =====================================================================
+ *  ДУЭЛЬ v1 — два сотрудника, комната по коду, серверный счёт
+ * =====================================================================
+ *
+ *  Живого соединения нет: клиент опрашивает doGet ?action=duelState
+ *  раз в 3 секунды. Всё, что влияет на исход, считает сервер:
+ *    — состояние матча лежит в CacheService (ключ duel:<id>, TTL 6 часов);
+ *    — код комнаты — отдельный ключ duelcode:<КОД> → id;
+ *    — время ответа и порядок ответов фиксирует сервер (Date.now()),
+ *      время телефона не используется;
+ *    — правильный ответ НЕ уходит в состояние, пока раунд не закрыт.
+ *
+ *  Правила (ПЛАН-ОБНОВЛЕНИЙ §3): 10 HP, урон 1, раунд 20 с, окно блока
+ *  5 с после первого правильного ответа, максимум 15 раундов, ожидание
+ *  соперника 2 минуты. Elo: 1000 старт, K=32, ничья = 0.5 очка.
+ *
+ *  Листы «Дуэли» и «Рейтинг» создаются автоматически при первой дуэли.
+ *  Строки тестовых матчей помечаются кодом, начинающимся с TEST
+ *  (duelCreate c test:true — только для проверки, приложение его не шлёт).
+ * ===================================================================== */
+
+const DUEL_HP = 10;
+const DUEL_DAMAGE = 1;
+const DUEL_ROUND_SEC = 20;
+const DUEL_ROUND_MS = DUEL_ROUND_SEC * 1000;
+const DUEL_BLOCK_MS = 5000;
+const DUEL_MAX_ROUNDS = 15;
+const DUEL_WAIT_MS = 2 * 60 * 1000;
+const DUEL_PAUSE_MS = 3000;          // разбор раунда, потом следующий вопрос
+const DUEL_TTL_SEC = 6 * 3600;
+const DUEL_ELO_K = 32;
+const DUEL_ELO_START = 1000;
+const DUEL_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // без I, O, 0, 1
+
+const DUEL_HEADERS = ['дата', 'код', 'игрок_1', 'игрок_2', 'hp_1', 'hp_2',
+  'раундов', 'победитель', 'длительность_сек'];
+const RATING_HEADERS = ['сотрудник', 'рейтинг', 'побед', 'поражений', 'матчей', 'последний_матч'];
+
+/** Общая обёртка: одна дуэль меняется одним игроком за раз. */
+function duelLock_(fn) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) return { ok: false, error: 'Сервер занят, повторите через пару секунд', code: 'busy' };
+  try {
+    return fn();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function duelCacheKey_(id) { return 'duel:' + id; }
+function duelCodeKey_(code) { return 'duelcode:' + code; }
+
+function duelLoad_(id) {
+  id = str_(id);
+  if (!id) return null;
+  const raw = CacheService.getScriptCache().get(duelCacheKey_(id));
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch (e) { return null; }
+}
+
+function duelSave_(m) {
+  if (!m || !m.id) return;
+  const cache = CacheService.getScriptCache();
+  cache.put(duelCacheKey_(m.id), JSON.stringify(m), DUEL_TTL_SEC);
+  if (m.code) cache.put(duelCodeKey_(m.code), m.id, DUEL_TTL_SEC);
+}
+
+function duelDrop_(m) {
+  if (!m || !m.id) return;
+  const cache = CacheService.getScriptCache();
+  cache.remove(duelCacheKey_(m.id));
+  if (m.code) cache.remove(duelCodeKey_(m.code));
+}
+
+function duelByCode_(code) {
+  code = str_(code).toUpperCase().replace(/\s+/g, '');
+  if (!/^[A-Z0-9]{4,10}$/.test(code)) return null;
+  const id = CacheService.getScriptCache().get(duelCodeKey_(code));
+  return id ? duelLoad_(id) : null;
+}
+
+function duelRand_(n) {
+  let s = '';
+  for (let i = 0; i < n; i++) s += DUEL_CODE_ALPHABET.charAt(Math.floor(Math.random() * DUEL_CODE_ALPHABET.length));
+  return s;
+}
+
+function duelNewCode_(test) {
+  return (test ? 'TEST' : '') + duelRand_(test ? 2 : 6);
+}
+
+function duelShuffle_(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const t = a[i]; a[i] = a[j]; a[j] = t;
+  }
+  return a;
+}
+
+/** Только активные сотрудники: имя из листа «Сотрудники», галочка «Работает». */
+function isActiveEmployee_(name) {
+  name = str_(name);
+  if (!name) return false;
+  return rows_(ss_(), SHEETS.staff).some(r => str_(r[0]) === name && r[3] === true);
+}
+
+/** Листы дуэли и рейтинга. Создаются при первом обращении, шапки не дублируются. */
+function ensureDuelSheets_(ss) {
+  ss = ss || ss_();
+  let ds = ss.getSheetByName(SHEETS.duels);
+  if (!ds) {
+    ds = ss.insertSheet(SHEETS.duels);
+    ds.getRange(1, 1, 1, DUEL_HEADERS.length).setValues([DUEL_HEADERS]).setFontWeight('bold');
+    ds.setFrozenRows(1);
+    ds.setColumnWidth(1, 140);
+    ds.setColumnWidth(2, 90);
+    ds.setColumnWidth(3, 160);
+    ds.setColumnWidth(4, 160);
+    ds.setColumnWidth(8, 160);
+  }
+  let rs = ss.getSheetByName(SHEETS.ratings);
+  if (!rs) {
+    rs = ss.insertSheet(SHEETS.ratings);
+    rs.getRange(1, 1, 1, RATING_HEADERS.length).setValues([RATING_HEADERS]).setFontWeight('bold');
+    rs.setFrozenRows(1);
+    rs.setColumnWidth(1, 180);
+    rs.setColumnWidth(6, 150);
+  }
+  return { duels: ds, ratings: rs };
+}
+
+/** Текущий рейтинг сотрудника по листу «Рейтинг» (без создания строки). */
+function duelRatingOf_(ratings, name) {
+  const r = ratings[name];
+  return r && r.rating > 0 ? r.rating : DUEL_ELO_START;
+}
+
+function duelReadRatings_(ss) {
+  const sh = ss.getSheetByName(SHEETS.ratings);
+  const out = {};
+  if (!sh || sh.getLastRow() < 2) return out;
+  sh.getRange(2, 1, sh.getLastRow() - 1, RATING_HEADERS.length).getValues().forEach((r, i) => {
+    const name = str_(r[0]);
+    if (!name) return;
+    out[name] = {
+      name, row: i + 2,
+      rating: num_(r[1]) > 0 ? Math.round(num_(r[1])) : DUEL_ELO_START,
+      wins: num_(r[2]), losses: num_(r[3]), matches: num_(r[4]), last: r[5],
+    };
+  });
+  return out;
+}
+
+/** Elo: ожидаемый счёт и новая оценка. Ничья — 0.5. */
+function duelElo_(myRating, oppRating, score) {
+  const expected = 1 / (1 + Math.pow(10, (oppRating - myRating) / 400));
+  return Math.max(0, Math.round(myRating + DUEL_ELO_K * (score - expected)));
+}
+
+/** GET ?action=duelRating&employee= — короткая карточка рейтинга для экрана дуэли. */
+function duelRating_(employee) {
+  employee = str_(employee);
+  if (!employee) return { ok: false, error: 'Не указан сотрудник' };
+  if (!isActiveEmployee_(employee)) return { ok: false, error: 'Сотрудник не найден или отключён', code: 'auth' };
+  try {
+    const ss = ss_();
+    ensureDuelSheets_(ss);
+    const ratings = duelReadRatings_(ss);
+    const mine = ratings[employee];
+    const all = Object.keys(ratings).map(n => ratings[n].rating).sort((a, b) => b - a);
+    const place = mine ? all.indexOf(mine.rating) + 1 : 0;
+    return {
+      ok: true, employee,
+      rating: mine ? mine.rating : DUEL_ELO_START,
+      wins: mine ? mine.wins : 0,
+      losses: mine ? mine.losses : 0,
+      matches: mine ? mine.matches : 0,
+      place: place,
+      players: all.length,
+    };
+  } catch (e) {
+    return { ok: false, error: 'Не удалось прочитать рейтинг: ' + e };
+  }
+}
+
+/** Вопросы для дуэли: только «в игре», с правильным ответом — он остаётся на сервере. */
+function duelQuestionPool_() {
+  const sh = ss_().getSheetByName(SHEETS.questions);
+  if (!sh || sh.getLastRow() < 2) return [];
+  const out = [];
+  sh.getRange(2, 1, sh.getLastRow() - 1, QUIZ_COLUMNS).getValues().forEach(r => {
+    const id = str_(r[0]);
+    if (!id) return;
+    const status = str_(r[10]) || 'в игре';
+    if (status !== 'в игре') return;
+    const q = {
+      id,
+      'категория': str_(r[1]),
+      'вопрос': str_(r[2]),
+      A: str_(r[3]), B: str_(r[4]), C: str_(r[5]), D: str_(r[6]),
+      correct: str_(r[7]).toUpperCase(),
+      'пояснение': str_(r[8]),
+      'источник': str_(r[9]),
+    };
+    if (!q['вопрос'] || !q.A || !q.B || !q.C || !q.D || 'ABCD'.indexOf(q.correct) === -1) return;
+    out.push(q);
+  });
+  return out;
+}
+
+/* ---------- Создание комнаты и вход ---------- */
+
+function duelCreate_(body) {
+  const employee = str_(body && body.employee);
+  if (!employee) return { ok: false, error: 'Не указан сотрудник' };
+  if (!isActiveEmployee_(employee)) return { ok: false, error: 'Дуэль доступна только сотрудникам', code: 'auth' };
+
+  return duelLock_(() => {
+    const pool = duelQuestionPool_();
+    if (!pool.length) return { ok: false, error: 'В банке нет вопросов «в игре» — дуэль пока недоступна' };
+
+    const now = Date.now();
+    const ss = ss_();
+    ensureDuelSheets_(ss);
+    const ratings = duelReadRatings_(ss);
+
+    const test = body.test === true;
+    let code = '';
+    for (let i = 0; i < 20; i++) {
+      code = duelNewCode_(test);
+      if (!CacheService.getScriptCache().get(duelCodeKey_(code))) break;
+    }
+
+    const maxRounds = Math.min(DUEL_MAX_ROUNDS, pool.length);
+    const m = {
+      id: 'd' + now.toString(36) + duelRand_(8),
+      code,
+      createdAt: now,
+      startedAt: 0,
+      finishedAt: 0,
+      status: 'waiting',
+      players: [{ name: employee, hp: DUEL_HP }],
+      questions: duelShuffle_(pool).slice(0, maxRounds),
+      maxRounds,
+      round: 0,
+      roundState: null,
+      lastRound: null,
+      nextRoundAt: 0,
+      winner: null,
+      ratings: {},
+      ratingChanges: null,
+    };
+    m.ratings[employee] = duelRatingOf_(ratings, employee);
+    duelSave_(m);
+    log_('Дуэль', 'Создана комната ' + code + ' (' + employee + ')');
+
+    return {
+      ok: true, code, duelId: m.id, role: 1, status: 'waiting',
+      now, expiresAt: now + DUEL_WAIT_MS, myRating: m.ratings[employee],
+    };
+  });
+}
+
+function duelJoin_(body) {
+  const employee = str_(body && body.employee);
+  const code = str_(body && body.code).toUpperCase().replace(/\s+/g, '');
+  if (!employee) return { ok: false, error: 'Не указан сотрудник' };
+  if (!code) return { ok: false, error: 'Введите код комнаты' };
+  if (!isActiveEmployee_(employee)) return { ok: false, error: 'Дуэль доступна только сотрудникам', code: 'auth' };
+
+  return duelLock_(() => {
+    const m = duelByCode_(code);
+    if (!m) return { ok: false, error: 'Комната не найдена или уже закрыта', code: 'notfound' };
+
+    const idx = m.players.findIndex(p => p.name === employee);
+    if (idx >= 0) {
+      // Повторный вход того же игрока (закрыл приложение, вернулся по ссылке)
+      const now = Date.now();
+      if (m.status === 'waiting' && now - m.createdAt > DUEL_WAIT_MS) {
+        duelDrop_(m);
+        return { ok: false, error: 'Ожидание истекло — создайте новую комнату', code: 'expired' };
+      }
+      if (m.status === 'playing') duelTick_(m, now);
+      duelSave_(m);
+      return {
+        ok: true, duelId: m.id, role: idx + 1, status: m.status, code: m.code,
+        now, myRating: duelRatingOf_(m.ratings, employee),
+      };
+    }
+
+    if (m.status === 'finished') return { ok: false, error: 'Матч уже закончился', code: 'finished' };
+    if (m.status !== 'waiting' || m.players.length >= 2) {
+      return { ok: false, error: 'Комната занята — матч уже идёт', code: 'busy' };
+    }
+    const now = Date.now();
+    if (now - m.createdAt > DUEL_WAIT_MS) {
+      duelDrop_(m);
+      return { ok: false, error: 'Комната сгорела — на создание новой есть 2 минуты', code: 'expired' };
+    }
+
+    const ss = ss_();
+    ensureDuelSheets_(ss);
+    m.players.push({ name: employee, hp: DUEL_HP });
+    m.ratings[employee] = duelRatingOf_(duelReadRatings_(ss), employee);
+    m.status = 'playing';
+    m.startedAt = now;
+    m.round = 0;
+    duelStartRound_(m, now);
+    duelSave_(m);
+    log_('Дуэль', 'Комната ' + m.code + ': ' + m.players[0].name + ' × ' + employee);
+
+    return {
+      ok: true, duelId: m.id, role: 2, status: 'playing', code: m.code,
+      now, myRating: m.ratings[employee],
+    };
+  });
+}
+
+/* ---------- Раунд ---------- */
+
+function duelStartRound_(m, now) {
+  if (m.round >= m.maxRounds) return;
+  m.round += 1;
+  const q = m.questions[m.round - 1];
+  m.roundState = {
+    n: m.round,
+    startedAt: now,
+    deadline: now + DUEL_ROUND_MS,
+    answers: [],
+    resolved: false,
+    result: null,
+  };
+  m.nextRoundAt = 0;
+  m.lastRound = m.lastRound || null;
+}
+
+/**
+ * Ленивое продвижение матча: вызывается при каждом опросе/ответе.
+ * Никаких триггеров нет — время проверяем по серверным часам.
+ */
+function duelTick_(m, now) {
+  if (!m || m.status !== 'playing') return;
+  let guard = 0;
+  while (guard++ < 8) {
+    if (!m.roundState) {
+      duelStartRound_(m, now);
+      continue;
+    }
+    const r = m.roundState;
+
+    if (r.resolved) {
+      if (now < (m.nextRoundAt || 0)) return;                 // идёт разбор раунда
+      if (m.round >= m.maxRounds) { duelFinish_(m, now); return; }
+      duelStartRound_(m, now);
+      continue;
+    }
+
+    const outcome = duelEvalRound_(m, now);
+    if (!outcome) return;                                     // раунд ещё не решён
+    duelApplyRound_(m, outcome);
+    if (m.players.some(p => p.hp <= 0) || m.round >= m.maxRounds) {
+      duelFinish_(m, now);
+      return;
+    }
+    m.nextRoundAt = now + DUEL_PAUSE_MS;
+    return;
+  }
+}
+
+/**
+ * Итог раунда или null, если ждать ещё есть смысл.
+ * correct: правильные ответы; answers уже с серверным временем.
+ */
+function duelEvalRound_(m, now) {
+  const r = m.roundState;
+  const ans = r.answers.slice().sort((a, b) => (a.at - b.at) || (a.seq - b.seq));
+
+  if (!ans.length) return now >= r.deadline ? { kind: 'none' } : null;
+
+  if (ans.length >= 2) {
+    const first = ans[0], second = ans[1];
+    if (first.correct && second.correct) {
+      const blocked = (second.at - first.at) <= DUEL_BLOCK_MS;
+      return blocked
+        ? { kind: 'blocked', first: first.name, second: second.name }
+        : { kind: 'damage', attacker: first.name, first: first.name, second: second.name };
+    }
+    if (first.correct) return { kind: 'damage', attacker: first.name };
+    if (second.correct) return { kind: 'damage', attacker: second.name };
+    return { kind: 'none' };
+  }
+
+  const only = ans[0];
+  if (!only.correct) {
+    // Первый ошибся, второй ещё может ответить правильно — ждём дедлайн
+    return now >= r.deadline ? { kind: 'none' } : null;
+  }
+  // Пока правильный ответ один, ждём до дедлайна: второй ещё может успеть
+  // ответить (в окне — блок, позже — урон всё равно первому). Так его ответ
+  // не теряется и попадает в разбор раунда.
+  return now >= r.deadline ? { kind: 'damage', attacker: only.name } : null;
+}
+
+function duelApplyRound_(m, outcome) {
+  const r = m.roundState;
+  const q = m.questions[r.n - 1];
+  const oppName = name => {
+    const p = m.players.find(x => x.name !== name);
+    return p ? p.name : '';
+  };
+
+  let attacker = null, victim = null, blocked = false;
+  if (outcome.kind === 'damage') {
+    attacker = outcome.attacker;
+    victim = oppName(attacker);
+    const p = m.players.find(x => x.name === victim);
+    if (p) p.hp = Math.max(0, p.hp - DUEL_DAMAGE);
+  } else if (outcome.kind === 'blocked') {
+    blocked = true;
+  }
+
+  r.resolved = true;
+  r.result = {
+    n: r.n,
+    correct: q.correct,
+    correctText: q[q.correct],
+    explanation: q['пояснение'],
+    answers: r.answers.map(a => ({ name: a.name, choice: a.choice, correct: a.correct, at: a.at })),
+    first: r.answers.length ? r.answers.slice().sort((a, b) => (a.at - b.at) || (a.seq - b.seq))[0].name : null,
+    attacker,
+    victim,
+    blocked,
+    timeout: r.answers.length === 0,
+  };
+  m.lastRound = r.result;
+}
+
+/** POST {action:'duelAnswer'} — ответ принимает только сервер, один раз на раунд. */
+function duelAnswer_(body) {
+  const employee = str_(body && body.employee);
+  const id = str_(body && body.duelId);
+  const round = Number(body && body.round);
+  const choice = str_(body && body.choice).toUpperCase();
+  if (!employee) return { ok: false, error: 'Не указан сотрудник' };
+  if (!id) return { ok: false, error: 'Не указан матч' };
+  if ('ABCD'.indexOf(choice) === -1) return { ok: false, error: 'Некорректный вариант ответа' };
+
+  return duelLock_(() => {
+    const m = duelLoad_(id);
+    if (!m) return { ok: false, error: 'Матч не найден или уже истёк', code: 'notfound' };
+    if (!m.players.some(p => p.name === employee)) {
+      return { ok: false, error: 'Вы не участник этого матча', code: 'auth' };
+    }
+
+    const now = Date.now();
+    duelTick_(m, now);
+
+    if (m.status !== 'playing') {
+      duelSave_(m);
+      return { ok: false, error: 'Матч уже закончился', code: 'finished' };
+    }
+    const r = m.roundState;
+    if (!r || r.n !== round) {
+      duelSave_(m);
+      return { ok: false, error: 'Этот раунд уже закончился', code: 'round' };
+    }
+    if (r.resolved) {
+      duelSave_(m);
+      return { ok: false, error: now > r.deadline ? 'Время вышло — ответ не принят' : 'Раунд уже закрыт', code: 'round' };
+    }
+    if (now > r.deadline) {
+      duelTick_(m, now);
+      duelSave_(m);
+      return { ok: false, error: 'Время вышло — ответ не принят', code: 'late' };
+    }
+    if (r.answers.some(a => a.name === employee)) {
+      duelSave_(m);
+      return { ok: false, error: 'Ответ уже отправлен — изменить нельзя', code: 'answered' };
+    }
+
+    const q = m.questions[r.n - 1];
+    r.answers.push({
+      name: employee,
+      choice,
+      at: now,
+      correct: choice === q.correct,
+      seq: r.answers.length + 1,
+    });
+    duelTick_(m, now); // мог сразу закрыть раунд
+    duelSave_(m);
+
+    return { ok: true, accepted: true, round: r.n, at: now };
+  });
+}
+
+/* ---------- Состояние для опроса ---------- */
+
+/** GET ?action=duelState&duelId=&employee= */
+function duelState_(id, employee) {
+  id = str_(id);
+  employee = str_(employee);
+  if (!id) return { ok: false, error: 'Не указан матч' };
+  if (!employee) return { ok: false, error: 'Не указан сотрудник' };
+
+  return duelLock_(() => {
+    const m = duelLoad_(id);
+    if (!m) return { ok: false, error: 'Матч не найден — возможно, он уже завершился или истёк', code: 'notfound' };
+    if (!m.players.some(p => p.name === employee)) {
+      return { ok: false, error: 'Вы не участник этого матча', code: 'auth' };
+    }
+
+    const now = Date.now();
+    if (m.status === 'waiting' && now - m.createdAt > DUEL_WAIT_MS) {
+      duelDrop_(m);
+      return { ok: false, error: 'Ожидание истекло — комната закрыта', code: 'expired' };
+    }
+    if (m.status === 'playing') {
+      duelTick_(m, now);
+      duelSave_(m);
+    }
+    return duelStateFor_(m, employee, now);
+  });
+}
+
+/** Состояние без правильного ответа текущего раунда. */
+function duelStateFor_(m, name, now) {
+  const me = m.players.find(p => p.name === name);
+  const opp = m.players.find(p => p.name !== name) || null;
+  const out = {
+    ok: true,
+    duelId: m.id,
+    code: m.code,
+    status: m.status,
+    round: m.round,
+    maxRounds: m.maxRounds,
+    now,
+    myName: name,
+    myHp: me ? me.hp : 0,
+    oppHp: opp ? opp.hp : null,
+    opponent: opp ? opp.name : '',
+    myRating: duelRatingOf_(m.ratings, name),
+    oppRating: opp ? duelRatingOf_(m.ratings, opp.name) : null,
+    question: null,
+    myAnswer: null,
+    oppAnswered: false,
+    lastRound: duelLastFor_(m, name),
+    result: null,
+    deadline: m.status === 'waiting' ? m.createdAt + DUEL_WAIT_MS : 0,
+    pauseUntil: 0,
+  };
+
+  if (m.status === 'playing') {
+    const r = m.roundState;
+    if (r) {
+      out.deadline = r.deadline;
+      out.pauseUntil = m.nextRoundAt || 0;
+      if (!r.resolved) {
+        const q = m.questions[r.n - 1];
+        // Никаких correct/пояснений до закрытия раунда: иначе рейтинг накручивается.
+        out.question = {
+          id: q.id, 'категория': q['категория'], 'вопрос': q['вопрос'],
+          A: q.A, B: q.B, C: q.C, D: q.D,
+        };
+        const mine = r.answers.find(a => a.name === name);
+        out.myAnswer = mine ? mine.choice : null;
+        out.oppAnswered = r.answers.some(a => a.name !== name);
+      }
+    }
+  }
+
+  if (m.status === 'finished') {
+    out.result = {
+      winner: !m.winner ? 'draw' : (m.winner === name ? 'me' : 'opponent'),
+      winnerName: m.winner || '',
+      myHp: me ? me.hp : 0,
+      oppHp: opp ? opp.hp : 0,
+      rounds: m.round,
+    };
+    const ch = m.ratingChanges && m.ratingChanges[name];
+    const oppCh = m.ratingChanges && opp ? m.ratingChanges[opp.name] : null;
+    out.rating = ch ? { before: ch.before, after: ch.after, delta: ch.after - ch.before } : null;
+    out.oppRatingChange = oppCh ? oppCh.after - oppCh.before : null;
+  }
+  return out;
+}
+
+/** Последний закрытый раунд в терминах «я / соперник». Без правильного ответа, пока раунд идёт. */
+function duelLastFor_(m, name) {
+  const res = m.lastRound;
+  if (!res) return null;
+  const opp = m.players.find(p => p.name !== name);
+  const mine = (res.answers || []).find(a => a.name === name);
+  const theirs = opp ? (res.answers || []).find(a => a.name === opp.name) : null;
+  return {
+    n: res.n,
+    correct: res.correct,
+    correctText: res.correctText,
+    explanation: res.explanation,
+    myChoice: mine ? mine.choice : null,
+    oppChoice: theirs ? theirs.choice : null,
+    oppAnswered: !!theirs,
+    blocked: !!res.blocked,
+    damage: res.victim ? (res.victim === name ? 'me' : 'opponent') : null,
+    by: res.attacker ? (res.attacker === name ? 'me' : 'opponent') : null,
+    first: res.first ? (res.first === name ? 'me' : 'opponent') : null,
+    timeout: !!res.timeout,
+  };
+}
+
+/* ---------- Завершение, история, Elo ---------- */
+
+function duelFinish_(m, now) {
+  if (m.status === 'finished') return;
+  m.status = 'finished';
+  m.finishedAt = now;
+  m.nextRoundAt = 0;
+  if (m.roundState) m.roundState.resolved = true;
+
+  const p1 = m.players[0], p2 = m.players[1];
+  if (!p2) { m.status = 'waiting'; return; } // матч без соперника не завершается
+
+  let winner = null;
+  if (p1.hp <= 0 && p2.hp > 0) winner = p2.name;
+  else if (p2.hp <= 0 && p1.hp > 0) winner = p1.name;
+  else if (p1.hp > p2.hp) winner = p1.name;
+  else if (p2.hp > p1.hp) winner = p2.name;
+  m.winner = winner;
+
+  try {
+    const ss = ss_();
+    ensureDuelSheets_(ss);
+    const sh = ss.getSheetByName(SHEETS.ratings);
+    const ratings = duelReadRatings_(ss);
+    const r1 = duelRatingOf_(ratings, p1.name);
+    const r2 = duelRatingOf_(ratings, p2.name);
+    const s1 = winner === null ? 0.5 : (winner === p1.name ? 1 : 0);
+    const s2 = 1 - s1;
+    const n1 = duelElo_(r1, r2, s1);
+    const n2 = duelElo_(r2, r1, s2);
+    m.ratingChanges = {};
+    m.ratingChanges[p1.name] = { before: r1, after: n1 };
+    m.ratingChanges[p2.name] = { before: r2, after: n2 };
+
+    const stamp = new Date(now);
+    [ [p1, r1, n1, s1], [p2, r2, n2, s2] ].forEach(([p, before, after, score]) => {
+      const old = ratings[p.name];
+      const wins = (old ? old.wins : 0) + (score === 1 ? 1 : 0);
+      const losses = (old ? old.losses : 0) + (score === 0 ? 1 : 0);
+      const matches = (old ? old.matches : 0) + 1;
+      if (old) {
+        sh.getRange(old.row, 1, 1, RATING_HEADERS.length)
+          .setValues([[text_(p.name, 80), after, wins, losses, matches, stamp]]);
+      } else {
+        addRow_(sh, [text_(p.name, 80), after, wins, losses, matches, stamp]);
+      }
+    });
+
+    const ds = ss.getSheetByName(SHEETS.duels);
+    const started = m.startedAt || m.createdAt;
+    addRow_(ds, [
+      new Date(started), "'" + m.code, text_(p1.name, 80), text_(p2.name, 80),
+      p1.hp, p2.hp, m.round, winner ? text_(winner, 80) : 'ничья',
+      Math.max(0, Math.round((now - started) / 1000)),
+    ]);
+    SpreadsheetApp.flush();
+    log_('Дуэль', 'Матч ' + m.code + ' завершён: ' + p1.name + ' ' + p1.hp + ' — ' + p2.hp + ' ' + p2.name +
+      (winner ? ', победитель ' + winner : ', ничья'));
+  } catch (e) {
+    log_('Дуэль', 'ОШИБКА записи результата ' + m.code + ': ' + e);
+  }
+}
+
+/** GET ?action=duelCancel&duelId=&employee= — отмена ожидания создателем. */
+function duelCancel_(id, employee) {
+  id = str_(id);
+  employee = str_(employee);
+  if (!id) return { ok: false, error: 'Не указан матч' };
+  return duelLock_(() => {
+    const m = duelLoad_(id);
+    if (!m) return { ok: true, cancelled: true };
+    if (m.status !== 'waiting') return { ok: false, error: 'Матч уже начался — отменить нельзя', code: 'playing' };
+    if (employee && m.players.length && m.players[0].name !== employee) {
+      return { ok: false, error: 'Отменить ожидание может только создатель', code: 'auth' };
+    }
+    duelDrop_(m);
+    log_('Дуэль', 'Ожидание ' + m.code + ' отменено');
+    return { ok: true, cancelled: true };
+  });
 }

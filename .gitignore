@@ -1,0 +1,8 @@
+# Локальные настройки clasp: scriptId проекта и вход в Google — не для репозитория
+apps-script/.clasp.json
+.clasp.json
+.clasprc.json
+apps-script/.clasprc.json
+
+# Зависимости (в этом проекте их нет, но на всякий случай)
+node_modules/

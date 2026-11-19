@@ -10,12 +10,13 @@
 //    ТТК         — список коктейлей с поиском, карточка с фото (работает офлайн)
 //    Инвентаризация — место → категория → вид → позиция → полные + остаток
 //    Переработка — акты: простые (было/стало) и по рецепту (ключевое → пересчёт)
+//    Викторина   — 10 вопросов, таймер, разбор ответа, обжалование вопроса
 //    Очередь     — что ещё не отправлено, что отклонено, история
 // =====================================================================
 
 import { SYNC_INTERVAL_MS, PHOTO_MAX_SIDE, PHOTO_QUALITY } from '../config.js';
 import { db } from './db.js';
-import { apiGet, apiPost, ApiError } from './api.js';
+import { apiGet, apiPost, ApiError, NetworkError } from './api.js';
 import {
   enqueue, startAutoSync, onSyncChange, getStatus, syncNow,
   listQueue, listSent, removeFromQueue, retryRejected,
@@ -288,10 +289,11 @@ function screenHome() {
       }, 'Сменить'),
     ),
     h('div', { class: 'tiles' }, isAdmin()
-      ? [ // Админ: только эти три плитки
+      ? [ // Админ: только эти плитки
         tile('transfer', 'Перенос', 'между точками', () => go(screenItemsForm, 'transfer')),
         tile('writeoff', 'Списание', 'бой, порча, брак', () => go(screenItemsForm, 'writeoff')),
         tile('gift', 'Gift-shop', 'инвентаризация', () => go(screenInventory)),
+        tile('quiz', 'Викторина', 'вопросы смены', () => go(screenQuizStart)),
       ]
       : [
         tile('transfer', 'Перенос', 'кухня ⇄ бар', () => go(screenItemsForm, 'transfer')),
@@ -299,6 +301,7 @@ function screenHome() {
         tile('photo', 'Фото уборки', 'зоны после смены', () => go(screenPhoto)),
         tile('ttk', 'ТТК', 'рецептуры', () => go(screenTtkList)),
         tile('inv', 'Инвентаризация', 'подсчёт остатков', () => go(screenInventory)),
+        tile('quiz', 'Викторина', 'вопросы смены', () => go(screenQuizStart)),
         actsTile(),
       ]),
   );
@@ -1255,6 +1258,322 @@ function screenAct(act) {
 }
 
 // =====================================================================
+//  ВИКТОРИНА
+//
+//  Вопросы приходят с сервера (?action=questions) и ложатся в кэш на
+//  телефоне (kv «quiz:questions» вместе с version): без сети играем из
+//  кэша. Правильный ответ и пояснение уже есть в самом вопросе, поэтому
+//  по ходу партии сеть не нужна.
+//
+//  «Обжаловать» → POST {action:'dispute'}: вопрос уходит в карантин,
+//  жалоба — в лист «Обжалования». Без сети жалоба копится в
+//  kv «quiz:disputes» и досылается при следующем запуске и появлении сети.
+// =====================================================================
+const QUIZ_SIZE = 10;      // вопросов в одной партии
+const QUIZ_SECONDS = 20;   // секунд на один вопрос
+const QUIZ_CACHE_KEY = 'quiz:questions';
+const QUIZ_DISPUTES_KEY = 'quiz:disputes';
+const QUIZ_LETTERS = ['A', 'B', 'C', 'D'];
+
+/** Перемешивание: каждую партию вопросы идут в новом порядке. */
+function shuffled(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+/** «1 вопрос», «2 вопроса», «5 вопросов» — чтобы на экране не было «10 вопрос». */
+function questionsWord(n) {
+  const d = n % 10, dd = n % 100;
+  if (d === 1 && dd !== 11) return 'вопрос';
+  if (d >= 2 && d <= 4 && (dd < 12 || dd > 14)) return 'вопроса';
+  return 'вопросов';
+}
+
+/**
+ * Вопросы: сначала пробуем сервер, при отсутствии сети — кэш на телефоне.
+ * Если сервер вернул новую version — обновляем кэш.
+ */
+async function loadQuizQuestions() {
+  const cache = await db.get('kv', QUIZ_CACHE_KEY);
+  try {
+    const res = await apiGet({ action: 'questions' }, 20000);
+    const fresh = Array.isArray(res.questions) ? res.questions : [];
+    if (!cache || cache.version !== res.version) {
+      await db.put('kv', { version: res.version, questions: fresh, savedAt: new Date().toISOString() }, QUIZ_CACHE_KEY);
+    }
+    return { questions: fresh, cached: false };
+  } catch (e) {
+    if (cache && Array.isArray(cache.questions) && cache.questions.length) {
+      return { questions: cache.questions, cached: true };
+    }
+    throw e;
+  }
+}
+
+// ---------- Обжалования: отправка и локальная очередь ----------
+
+/** Отправить одну жалобу. queued:true — сеть недоступна, повторять позже. */
+async function sendQuizDispute(rec) {
+  try {
+    await apiPost({ action: 'dispute', id: rec.id, employee: rec.employee, answer: rec.answer, comment: rec.comment }, 20000);
+    return { ok: true };
+  } catch (e) {
+    if (e instanceof NetworkError) return { ok: false, queued: true, error: '' };
+    // Сервер ответил и отказал (например, нет листов викторины) — повторять бессмысленно
+    return { ok: false, queued: false, error: e.message || 'Сервер отклонил обжалование' };
+  }
+}
+
+async function queueQuizDispute(rec) {
+  const list = (await db.get('kv', QUIZ_DISPUTES_KEY)) || [];
+  if (list.some(x => x.id === rec.id && x.employee === rec.employee)) return;
+  list.push(rec);
+  await db.put('kv', list, QUIZ_DISPUTES_KEY);
+}
+
+/** Дослать отложенные жалобы. Вызывается при старте и появлении сети. */
+async function flushQuizDisputes() {
+  const list = (await db.get('kv', QUIZ_DISPUTES_KEY)) || [];
+  if (!list.length) return;
+  const left = [];
+  let offline = false;
+  for (const rec of list) {
+    if (offline) { left.push(rec); continue; }
+    const res = await sendQuizDispute(rec);
+    if (res.ok) continue;
+    if (res.queued) { offline = true; left.push(rec); }       // нет сети — оставляем до следующего раза
+    else console.warn('Обжалование отклонено:', res.error);    // сервер сказал «нет» — не копим вечно
+  }
+  if (left.length) await db.put('kv', left, QUIZ_DISPUTES_KEY);
+  else await db.del('kv', QUIZ_DISPUTES_KEY);
+}
+
+/** Жалоба на вопрос: сразу на сервер, при отсутствии сети — в очередь на телефоне. */
+async function submitQuizDispute(q, letter, comment) {
+  const rec = {
+    id: q.id,
+    employee: session ? session.name : '',
+    answer: letter ? `${letter}. ${q[letter]}` : 'нет ответа (время вышло)',
+    comment: comment || '',
+    createdAt: new Date().toISOString(),
+  };
+  const res = await sendQuizDispute(rec);
+  if (res.ok) return { ok: true, queued: false };
+  if (res.queued) { await queueQuizDispute(rec); return { ok: true, queued: true }; }
+  return res;
+}
+
+// ---------- Экран 1: старт ----------
+
+function screenQuizStart() {
+  const root = h('main', { class: 'screen' }, header('Викторина'));
+  const body = h('div', {}, h('p', { class: 'hint' }, 'Загрузка вопросов…'));
+  root.append(body);
+
+  function draw(state) {
+    if (!state.questions.length) {
+      body.replaceChildren(
+        h('p', { class: 'hint' }, 'Вопросов пока нет.'),
+        h('p', { class: 'hint left' }, 'Банк вопросов лежит на сервере, в листе «Вопросы». Если викторину только что включили, владельцу нужно один раз запустить setupQuiz() в редакторе Apps Script.'),
+        h('button', { class: 'secondary', onclick: retry }, 'Обновить'),
+      );
+      return;
+    }
+    const n = Math.min(QUIZ_SIZE, state.questions.length);
+    body.replaceChildren(
+      h('p', { class: 'quiz-score' }, `${n} ${questionsWord(n)}`),
+      h('p', { class: 'muted' }, `Короткая партия: ${QUIZ_SECONDS} секунд на вопрос, один ответ без возврата. После каждого ответа — пояснение и источник, в конце — разбор ошибок.`),
+      state.cached ? h('p', { class: 'hint left' }, 'Нет сети — вопросы взяты из кэша на телефоне. Обжалования уйдут, когда появится связь.') : null,
+      h('button', {
+        class: 'primary',
+        onclick: () => {
+          const game = { list: shuffled(state.questions).slice(0, n), i: 0, score: 0, wrong: [], answered: false };
+          resetTo(screenQuizQuestion, game);
+        },
+      }, 'Начать'),
+    );
+  }
+
+  function retry() {
+    body.replaceChildren(h('p', { class: 'hint' }, 'Загрузка вопросов…'));
+    loadQuizQuestions().then(draw).catch(showError);
+  }
+
+  function showError(e) {
+    const oldServer = e instanceof ApiError && /Неизвестное действие/i.test(e.message);
+    body.replaceChildren(
+      h('p', { class: 'hint' }, oldServer ? 'Сервер пока не умеет отдавать вопросы.' : 'Не удалось загрузить вопросы.'),
+      h('p', { class: 'hint left' }, oldServer
+        ? 'Похоже, новая версия сервера ещё не развёрнута. Владельцу: выложить проект (clasp push) и обновить развёртывание, затем запустить setupQuiz().'
+        : e.message || 'Нет сети, и кэша на телефоне тоже нет.'),
+      h('button', { class: 'secondary', onclick: retry }, 'Повторить'),
+    );
+  }
+
+  loadQuizQuestions().then(draw).catch(showError);
+  flushQuizDisputes();
+  return root;
+}
+
+// ---------- Экран 2: вопрос и таймер ----------
+
+function screenQuizQuestion(game) {
+  const root = h('main', { class: 'screen' });
+  const q = game.list[game.i];
+  const totalMs = QUIZ_SECONDS * 1000;
+  let endsAt = Date.now() + totalMs;
+  let tick = null;
+
+  const stopTimer = () => { if (tick) { clearInterval(tick); tick = null; } };
+
+  const timeLabel = h('span', { class: 'quiz-time' });
+  const bar = h('div', { class: 'quiz-bar' });
+  const head = h('div', { class: 'quiz-head' },
+    h('span', {}, `Счёт: ${game.score}`),
+    timeLabel,
+    h('button', {
+      class: 'link',
+      onclick: () => { if (confirm('Выйти из викторины? Результат этой партии не сохранится.')) { stopTimer(); resetTo(screenHome); } },
+    }, 'Выйти'));
+  const body = h('div', {});
+  root.append(header(`Вопрос ${game.i + 1} из ${game.list.length}`, { showBack: false }), head,
+    h('div', { class: 'quiz-timer' }, bar), body);
+
+  const answers = h('div', { class: 'quiz-answers' });
+  const buttons = {};
+  QUIZ_LETTERS.forEach(L => {
+    const b = h('button', { class: 'answer' }, h('span', { class: 'letter' }, L), h('span', {}, q[L]));
+    b.addEventListener('click', () => choose(L));
+    buttons[L] = b;
+    answers.append(b);
+  });
+  const verdictBox = h('div', {});
+  body.append(h('p', { class: 'quiz-q' }, q['вопрос']), answers, verdictBox);
+
+  function paintTimer() {
+    const left = Math.max(0, endsAt - Date.now());
+    timeLabel.textContent = `${Math.ceil(left / 1000)} с`;
+    bar.style.width = `${(left / totalMs) * 100}%`;
+    bar.classList.toggle('low', left <= 5000);
+  }
+
+  function choose(letter) {
+    if (game.answered) return; // ответить дважды нельзя
+    game.answered = true;
+    stopTimer();
+    const correct = q['правильный'];
+    const isRight = letter === correct;
+    QUIZ_LETTERS.forEach(L => {
+      buttons[L].disabled = true;
+      if (L === correct) buttons[L].classList.add('correct');
+      else if (L === letter) buttons[L].classList.add('wrong');
+    });
+    if (isRight) game.score++;
+    else game.wrong.push({ q, answer: letter });
+
+    const verdict = letter === null ? '⏱ Время вышло' : (isRight ? '✅ Верно' : '❌ Неверно');
+    verdictBox.replaceChildren(
+      h('p', { class: 'quiz-verdict ' + (isRight ? 'ok' : 'bad') }, verdict),
+      h('div', { class: 'quiz-explain' },
+        letter !== null && !isRight
+          ? h('p', {}, `Правильный ответ: ${correct}. ${q[correct]}`) : null,
+        h('p', {}, q['пояснение']),
+        h('p', { class: 'quiz-source' }, 'Источник: ' + q['источник'])),
+      h('button', { class: 'primary', onclick: next },
+        game.i + 1 < game.list.length ? 'Дальше' : 'Показать результат'),
+    );
+  }
+
+  function next() {
+    game.i++;
+    game.answered = false;
+    if (game.i >= game.list.length) return resetTo(screenQuizResult, game);
+    render(); // тот же экран заново: новый вопрос, новый отсчёт
+  }
+
+  paintTimer();
+  tick = setInterval(() => {
+    if (!document.body.contains(root)) { stopTimer(); return; } // экран закрыли — таймер не нужен
+    paintTimer();
+    if (Date.now() >= endsAt) { stopTimer(); choose(null); }
+  }, 100);
+
+  return root;
+}
+
+// ---------- Экран 3: результат и обжалования ----------
+
+function screenQuizResult(game) {
+  const total = game.list.length;
+  const root = h('main', { class: 'screen' }, header('Результат', { showBack: false }));
+  const wrong = game.wrong;
+
+  root.append(
+    h('p', { class: 'quiz-score' }, `Правильно ${game.score} из ${total}`),
+  );
+
+  if (!wrong.length) {
+    root.append(h('p', { class: 'hint' }, 'Ни одной ошибки — отличное знание меню и стандартов.'));
+  } else {
+    root.append(
+      h('p', { class: 'label' }, `Ошибки: ${wrong.length}`),
+      h('p', { class: 'muted' }, 'Считаете вопрос неверным или устаревшим — нажмите «Обжаловать». Вопрос уйдёт на проверку и больше не попадётся игрокам.'),
+      h('div', {}, ...wrong.map(wrongCard)),
+    );
+  }
+
+  root.append(h('button', { class: 'primary', onclick: () => resetTo(screenHome) }, 'На главную'));
+
+  function wrongCard(w) {
+    const q = w.q;
+    const answerText = w.answer ? `${w.answer}. ${q[w.answer]}` : 'не ответил(а), время вышло';
+    const calc = h('div', { class: 'quiz-dispute' });
+    const sent = h('p', { class: 'quiz-sent hidden' }, 'Отправлено на проверку');
+    const row = h('div', { class: 'quiz-dispute-row hidden' });
+    const openBtn = h('button', {
+      class: 'secondary',
+      onclick: () => {
+        openBtn.classList.add('hidden');
+        const comment = h('input', { type: 'text', placeholder: 'Комментарий (необязательно)', maxlength: '500' });
+        const sendBtn = h('button', { class: 'primary' }, 'Отправить');
+        sendBtn.addEventListener('click', async () => {
+          sendBtn.disabled = true;
+          const res = await submitQuizDispute(q, w.answer, comment.value.trim());
+          if (!res.ok) {
+            sendBtn.disabled = false;
+            return toast(res.error || 'Не удалось отправить обжалование', 'bad');
+          }
+          row.classList.add('hidden');
+          sent.textContent = res.queued ? 'Отправлено на проверку. Уйдёт, когда появится сеть.' : 'Отправлено на проверку';
+          sent.classList.remove('hidden');
+        });
+        comment.addEventListener('keydown', e => { if (e.key === 'Enter') sendBtn.click(); });
+        row.replaceChildren(comment, sendBtn);
+        row.classList.remove('hidden');
+        setTimeout(() => comment.focus(), 50);
+      },
+    }, 'Обжаловать');
+
+    calc.append(
+      h('p', { class: 'quiz-source' }, `Ваш ответ: ${answerText} · Правильный: ${q['правильный']}`),
+      h('p', { class: 'quiz-source' }, 'Источник: ' + q['источник']),
+      openBtn, row, sent,
+    );
+    return h('div', { class: 'quiz-wrong' },
+      h('p', { class: 'quiz-wrong-q' }, q['вопрос']),
+      h('p', { class: 'muted' }, q['пояснение']),
+      calc);
+  }
+
+  return root;
+}
+
+
+// =====================================================================
 //  ЭКРАН: ОЧЕРЕДЬ И ИСТОРИЯ
 // =====================================================================
 function describe(r) {
@@ -1363,6 +1682,9 @@ async function start() {
   }
   history.replaceState({ depth: 1 }, '');
   startAutoSync(SYNC_INTERVAL_MS);
+  // Обжалования викторины, скопившиеся без сети, — досылаем при запуске и появлении сети
+  window.addEventListener('online', () => { flushQuizDisputes(); });
+  flushQuizDisputes();
   renderStatus(await getStatus());
 }
 

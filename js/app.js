@@ -1287,8 +1287,17 @@ function screenAct(act) {
 const QUIZ_SIZE = 10;      // вопросов в одной партии
 const QUIZ_SECONDS = 20;   // секунд на один вопрос
 const QUIZ_CACHE_KEY = 'quiz:questions';
-const QUIZ_DISPUTES_KEY = 'quiz:disputes';
+const QUIZ_DISPUTES_KEY = 'quiz:disputes'; // очередь: и обжалования, и результаты
+const QUIZ_STATS_KEY = 'quiz:stats';
 const QUIZ_LETTERS = ['A', 'B', 'C', 'D'];
+
+/** Короткий уникальный id попытки: он же защищает от двойной записи при обрыве сети. */
+function newQuizAttemptId() {
+  try {
+    if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  } catch (e) { /* старый браузер */ }
+  return 'a-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+}
 
 /** Перемешивание: каждую партию вопросы идут в новом порядке. */
 function shuffled(arr) {
@@ -1320,16 +1329,16 @@ async function loadQuizQuestions() {
     if (!cache || cache.version !== res.version) {
       await db.put('kv', { version: res.version, questions: fresh, savedAt: new Date().toISOString() }, QUIZ_CACHE_KEY);
     }
-    return { questions: fresh, cached: false };
+    return { questions: fresh, cached: false, version: res.version };
   } catch (e) {
     if (cache && Array.isArray(cache.questions) && cache.questions.length) {
-      return { questions: cache.questions, cached: true };
+      return { questions: cache.questions, cached: true, version: cache.version };
     }
     throw e;
   }
 }
 
-// ---------- Обжалования: отправка и локальная очередь ----------
+// ---------- Отправка и локальная очередь (обжалования + результаты) ----------
 
 /** Отправить одну жалобу. queued:true — сеть недоступна, повторять позже. */
 async function sendQuizDispute(rec) {
@@ -1343,14 +1352,84 @@ async function sendQuizDispute(rec) {
   }
 }
 
-async function queueQuizDispute(rec) {
+/** Отправить результат попытки. Повторный attemptId сервер не задваивает. */
+async function sendQuizResult(rec) {
+  try {
+    const data = await apiPost({
+      action: 'quizResult', attemptId: rec.attemptId, employee: rec.employee,
+      correct: rec.correct, total: rec.total, seconds: rec.seconds,
+      bankVersion: rec.bankVersion || '',
+    }, 20000);
+    return Object.assign({ ok: true }, data);
+  } catch (e) {
+    if (e instanceof NetworkError) return { ok: false, queued: true, error: '' };
+    return { ok: false, queued: false, error: e.message || 'Сервер отклонил результат' };
+  }
+}
+
+function sameQuizRecord(a, b) {
+  if (a.kind === 'result' || b.kind === 'result') {
+    return a.kind === 'result' && b.kind === 'result' && a.attemptId === b.attemptId;
+  }
+  return a.id === b.id && a.employee === b.employee;
+}
+
+async function queueQuizRecord(rec) {
   const list = (await db.get('kv', QUIZ_DISPUTES_KEY)) || [];
-  if (list.some(x => x.id === rec.id && x.employee === rec.employee)) return;
+  if (list.some(x => sameQuizRecord(x, rec))) return;
   list.push(rec);
   await db.put('kv', list, QUIZ_DISPUTES_KEY);
 }
 
-/** Дослать отложенные жалобы. Вызывается при старте и появлении сети. */
+async function removeQuizRecord(rec) {
+  const list = (await db.get('kv', QUIZ_DISPUTES_KEY)) || [];
+  const left = list.filter(x => !sameQuizRecord(x, rec));
+  if (left.length) await db.put('kv', left, QUIZ_DISPUTES_KEY);
+  else await db.del('kv', QUIZ_DISPUTES_KEY);
+}
+
+function quizStatsFromResponse(employee, res) {
+  return {
+    employee,
+    attempts: Number(res.attempts) || 0,
+    best: Number(res.best) || 0,
+    bestCorrect: Number(res.bestCorrect) || 0,
+    bestTotal: Number(res.bestTotal) || 0,
+    average: Number(res.average) || 0,
+    lastAt: res.lastAt || '',
+  };
+}
+
+/** Локальная (оптимистичная) статистика, пока результат ждёт сети. */
+function mergeLocalQuizStats(prev, rec) {
+  const pct = rec.total > 0 ? rec.correct / rec.total * 100 : 0;
+  const attempts = (prev ? prev.attempts : 0) + 1;
+  const oldBest = prev ? Number(prev.best) || 0 : -1;
+  const better = !prev || pct > oldBest || (pct === oldBest && rec.correct > (prev.bestCorrect || 0));
+  return {
+    employee: rec.employee,
+    attempts,
+    best: better ? pct : (prev.best || 0),
+    bestCorrect: better ? rec.correct : (prev.bestCorrect || 0),
+    bestTotal: better ? rec.total : (prev.bestTotal || 0),
+    average: prev && prev.average
+      ? Math.round(((prev.average * (attempts - 1)) + pct) / attempts * 10) / 10
+      : Math.round(pct * 10) / 10,
+    lastAt: new Date().toISOString(),
+  };
+}
+
+function quizStatsLine(stats) {
+  if (!stats || !(stats.attempts > 0)) return '';
+  let best = '';
+  if (stats.bestTotal) best = `${stats.bestCorrect} из ${stats.bestTotal}`;
+  else if (stats.best) best = `${fmtNum(stats.best)}%`;
+  return best
+    ? `Лучший результат: ${best} · попыток: ${stats.attempts}`
+    : `Попыток: ${stats.attempts}`;
+}
+
+/** Дослать отложенные жалобы и результаты. Вызывается при старте и появлении сети. */
 async function flushQuizDisputes() {
   const list = (await db.get('kv', QUIZ_DISPUTES_KEY)) || [];
   if (!list.length) return;
@@ -1358,10 +1437,16 @@ async function flushQuizDisputes() {
   let offline = false;
   for (const rec of list) {
     if (offline) { left.push(rec); continue; }
-    const res = await sendQuizDispute(rec);
-    if (res.ok) continue;
+    const isResult = rec.kind === 'result';
+    const res = isResult ? await sendQuizResult(rec) : await sendQuizDispute(rec);
+    if (res.ok) {
+      if (isResult && session && rec.employee === session.name) {
+        await db.put('kv', quizStatsFromResponse(rec.employee, res), QUIZ_STATS_KEY);
+      }
+      continue;
+    }
     if (res.queued) { offline = true; left.push(rec); }       // нет сети — оставляем до следующего раза
-    else console.warn('Обжалование отклонено:', res.error);    // сервер сказал «нет» — не копим вечно
+    else console.warn(isResult ? 'Результат викторины отклонён:' : 'Обжалование отклонено:', res.error);
   }
   if (left.length) await db.put('kv', left, QUIZ_DISPUTES_KEY);
   else await db.del('kv', QUIZ_DISPUTES_KEY);
@@ -1370,6 +1455,7 @@ async function flushQuizDisputes() {
 /** Жалоба на вопрос: сразу на сервер, при отсутствии сети — в очередь на телефоне. */
 async function submitQuizDispute(q, letter, comment) {
   const rec = {
+    kind: 'dispute',
     id: q.id,
     employee: session ? session.name : '',
     answer: letter ? `${letter}. ${q[letter]}` : 'нет ответа (время вышло)',
@@ -1378,7 +1464,46 @@ async function submitQuizDispute(q, letter, comment) {
   };
   const res = await sendQuizDispute(rec);
   if (res.ok) return { ok: true, queued: false };
-  if (res.queued) { await queueQuizDispute(rec); return { ok: true, queued: true }; }
+  if (res.queued) { await queueQuizRecord(rec); return { ok: true, queued: true }; }
+  return res;
+}
+
+/**
+ * Результат попытки: сначала кладём в IndexedDB (attemptId уже сохранён),
+ * потом сразу пытаемся отправить. Нет сети — запись останется до следующего раза.
+ */
+async function submitQuizAttempt(game) {
+  if (game.resultSubmitted) return null;
+  game.resultSubmitted = true;
+  if (!game.attemptId) game.attemptId = newQuizAttemptId();
+  const rec = {
+    kind: 'result',
+    attemptId: game.attemptId,
+    employee: session ? session.name : '',
+    correct: game.score,
+    total: game.list.length,
+    seconds: game.seconds,
+    bankVersion: game.bankVersion || '',
+    createdAt: new Date().toISOString(),
+  };
+  if (!rec.employee || !(rec.total > 0)) return { ok: false, error: 'Некого сохранять' };
+
+  await queueQuizRecord(rec);
+  const res = await sendQuizResult(rec);
+  if (res.ok) {
+    await removeQuizRecord(rec);
+    const stats = quizStatsFromResponse(rec.employee, res);
+    await db.put('kv', stats, QUIZ_STATS_KEY);
+    return { ok: true, queued: false, stats };
+  }
+  if (res.queued) {
+    const cached = await db.get('kv', QUIZ_STATS_KEY);
+    const prev = cached && cached.employee === rec.employee ? cached : null;
+    const stats = mergeLocalQuizStats(prev, rec);
+    await db.put('kv', stats, QUIZ_STATS_KEY);
+    return { ok: true, queued: true, stats };
+  }
+  await removeQuizRecord(rec);
   return res;
 }
 
@@ -1386,8 +1511,18 @@ async function submitQuizDispute(q, letter, comment) {
 
 function screenQuizStart() {
   const root = h('main', { class: 'screen' }, header('Викторина'));
+  const statsEl = h('p', { class: 'quiz-stats hidden' });
   const body = h('div', {}, h('p', { class: 'hint' }, 'Загрузка вопросов…'));
-  root.append(body);
+  root.append(statsEl, body);
+
+  // Свой рекорд показываем сразу из кэша, не дожидаясь сети.
+  db.get('kv', QUIZ_STATS_KEY).then(stats => {
+    if (!stats || stats.employee !== session.name) return;
+    const line = quizStatsLine(stats);
+    if (!line) return;
+    statsEl.textContent = line;
+    statsEl.classList.remove('hidden');
+  });
 
   function draw(state) {
     if (!state.questions.length) {
@@ -1406,7 +1541,11 @@ function screenQuizStart() {
       h('button', {
         class: 'primary',
         onclick: () => {
-          const game = { list: shuffled(state.questions).slice(0, n), i: 0, score: 0, wrong: [], answered: false };
+          const game = {
+            list: shuffled(state.questions).slice(0, n), i: 0, score: 0, wrong: [], answered: false,
+            startedAt: Date.now(), bankVersion: state.version || '',
+            attemptId: '', resultSubmitted: false, seconds: null,
+          };
           resetTo(screenQuizQuestion, game);
         },
       }, 'Начать'),
@@ -1524,12 +1663,49 @@ function screenQuizQuestion(game) {
 
 function screenQuizResult(game) {
   const total = game.list.length;
+  if (game.seconds === null || game.seconds === undefined) {
+    game.seconds = Math.max(0, Math.min(3600, Math.round((Date.now() - (game.startedAt || Date.now())) / 1000)));
+  }
   const root = h('main', { class: 'screen' }, header('Результат', { showBack: false }));
   const wrong = game.wrong;
+  const statsBox = h('div', { class: 'quiz-personal hidden' });
+
+  function paintQuizStats(stats, note) {
+    const line = quizStatsLine(stats);
+    if (!line) return;
+    statsBox.replaceChildren(h('p', { class: 'quiz-personal-line' }, line));
+    if (note) statsBox.append(h('p', { class: 'quiz-personal-note' }, note));
+    statsBox.classList.remove('hidden');
+  }
 
   root.append(
     h('p', { class: 'quiz-score' }, `Правильно ${game.score} из ${total}`),
+    statsBox,
   );
+
+  // Сохраняем попытку один раз на игру: attemptId переживает обрыв сети,
+  // а сервер отбрасывает повтор с тем же id.
+  (async () => {
+    try {
+      const cached = await db.get('kv', QUIZ_STATS_KEY);
+      if (cached && session && cached.employee === session.name) paintQuizStats(cached, '');
+      const res = await submitQuizAttempt(game);
+      if (!res) return;
+      if (res.ok) {
+        paintQuizStats(res.stats, res.queued
+          ? 'Результат сохранён на телефоне — уйдёт, когда появится сеть.'
+          : 'Результат сохранён.');
+      } else {
+        statsBox.replaceChildren(h('p', { class: 'quiz-personal-note bad' },
+          'Не удалось сохранить результат: ' + (res.error || 'ошибка')));
+        statsBox.classList.remove('hidden');
+      }
+    } catch (e) {
+      statsBox.replaceChildren(h('p', { class: 'quiz-personal-note bad' },
+        'Не удалось сохранить результат: ' + (e.message || 'ошибка')));
+      statsBox.classList.remove('hidden');
+    }
+  })();
 
   if (!wrong.length) {
     root.append(h('p', { class: 'hint' }, 'Ни одной ошибки — отличное знание меню и стандартов.'));

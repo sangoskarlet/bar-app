@@ -12,7 +12,7 @@
  *    GET  (doGet)  — приложение что-то ЧИТАЕТ: справочник, ТТК, фото ТТК, вопросы викторины,
  *                    состояние дуэли, рейтинг.
  *    POST (doPost) — приложение что-то ПИШЕТ: вход, переносы, списания, фото,
- *                    обжалование вопроса викторины, ответы дуэли.
+ *                    обжалование вопроса викторины, ответы дуэли, результат викторины.
  *
  *  Главные правила надёжности:
  *    1. У каждой записи есть уникальный ID, который придумывает телефон.
@@ -45,7 +45,8 @@ const SHEETS = {
   questions: 'Вопросы',             // банк вопросов викторины (создаётся setupQuiz)
   disputes:  'Обжалования',         // жалобы на вопросы викторины (создаётся setupQuiz)
   duels:     'Дуэли',               // история матчей (создаётся автоматически)
-  ratings:   'Рейтинг',             // Elo сотрудников (создаётся автоматически)
+  ratings:   'Рейтинг',             // Elo дуэли + агрегаты викторины (создаётся автоматически)
+  quizTries: 'Викторина',           // сырые попытки викторины (создаётся автоматически)
 };
 
 // В каком столбце листа лежит ID записи (считаем с 1: A=1, B=2 ...).
@@ -101,6 +102,7 @@ function doPost(e) {
     if (body.action === 'duelCreate') return json_(duelCreate_(body));
     if (body.action === 'duelJoin') return json_(duelJoin_(body));
     if (body.action === 'duelAnswer') return json_(duelAnswer_(body));
+    if (body.action === 'quizResult') return json_(quizResult_(body));
     return json_({ ok: false, error: 'Неизвестное действие: ' + body.action });
   } catch (err) {
     log_('ОШИБКА POST', String(err && err.stack || err));
@@ -670,7 +672,7 @@ function setup() {
   // «Эталоны уборки» и листы викторины к обязательным не относятся:
   // эталоны необязательны, а листы викторины создаёт отдельная функция setupQuiz().
   // Листы дуэли и рейтинга создаются сами при первой дуэли (ensureDuelSheets_).
-  const auto = ['refs', 'questions', 'disputes', 'duels', 'ratings'];
+  const auto = ['refs', 'questions', 'disputes', 'duels', 'ratings', 'quizTries'];
   const missing = Object.keys(SHEETS).filter(k => auto.indexOf(k) === -1)
     .map(k => SHEETS[k]).filter(n => !ss.getSheetByName(n));
   if (missing.length) throw new Error('В таблице нет листов: ' + missing.join(', '));
@@ -1131,7 +1133,17 @@ const DUEL_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // без I, O, 0
 
 const DUEL_HEADERS = ['дата', 'код', 'игрок_1', 'игрок_2', 'hp_1', 'hp_2',
   'раундов', 'победитель', 'длительность_сек'];
-const RATING_HEADERS = ['сотрудник', 'рейтинг', 'побед', 'поражений', 'матчей', 'последний_матч'];
+
+// «Рейтинг»: сначала дуэльные колонки (их порядок нельзя менять — там уже данные),
+// затем агрегаты викторины. Новые колонки только ДОПИСЫВАЮТСЯ справа.
+const RATING_DUEL_HEADERS = ['сотрудник', 'рейтинг', 'побед', 'поражений', 'матчей', 'последний_матч'];
+const RATING_QUIZ_HEADERS = ['викторина_попыток', 'викторина_лучший', 'викторина_средний', 'викторина_последняя'];
+const RATING_HEADERS = RATING_DUEL_HEADERS.concat(RATING_QUIZ_HEADERS);
+const RATING_DUEL_COLUMNS = RATING_DUEL_HEADERS.length;
+
+// Сырые попытки викторины: attemptId — первая колонка, чтобы ловить дубли.
+const QUIZ_TRY_HEADERS = ['attempt_id', 'дата', 'сотрудник', 'верно', 'всего', 'секунд', 'версия_банка'];
+const QUIZ_TRY_COLUMNS = QUIZ_TRY_HEADERS.length;
 
 /** Общая обёртка: одна дуэль меняется одним игроком за раз. */
 function duelLock_(fn) {
@@ -1223,6 +1235,7 @@ function ensureDuelSheets_(ss) {
     rs.setFrozenRows(1);
     rs.setColumnWidth(1, 180);
     rs.setColumnWidth(6, 150);
+    for (let i = 0; i < RATING_QUIZ_HEADERS.length; i++) rs.setColumnWidth(RATING_DUEL_COLUMNS + 1 + i, 150);
   }
   return { duels: ds, ratings: rs };
 }
@@ -1237,7 +1250,7 @@ function duelReadRatings_(ss) {
   const sh = ss.getSheetByName(SHEETS.ratings);
   const out = {};
   if (!sh || sh.getLastRow() < 2) return out;
-  sh.getRange(2, 1, sh.getLastRow() - 1, RATING_HEADERS.length).getValues().forEach((r, i) => {
+  sh.getRange(2, 1, sh.getLastRow() - 1, RATING_DUEL_COLUMNS).getValues().forEach((r, i) => {
     const name = str_(r[0]);
     if (!name) return;
     out[name] = {
@@ -1746,7 +1759,8 @@ function duelFinish_(m, now) {
       const losses = (old ? old.losses : 0) + (score === 0 ? 1 : 0);
       const matches = (old ? old.matches : 0) + 1;
       if (old) {
-        sh.getRange(old.row, 1, 1, RATING_HEADERS.length)
+        // Пишем только дуэльные колонки: агрегаты викторины справа не трогаем.
+        sh.getRange(old.row, 1, 1, RATING_DUEL_COLUMNS)
           .setValues([[text_(p.name, 80), after, wins, losses, matches, stamp]]);
       } else {
         addRow_(sh, [text_(p.name, 80), after, wins, losses, matches, stamp]);
@@ -1783,5 +1797,148 @@ function duelCancel_(id, employee) {
     duelDrop_(m);
     log_('Дуэль', 'Ожидание ' + m.code + ' отменено');
     return { ok: true, cancelled: true };
+  });
+}
+
+
+/* =====================================================================
+ *  РЕЙТИНГ ВИКТОРИНЫ
+ * =====================================================================
+ *
+ *  Лист «Викторина» — сырые попытки:
+ *    attempt_id | дата | сотрудник | верно | всего | секунд | версия_банка
+ *  attempt_id придумывает телефон; повторная отправка того же id не создаёт
+ *  вторую строку (идемпотентность при обрыве сети).
+ *
+ *  Лист «Рейтинг» — те же строки, что у дуэли, плюс четыре колонки СПРАВА:
+ *    викторина_попыток | викторина_лучший | викторина_средний | викторина_последняя
+ *  Порядок дуэльных колонок не меняется: там уже есть данные.
+ *  «лучший» и «средний» — проценты (0…100), «последняя» — дата попытки.
+ * ===================================================================== */
+
+function quizLock_(fn) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) return { ok: false, error: 'Сервер занят, повторите через пару секунд', code: 'busy' };
+  try {
+    return fn();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Создаёт «Викторину» и дописывает недостающие колонки в «Рейтинг». */
+function ensureQuizSheets_(ss) {
+  ss = ss || ss_();
+  const base = ensureDuelSheets_(ss); // гарантирует «Рейтинг» с полной шапкой
+  let qs = ss.getSheetByName(SHEETS.quizTries);
+  if (!qs) {
+    qs = ss.insertSheet(SHEETS.quizTries);
+    qs.getRange(1, 1, 1, QUIZ_TRY_COLUMNS).setValues([QUIZ_TRY_HEADERS]).setFontWeight('bold');
+    qs.setFrozenRows(1);
+    qs.setColumnWidth(1, 220);
+    qs.setColumnWidth(3, 160);
+    qs.setColumnWidth(7, 160);
+  }
+  const rs = base.ratings;
+  const have = rs.getRange(1, RATING_DUEL_COLUMNS + 1, 1, RATING_QUIZ_HEADERS.length).getValues()[0];
+  if (!str_(have[0])) {
+    rs.getRange(1, RATING_DUEL_COLUMNS + 1, 1, RATING_QUIZ_HEADERS.length)
+      .setValues([RATING_QUIZ_HEADERS]).setFontWeight('bold');
+    for (let i = 0; i < RATING_QUIZ_HEADERS.length; i++) {
+      rs.setColumnWidth(RATING_DUEL_COLUMNS + 1 + i, 150);
+    }
+  }
+  return { results: qs, ratings: rs };
+}
+
+function round1_(v) { return Math.round(v * 10) / 10; }
+
+/** Агрегаты одного сотрудника по сырым попыткам. */
+function quizAggregates_(sh, employee) {
+  const zero = { attempts: 0, best: 0, bestCorrect: 0, bestTotal: 0, average: 0, lastAt: '' };
+  if (!sh || sh.getLastRow() < 2) return zero;
+  const data = sh.getRange(2, 1, sh.getLastRow() - 1, QUIZ_TRY_COLUMNS).getValues();
+  let attempts = 0, sum = 0, bestPct = -1, bestCorrect = 0, bestTotal = 0, last = null;
+  data.forEach(r => {
+    const name = str_(r[2]).replace(/^'/, '');
+    if (name !== employee) return;
+    const correct = num_(r[3]);
+    const total = num_(r[4]);
+    if (!(total > 0) || correct < 0 || correct > total) return;
+    const pct = correct / total * 100;
+    attempts++;
+    sum += pct;
+    if (pct > bestPct || (pct === bestPct && correct > bestCorrect)) {
+      bestPct = pct; bestCorrect = correct; bestTotal = total;
+    }
+    const d = r[1] instanceof Date ? r[1] : new Date(r[1]);
+    if (!isNaN(d.getTime()) && (!last || d.getTime() > last.getTime())) last = d;
+  });
+  if (!attempts) return zero;
+  return {
+    attempts,
+    best: round1_(bestPct),
+    bestCorrect, bestTotal,
+    average: round1_(sum / attempts),
+    lastAt: last ? last.toISOString() : '',
+  };
+}
+
+/** Пишет агрегаты в «Рейтинг», не трогая дуэльные колонки 1–6. */
+function updateQuizRatingRow_(ss, employee, agg) {
+  const sh = ss.getSheetByName(SHEETS.ratings);
+  const stamp = agg.lastAt ? new Date(agg.lastAt) : '';
+  if (sh.getLastRow() >= 2) {
+    const data = sh.getRange(2, 1, sh.getLastRow() - 1, RATING_DUEL_COLUMNS).getValues();
+    const idx = data.findIndex(r => str_(r[0]).replace(/^'/, '') === employee);
+    if (idx >= 0) {
+      sh.getRange(idx + 2, RATING_DUEL_COLUMNS + 1, 1, RATING_QUIZ_HEADERS.length)
+        .setValues([[agg.attempts, agg.best, agg.average, stamp]]);
+      return;
+    }
+  }
+  // Сотрудник ещё не играл дуэль — заводим строку с дуэльными значениями по умолчанию.
+  addRow_(sh, [text_(employee, 80), DUEL_ELO_START, 0, 0, 0, '',
+    agg.attempts, agg.best, agg.average, stamp]);
+}
+
+/**
+ * POST {action:'quizResult', attemptId, employee, correct, total, seconds, bankVersion}
+ * Пишет попытку и возвращает личный рекорд: {ok, best, attempts, ...}.
+ * Повторный attemptId возвращает те же агрегаты без новой строки.
+ */
+function quizResult_(body) {
+  const attemptId = str_(body && body.attemptId);
+  const employee = str_(body && body.employee);
+  const correct = Number(body && body.correct);
+  const total = Number(body && body.total);
+  const seconds = Number(body && body.seconds);
+  const bankVersion = str_(body && body.bankVersion).slice(0, 80);
+
+  if (!/^[A-Za-z0-9-]{8,64}$/.test(attemptId)) return { ok: false, error: 'Некорректный attemptId' };
+  if (!employee) return { ok: false, error: 'Не указан сотрудник' };
+  if (!isActiveEmployee_(employee)) return { ok: false, error: 'Сотрудник не найден или отключён', code: 'auth' };
+  if (!Number.isInteger(total) || total <= 0 || total > 1000) return { ok: false, error: 'Некорректное число вопросов' };
+  if (!Number.isInteger(correct) || correct < 0 || correct > total) return { ok: false, error: 'Некорректное число верных ответов' };
+  if (!isFinite(seconds) || seconds < 0 || seconds > 3600) return { ok: false, error: 'Некорректное время попытки' };
+
+  return quizLock_(() => {
+    const ss = ss_();
+    const { results: sh } = ensureQuizSheets_(ss);
+
+    if (idExists_(sh, 1, attemptId)) {
+      const agg = quizAggregates_(sh, employee);
+      return Object.assign({ ok: true, duplicate: true }, agg);
+    }
+
+    addRow_(sh, [
+      "'" + attemptId, new Date(), text_(employee, 80),
+      correct, total, round1_(seconds), text_(bankVersion, 80),
+    ]);
+    const agg = quizAggregates_(sh, employee);
+    updateQuizRatingRow_(ss, employee, agg);
+    SpreadsheetApp.flush();
+    log_('Викторина', 'Результат: ' + employee + ' ' + correct + '/' + total + ' за ' + round1_(seconds) + ' с');
+    return Object.assign({ ok: true, duplicate: false }, agg);
   });
 }

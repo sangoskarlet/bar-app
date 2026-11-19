@@ -276,6 +276,11 @@ textarea { margin-top: 16px; resize: vertical; }
 .quiz-dispute-row input { min-height: 44px; }
 .quiz-dispute-row .primary { margin-top: 0; min-height: 44px; width: auto; padding: 0 16px; }
 .quiz-sent { color: var(--ok); font-weight: 600; margin: 10px 0 0; }
+.quiz-stats { text-align: center; color: var(--accent); font-size: 15px; font-weight: 600; margin: 4px 0 10px; }
+.quiz-personal { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 14px; margin: 12px 0 4px; text-align: center; }
+.quiz-personal-line { margin: 0; color: var(--accent); font-weight: 700; }
+.quiz-personal-note { margin: 6px 0 0; color: var(--muted); font-size: 13px; }
+.quiz-personal-note.bad { color: var(--bad); }
 
 /* Дуэль */
 .duel-screen { padding-bottom: 20px; }

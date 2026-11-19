@@ -10,7 +10,7 @@
  *
  *  Два типа запросов:
  *    GET  (doGet)  — приложение что-то ЧИТАЕТ: справочник, ТТК, фото ТТК, вопросы викторины,
- *                    состояние дуэли, рейтинг.
+ *                    состояние дуэли, рейтинг, профиль персонажа (заготовка).
  *    POST (doPost) — приложение что-то ПИШЕТ: вход, переносы, списания, фото,
  *                    обжалование вопроса викторины, ответы дуэли, результат викторины.
  *
@@ -47,6 +47,9 @@ const SHEETS = {
   duels:     'Дуэли',               // история матчей (создаётся автоматически)
   ratings:   'Рейтинг',             // Elo дуэли + агрегаты викторины (создаётся автоматически)
   quizTries: 'Викторина',           // сырые попытки викторины (создаётся автоматически)
+  characters: 'Персонажи',          // персонаж сотрудника (создаётся автоматически)
+  itemCatalog: 'Предметы',          // каталог предметов и эффектов (создаётся автоматически)
+  inventory: 'Инвентарь',           // полученные предметы и экипировка (создаётся автоматически)
 };
 
 // В каком столбце листа лежит ID записи (считаем с 1: A=1, B=2 ...).
@@ -84,6 +87,7 @@ function doGet(e) {
     if (action === 'duelState') return json_(duelState_(e.parameter.duelId, e.parameter.employee));
     if (action === 'duelCancel') return json_(duelCancel_(e.parameter.duelId, e.parameter.employee));
     if (action === 'duelRating') return json_(duelRating_(e.parameter.employee));
+    if (action === 'profile') return json_(getProfile_(e.parameter.employee));
     if (action === 'ping') return json_({ ok: true, time: new Date().toISOString() });
     return json_({ ok: false, error: 'Неизвестное действие: ' + action });
   } catch (err) {
@@ -672,7 +676,8 @@ function setup() {
   // «Эталоны уборки» и листы викторины к обязательным не относятся:
   // эталоны необязательны, а листы викторины создаёт отдельная функция setupQuiz().
   // Листы дуэли и рейтинга создаются сами при первой дуэли (ensureDuelSheets_).
-  const auto = ['refs', 'questions', 'disputes', 'duels', 'ratings', 'quizTries'];
+  const auto = ['refs', 'questions', 'disputes', 'duels', 'ratings', 'quizTries',
+    'characters', 'itemCatalog', 'inventory'];
   const missing = Object.keys(SHEETS).filter(k => auto.indexOf(k) === -1)
     .map(k => SHEETS[k]).filter(n => !ss.getSheetByName(n));
   if (missing.length) throw new Error('В таблице нет листов: ' + missing.join(', '));
@@ -1941,4 +1946,201 @@ function quizResult_(body) {
     log_('Викторина', 'Результат: ' + employee + ' ' + correct + '/' + total + ' за ' + round1_(seconds) + ' с');
     return Object.assign({ ok: true, duplicate: false }, agg);
   });
+}
+
+
+/* =====================================================================
+ *  ПЕРСОНАЛИЗАЦИЯ: ПЕРСОНАЖИ, ВНЕШНИЙ ВИД, ПРЕДМЕТЫ
+ * =====================================================================
+ *
+ *  ЭТО ТОЛЬКО ОСНОВАНИЕ. Механика ВЫКЛЮЧЕНА: предметы не влияют ни на
+ *  викторину, ни на дуэль. Сервер только читает листы и отдаёт профиль.
+ *
+ *  Листы (создаются при первом обращении):
+ *    Персонажи: сотрудник | имя_персонажа | аватар | цвет | эмблема | дата_создания
+ *    Предметы:  код | название | описание | слот | редкость |
+ *               эффект_тип | эффект_параметр | эффект_условие | эффект_значение | активен
+ *    Инвентарь: сотрудник | код_предмета | получен_дата | источник | экипирован
+ *
+ *  Эффект — строка данных, а не код. Новый предмет добавляется в «Предметы»
+ *  без правки JavaScript. Применение эффектов когда-нибудь будет в
+ *  applyItemEffects_() — сейчас она возвращает нули и нигде не вызывается.
+ * ===================================================================== */
+
+const CHARACTER_HEADERS = ['сотрудник', 'имя_персонажа', 'аватар', 'цвет', 'эмблема', 'дата_создания'];
+const ITEM_HEADERS = ['код', 'название', 'описание', 'слот', 'редкость',
+  'эффект_тип', 'эффект_параметр', 'эффект_условие', 'эффект_значение', 'активен'];
+const INVENTORY_HEADERS = ['сотрудник', 'код_предмета', 'получен_дата', 'источник', 'экипирован'];
+
+// Примеры-пустышки: показывают формат, но механика выключена.
+const ITEM_SEEDS = [
+  ['vine_expert', 'Винный знаток', 'Пример: +1 урона на вопросах категории «Вино». Механика пока выключена.',
+    'аксессуар', 'редкий', 'урон', 'категория', 'Вино', 1, true],
+  ['silver_shaker', 'Серебряный шейкер', 'Пример: +2 секунды к раунду в дружеском матче. Механика пока выключена.',
+    'инструмент', 'необычный', 'время', 'раунд', 'дружеский', 2, true],
+  ['barman_shield', 'Щит бармена', 'Пример: один щит за матч в дружеском режиме. Механика пока выключена.',
+    'аксессуар', 'редкий', 'щит', 'матч', 'дружеский', 1, true],
+  ['leather_notebook', 'Кожаный блокнот', 'Пример косметики: аксессуар персонажа.',
+    'аксессуар', 'обычный', 'косметика', 'аксессуар', 'всегда', '', true],
+  ['mentor_badge', 'Значок наставника', 'Пример косметики: эмблема персонажа.',
+    'эмблема', 'обычный', 'косметика', 'эмблема', 'всегда', '', true],
+];
+
+function ensureProfileSheets_(ss) {
+  ss = ss || ss_();
+
+  let characters = ss.getSheetByName(SHEETS.characters);
+  if (!characters) {
+    characters = ss.insertSheet(SHEETS.characters);
+    characters.getRange(1, 1, 1, CHARACTER_HEADERS.length).setValues([CHARACTER_HEADERS]).setFontWeight('bold');
+    characters.setFrozenRows(1);
+    characters.setColumnWidth(1, 180);
+    characters.setColumnWidth(2, 180);
+  }
+
+  let itemCatalog = ss.getSheetByName(SHEETS.itemCatalog);
+  if (!itemCatalog) {
+    itemCatalog = ss.insertSheet(SHEETS.itemCatalog);
+    itemCatalog.getRange(1, 1, 1, ITEM_HEADERS.length).setValues([ITEM_HEADERS]).setFontWeight('bold');
+    itemCatalog.setFrozenRows(1);
+    itemCatalog.setColumnWidth(1, 150);
+    itemCatalog.setColumnWidth(2, 180);
+    itemCatalog.setColumnWidth(3, 360);
+    itemCatalog.setColumnWidth(8, 160);
+  }
+  if (itemCatalog.getLastRow() < 2) {
+    itemCatalog.getRange(2, 1, ITEM_SEEDS.length, ITEM_HEADERS.length).setValues(ITEM_SEEDS);
+  }
+
+  let inventory = ss.getSheetByName(SHEETS.inventory);
+  if (!inventory) {
+    inventory = ss.insertSheet(SHEETS.inventory);
+    inventory.getRange(1, 1, 1, INVENTORY_HEADERS.length).setValues([INVENTORY_HEADERS]).setFontWeight('bold');
+    inventory.setFrozenRows(1);
+    inventory.setColumnWidth(1, 180);
+    inventory.setColumnWidth(3, 150);
+    inventory.setColumnWidth(4, 160);
+  }
+
+  return { characters, itemCatalog, inventory };
+}
+
+function bool_(v) {
+  if (v === true) return true;
+  const s = str_(v).toLowerCase();
+  return s === 'true' || s === 'да' || s === '1';
+}
+
+function isoDate_(v) {
+  if (!v) return '';
+  const d = v instanceof Date ? v : new Date(v);
+  return isNaN(d.getTime()) ? str_(v) : d.toISOString();
+}
+
+function readItemCatalog_(ss) {
+  const sh = ss.getSheetByName(SHEETS.itemCatalog);
+  const out = [];
+  if (!sh || sh.getLastRow() < 2) return out;
+  sh.getRange(2, 1, sh.getLastRow() - 1, ITEM_HEADERS.length).getValues().forEach(r => {
+    const code = str_(r[0]);
+    if (!code) return;
+    out.push({
+      code,
+      name: str_(r[1]),
+      description: str_(r[2]),
+      slot: str_(r[3]),
+      rarity: str_(r[4]),
+      effect: {
+        type: str_(r[5]),
+        param: str_(r[6]),
+        condition: str_(r[7]),
+        value: num_(r[8]),
+      },
+      active: bool_(r[9]),
+    });
+  });
+  return out;
+}
+
+function readCharacter_(ss, employee) {
+  const sh = ss.getSheetByName(SHEETS.characters);
+  const empty = { employee, name: '', avatar: '', color: '', emblem: '', createdAt: '' };
+  if (!sh || sh.getLastRow() < 2) return empty;
+  const rows = sh.getRange(2, 1, sh.getLastRow() - 1, CHARACTER_HEADERS.length).getValues();
+  const r = rows.find(x => str_(x[0]).replace(/^'/, '') === employee);
+  if (!r) return empty;
+  return {
+    employee,
+    name: str_(r[1]),
+    avatar: str_(r[2]),
+    color: str_(r[3]),
+    emblem: str_(r[4]),
+    createdAt: isoDate_(r[5]),
+  };
+}
+
+function readInventory_(ss, employee, catalog) {
+  const sh = ss.getSheetByName(SHEETS.inventory);
+  if (!sh || sh.getLastRow() < 2) return [];
+  const byCode = {};
+  catalog.forEach(it => { byCode[it.code] = it; });
+  const out = [];
+  sh.getRange(2, 1, sh.getLastRow() - 1, INVENTORY_HEADERS.length).getValues().forEach(r => {
+    if (str_(r[0]).replace(/^'/, '') !== employee) return;
+    const code = str_(r[1]);
+    if (!code) return;
+    const item = byCode[code] || null;
+    out.push({
+      code,
+      name: item ? item.name : code,
+      description: item ? item.description : '',
+      slot: item ? item.slot : '',
+      rarity: item ? item.rarity : '',
+      effect: item ? item.effect : { type: '', param: '', condition: '', value: 0 },
+      active: item ? item.active : false,
+      receivedAt: isoDate_(r[2]),
+      source: str_(r[3]),
+      equipped: bool_(r[4]),
+    });
+  });
+  return out;
+}
+
+/** GET ?action=profile&employee= — профиль без начисления и без механики. */
+function getProfile_(employee) {
+  employee = str_(employee);
+  if (!employee) return { ok: false, error: 'Не указан сотрудник' };
+  if (!isActiveEmployee_(employee)) return { ok: false, error: 'Сотрудник не найден или отключён', code: 'auth' };
+  try {
+    const ss = ss_();
+    ensureProfileSheets_(ss);
+    const catalog = readItemCatalog_(ss);
+    const inventory = readInventory_(ss, employee, catalog);
+    return {
+      ok: true,
+      employee,
+      character: readCharacter_(ss, employee),
+      equipped: inventory.filter(x => x.equipped),
+      inventory,
+      catalog,
+    };
+  } catch (e) {
+    return { ok: false, error: 'Не удалось прочитать профиль: ' + e };
+  }
+}
+
+/**
+ * Применение эффектов предметов. ПОКА ВЫКЛЮЧЕНО: всегда возвращает нули.
+ * Включать здесь и вызывать из:
+ *   — duelApplyRound_() — урон (effect.type === 'урон');
+ *   — duelStartRound_() — время раунда (effect.type === 'время');
+ *   — duelTick_()/duelAnswer_() — щит (effect.type === 'щит');
+ *   — подсчёта результата одиночной викторины (если решим давать бонусы там).
+ * Правило: фильтр по режиму (рейтинговый/дружеский) и условию, затем
+ * сложение значений с ограничениями. В рейтинговой дуэли бонусов быть не должно.
+ */
+function applyItemEffects_(context, equippedItems) {
+  // context: { mode: 'duel'|'quiz', rated: true|false, category: 'Вино', ... }
+  // equippedItems: строки из getProfile_().equipped.
+  return { damage: 0, seconds: 0, shield: 0 };
 }

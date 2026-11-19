@@ -724,9 +724,13 @@ function setupQuiz() {
   let added = 0;
   if (qs.getLastRow() < 2) {
     const now = new Date();
+    // Все текстовые ячейки пишем через text_ (апостроф в начале): иначе Таблицы
+    // разбирают ответы вида «2:1:1» как время, а «1860» — как число.
     const rows = QUIZ_QUESTIONS.map(q => [
-      q.id, q['категория'], q['вопрос'], q.A, q.B, q.C, q.D,
-      str_(q['правильный']).toUpperCase(), q['пояснение'], q['источник'], 'в игре', now,
+      text_(q.id, 40), text_(q['категория'], 80), text_(q['вопрос'], 1000),
+      text_(q.A, 300), text_(q.B, 300), text_(q.C, 300), text_(q.D, 300),
+      str_(q['правильный']).toUpperCase(), text_(q['пояснение'], 1500), text_(q['источник'], 300),
+      'в игре', now,
     ]);
     if (rows.length) {
       qs.getRange(2, 1, rows.length, QUIZ_COLUMNS).setValues(rows);
@@ -771,7 +775,8 @@ function getQuestions_() {
     if (!id) return;
     // Пустой статус у строки, добавленной владельцем руками, считаем «в игре»
     const status = str_(r[10]) || 'в игре';
-    versionSource += id + '|' + str_(r[7]) + '|' + status + ';';
+    // В version входит и текст: поправили опечатку или ответ — кэш на телефоне обновится
+    versionSource += [id, r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], status].join('|') + ';';
     if (status !== 'в игре') return;
 
     const q = {

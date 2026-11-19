@@ -3,6 +3,13 @@ apps-script/.clasp.json
 .clasp.json
 .clasprc.json
 apps-script/.clasprc.json
+.clasp-home/
+
+# Каталоги локального запуска clasp (кэш npm) — не для репозитория
+.npm-cache/
+
+# Каталог сверки выложенного кода с репозиторием (clasp pull) — служебный
+.pull-check/
 
 # Зависимости (в этом проекте их нет, но на всякий случай)
 node_modules/

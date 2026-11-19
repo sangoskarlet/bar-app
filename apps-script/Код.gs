@@ -9,8 +9,9 @@
  *    PIN, проверяет данные, защищает от дублей и записывает строку.
  *
  *  Два типа запросов:
- *    GET  (doGet)  — приложение что-то ЧИТАЕТ: справочник, ТТК, фото ТТК.
- *    POST (doPost) — приложение что-то ПИШЕТ: вход, переносы, списания, фото.
+ *    GET  (doGet)  — приложение что-то ЧИТАЕТ: справочник, ТТК, фото ТТК, вопросы викторины.
+ *    POST (doPost) — приложение что-то ПИШЕТ: вход, переносы, списания, фото,
+ *                    обжалование вопроса викторины.
  *
  *  Главные правила надёжности:
  *    1. У каждой записи есть уникальный ID, который придумывает телефон.
@@ -40,6 +41,8 @@ const SHEETS = {
   actTpl:    'Шаблоны переработки', // какие акты бывают и их рецепты
   acts:      'Акты переработки',    // журнал актов: строка на каждое сырьё и результат
   refs:      'Эталоны уборки',      // зона → что проверять + эталонное фото (для ИИ-проверки)
+  questions: 'Вопросы',             // банк вопросов викторины (создаётся setupQuiz)
+  disputes:  'Обжалования',         // жалобы на вопросы викторины (создаётся setupQuiz)
 };
 
 // В каком столбце листа лежит ID записи (считаем с 1: A=1, B=2 ...).
@@ -73,6 +76,7 @@ function doGet(e) {
     if (action === 'config') return json_(getConfig_());
     if (action === 'ttkPhoto') return json_(getTtkPhoto_(e.parameter.id));
     if (action === 'openActs') return json_({ ok: true, acts: openActs_(ss_()) });
+    if (action === 'questions') return json_(getQuestions_());
     if (action === 'ping') return json_({ ok: true, time: new Date().toISOString() });
     return json_({ ok: false, error: 'Неизвестное действие: ' + action });
   } catch (err) {
@@ -87,6 +91,7 @@ function doPost(e) {
     const body = JSON.parse((e && e.postData && e.postData.contents) || '{}');
     if (body.action === 'login') return json_(login_(body.name, body.pin));
     if (body.action === 'submit') return json_(submit_(body.records));
+    if (body.action === 'dispute') return json_(dispute_(body));
     return json_({ ok: false, error: 'Неизвестное действие: ' + body.action });
   } catch (err) {
     log_('ОШИБКА POST', String(err && err.stack || err));
@@ -653,11 +658,192 @@ function photoFolderFor_(date) {
 
 function setup() {
   const ss = ss_();
-  const missing = Object.keys(SHEETS).filter(k => k !== 'refs').map(k => SHEETS[k]).filter(n => !ss.getSheetByName(n));
+  // «Эталоны уборки» и листы викторины к обязательным не относятся:
+  // эталоны необязательны, а листы викторины создаёт отдельная функция setupQuiz().
+  const missing = Object.keys(SHEETS).filter(k => k !== 'refs' && k !== 'questions' && k !== 'disputes')
+    .map(k => SHEETS[k]).filter(n => !ss.getSheetByName(n));
   if (missing.length) throw new Error('В таблице нет листов: ' + missing.join(', '));
   const folder = photoFolderFor_(new Date());
   log_('Настройка', 'OK. Папка для фото: ' + folder.getUrl());
   Logger.log('Готово. Листы на месте. Папка для фото: ' + folder.getUrl());
+}
+
+
+/* =====================================================================
+ *  ВИКТОРИНА — банк вопросов и обжалования
+ * =====================================================================
+ *
+ *  Лист «Вопросы» (создаётся setupQuiz):
+ *    id | категория | вопрос | A | B | C | D | правильный | пояснение |
+ *    источник | статус | дата_добавления
+ *    статус: «в игре» — показываем в приложении,
+ *            «карантин» — после жалобы, больше не выдаём,
+ *            «устарел» — вопрос устарел (ставит владелец).
+ *
+ *  Лист «Обжалования» (создаётся setupQuiz):
+ *    дата | сотрудник | id_вопроса | вопрос | ответ_игрока | комментарий |
+ *    статус | решение
+ *    статус: «новое» / «разобрано» (решение пишет владелец).
+ *
+ *  В приложение уходят ТОЛЬКО вопросы «в игре» (?action=questions).
+ *  Жалоба ({action:'dispute'}) пишет строку в «Обжалования» и уводит вопрос
+ *  в «карантин», чтобы он больше не попадался игрокам.
+ *  Банк вопросов правится в content/вопросы.tsv и пересобирается
+ *  генератором tools/gen-questions.mjs → этот проект получает «Вопросы.gs».
+ * ===================================================================== */
+
+const QUIZ_COLUMNS = 12;   // A..L листа «Вопросы»
+const DISPUTE_COLUMNS = 8; // A..H листа «Обжалования»
+const QUIZ_HEADERS = ['id', 'категория', 'вопрос', 'A', 'B', 'C', 'D', 'правильный',
+  'пояснение', 'источник', 'статус', 'дата_добавления'];
+const DISPUTE_HEADERS = ['дата', 'сотрудник', 'id_вопроса', 'вопрос', 'ответ_игрока',
+  'комментарий', 'статус', 'решение'];
+
+/**
+ * Разово: создаёт листы «Вопросы» и «Обжалования», пишет шапки и заливает
+ * банк вопросов из «Вопросы.gs». Повторный запуск НИЧЕГО не дублирует:
+ * вопросы добавляются только в пустой лист, шапки — только в пустые.
+ */
+function setupQuiz() {
+  const ss = ss_();
+  const created = [];
+  let qs = ss.getSheetByName(SHEETS.questions);
+  if (!qs) { qs = ss.insertSheet(SHEETS.questions); created.push(SHEETS.questions); }
+  let ds = ss.getSheetByName(SHEETS.disputes);
+  if (!ds) { ds = ss.insertSheet(SHEETS.disputes); created.push(SHEETS.disputes); }
+
+  if (!str_(qs.getRange(1, 1).getValue())) {
+    qs.getRange(1, 1, 1, QUIZ_COLUMNS).setValues([QUIZ_HEADERS]).setFontWeight('bold');
+    qs.setFrozenRows(1);
+  }
+  if (!str_(ds.getRange(1, 1).getValue())) {
+    ds.getRange(1, 1, 1, DISPUTE_COLUMNS).setValues([DISPUTE_HEADERS]).setFontWeight('bold');
+    ds.setFrozenRows(1);
+  }
+
+  let added = 0;
+  if (qs.getLastRow() < 2) {
+    const now = new Date();
+    // Все текстовые ячейки пишем через text_ (апостроф в начале): иначе Таблицы
+    // разбирают ответы вида «2:1:1» как время, а «1860» — как число.
+    const rows = QUIZ_QUESTIONS.map(q => [
+      text_(q.id, 40), text_(q['категория'], 80), text_(q['вопрос'], 1000),
+      text_(q.A, 300), text_(q.B, 300), text_(q.C, 300), text_(q.D, 300),
+      str_(q['правильный']).toUpperCase(), text_(q['пояснение'], 1500), text_(q['источник'], 300),
+      'в игре', now,
+    ]);
+    if (rows.length) {
+      qs.getRange(2, 1, rows.length, QUIZ_COLUMNS).setValues(rows);
+      added = rows.length;
+    }
+    // Читаемость листа: узкие служебные колонки, широкие текстовые
+    qs.setColumnWidth(1, 70);
+    qs.setColumnWidth(3, 460);
+    qs.setColumnWidth(9, 460);
+    qs.setColumnWidth(10, 300);
+    qs.getRange('C:C').setWrap(true);
+    qs.getRange('I:J').setWrap(true);
+    ds.setColumnWidth(4, 460);
+    ds.setColumnWidth(6, 300);
+    ds.getRange('D:F').setWrap(true);
+  }
+  SpreadsheetApp.flush();
+
+  const total = Math.max(0, qs.getLastRow() - 1);
+  const msg = 'Листы: ' + (created.length ? 'созданы ' + created.join(', ') : 'уже были') +
+    '. Вопросов в листе «' + SHEETS.questions + '»: ' + total +
+    (added ? ' (добавлено ' + added + ')' : ' (лист был не пуст — банк не трогал)') + '.';
+  log_('Викторина', 'setupQuiz: ' + msg);
+  Logger.log('Готово. ' + msg);
+  return msg;
+}
+
+/**
+ * GET ?action=questions — вопросы «в игре» для приложения.
+ * version меняется при любой правке статуса/правильного ответа:
+ * по нему телефон понимает, что кэш вопросов устарел.
+ */
+function getQuestions_() {
+  const sh = ss_().getSheetByName(SHEETS.questions);
+  if (!sh || sh.getLastRow() < 2) return { ok: true, questions: [], version: 'empty' };
+
+  const data = sh.getRange(2, 1, sh.getLastRow() - 1, QUIZ_COLUMNS).getValues();
+  const questions = [];
+  let versionSource = '';
+  data.forEach(r => {
+    const id = str_(r[0]);
+    if (!id) return;
+    // Пустой статус у строки, добавленной владельцем руками, считаем «в игре»
+    const status = str_(r[10]) || 'в игре';
+    // В version входит и текст: поправили опечатку или ответ — кэш на телефоне обновится
+    versionSource += [id, r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], status].join('|') + ';';
+    if (status !== 'в игре') return;
+
+    const q = {
+      id: id,
+      'категория': str_(r[1]),
+      'вопрос': str_(r[2]),
+      A: str_(r[3]),
+      B: str_(r[4]),
+      C: str_(r[5]),
+      D: str_(r[6]),
+      'правильный': str_(r[7]).toUpperCase(),
+      'пояснение': str_(r[8]),
+      'источник': str_(r[9]),
+    };
+    // Битую строку не отдаём: без текста или с непонятной буквой играть нельзя
+    if (!q['вопрос'] || !q.A || !q.B || !q.C || !q.D || 'ABCD'.indexOf(q['правильный']) === -1) return;
+    questions.push(q);
+  });
+
+  return { ok: true, questions: questions, version: 'v' + questions.length + '-' + hash_(versionSource) };
+}
+
+/**
+ * POST {action:'dispute', id, employee, answer, comment}
+ * Пишет жалобу в «Обжалования» и ставит вопросу статус «карантин».
+ * Повторная жалоба на тот же вопрос (пока прежняя «новое») вторую строку не создаёт.
+ */
+function dispute_(body) {
+  const id = str_(body && body.id).slice(0, 40);
+  if (!id) return { ok: false, error: 'Не указан id вопроса' };
+  const employee = text_(body.employee, 80);
+  const answer = text_(body.answer, 300);
+  const comment = text_(body.comment, 500);
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) return { ok: false, error: 'Таблица занята, повторите позже', code: 'busy' };
+  try {
+    const ss = ss_();
+    const qs = ss.getSheetByName(SHEETS.questions);
+    const ds = ss.getSheetByName(SHEETS.disputes);
+    if (!qs || !ds) return { ok: false, error: 'Нет листов викторины: запустите setupQuiz() в Apps Script' };
+
+    const qData = qs.getLastRow() < 2 ? [] : qs.getRange(2, 1, qs.getLastRow() - 1, QUIZ_COLUMNS).getValues();
+    const idx = qData.findIndex(r => str_(r[0]).replace(/^'/, '') === id);
+    if (idx === -1) return { ok: false, error: 'Вопрос не найден: ' + id };
+
+    const dData = ds.getLastRow() < 2 ? [] : ds.getRange(2, 1, ds.getLastRow() - 1, DISPUTE_COLUMNS).getValues();
+    // Апостроф в начале ячейки — служебный (текст, а не формула), при чтении его может не быть
+    const already = dData.find(r => str_(r[2]).replace(/^'/, '') === id && str_(r[6]) === 'новое');
+    if (already) return { ok: true, duplicate: true };
+
+    // Дата | сотрудник | id | вопрос | ответ игрока | комментарий | статус | решение
+    addRow_(ds, [new Date(), employee, "'" + id, text_(qData[idx][2], 500), answer, comment, 'новое', '']);
+    qs.getRange(idx + 2, 11).setValue('карантин'); // K — статус вопроса
+    SpreadsheetApp.flush();
+    log_('Викторина', 'Обжалован вопрос ' + id + ' — ушёл в карантин');
+    return { ok: true, quarantined: id };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Короткий хеш строки (djb2) — для version в ответе ?action=questions. */
+function hash_(s) {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+  return h.toString(36);
 }
 
 

@@ -11,6 +11,7 @@
 //    Инвентаризация — место → категория → вид → позиция → полные + остаток
 //    Переработка — акты: простые (было/стало) и по рецепту (ключевое → пересчёт)
 //    Викторина   — 10 вопросов, таймер, разбор ответа, обжалование вопроса
+//    Дуэль       — комната по коду, 10 HP, 20 секунд на раунд, опрос состояния
 //    Очередь     — что ещё не отправлено, что отклонено, история
 // =====================================================================
 
@@ -84,6 +85,16 @@ function parseQty(s) {
 //  Навигация: стек экранов + поддержка кнопки «Назад» на Android
 // ---------------------------------------------------------------------
 const stack = [];
+// Уборка за экраном: таймеры и опросы должны останавливаться при уходе.
+// Экраны регистрируют здесь функции очистки (clearInterval, stop-функции).
+let screenCleanups = [];
+function registerCleanup(fn) { if (typeof fn === 'function') screenCleanups.push(fn); }
+function runScreenCleanups() {
+  while (screenCleanups.length) {
+    const fn = screenCleanups.pop();
+    try { fn(); } catch (e) { console.warn('cleanup', e); }
+  }
+}
 function go(screen, ...args) {
   stack.push([screen, args]);
   history.pushState({ depth: stack.length }, '');
@@ -101,6 +112,7 @@ function resetTo(screen, ...args) {
   render();
 }
 function render() {
+  runScreenCleanups();
   const [screen, args] = stack[stack.length - 1];
   app.replaceChildren(screen(...args));
   window.scrollTo(0, 0);
@@ -229,6 +241,7 @@ function screenLogin() {
       await db.put('kv', session, 'session');
       renderStatus(await getStatus());
       resetTo(screenHome);
+      handleDuelEntry(); // если приложение открыли по ссылке ?duel=КОД
     } catch (e) {
       toast(e instanceof ApiError ? e.message : 'Нет связи. Для входа нужен интернет.', 'bad');
       loginBtn.disabled = false;
@@ -294,6 +307,7 @@ function screenHome() {
         tile('writeoff', 'Списание', 'бой, порча, брак', () => go(screenItemsForm, 'writeoff')),
         tile('gift', 'Gift-shop', 'инвентаризация', () => go(screenInventory)),
         tile('quiz', 'Викторина', 'вопросы смены', () => go(screenQuizStart)),
+        tile('duel', 'Дуэль', 'два игрока', openDuel),
       ]
       : [
         tile('transfer', 'Перенос', 'кухня ⇄ бар', () => go(screenItemsForm, 'transfer')),
@@ -302,6 +316,7 @@ function screenHome() {
         tile('ttk', 'ТТК', 'рецептуры', () => go(screenTtkList)),
         tile('inv', 'Инвентаризация', 'подсчёт остатков', () => go(screenInventory)),
         tile('quiz', 'Викторина', 'вопросы смены', () => go(screenQuizStart)),
+        tile('duel', 'Дуэль', 'два игрока', openDuel),
         actsTile(),
       ]),
   );
@@ -1574,6 +1589,643 @@ function screenQuizResult(game) {
 
 
 // =====================================================================
+//  ДУЭЛЬ
+//
+//  Два сотрудника, комната по коду. Живого соединения нет: пока открыт
+//  экран боя, приложение опрашивает ?action=duelState раз в 3 секунды.
+//  Всё, что влияет на исход (время ответа, порядок, урон, HP, Elo),
+//  считает сервер. Правильный ответ приходит только после закрытия раунда.
+//
+//  Таймеры и опрос регистрируются в screenCleanups: render() останавливает
+//  их при любом переходе, поэтому утечек нет.
+// =====================================================================
+const DUEL_POLL_MS = 3000;
+const DUEL_POLL_OFFLINE_MS = 5000;
+const DUEL_ROUND_MS = 20000;
+const DUEL_HP = 10;
+const DUEL_LETTERS = ['A', 'B', 'C', 'D'];
+const DUEL_ACTIVE_KEY = 'duelActive';
+
+let pendingDuelCode = '';
+
+function duelCodeFromUrl() {
+  try {
+    const code = (new URL(location.href).searchParams.get('duel') || '').trim().toUpperCase();
+    return /^[A-Z0-9]{4,10}$/.test(code) ? code : '';
+  } catch (e) {
+    return '';
+  }
+}
+
+/** Ссылка на дуэль: ?duel=КОД — её можно отправить сопернику. */
+function duelLink(code) {
+  const u = new URL(location.href);
+  u.search = '?duel=' + encodeURIComponent(code);
+  u.hash = '';
+  return u.toString();
+}
+
+function duelErrorText(e) {
+  if (e instanceof NetworkError) return 'Для дуэли нужен интернет — проверьте связь';
+  return e && e.message ? e.message : 'Не удалось связаться с сервером';
+}
+
+async function saveDuelActive(duelId, code, role) {
+  await db.put('kv', { duelId, code, role, savedAt: new Date().toISOString() }, DUEL_ACTIVE_KEY);
+}
+async function clearDuelActive() {
+  await db.del('kv', DUEL_ACTIVE_KEY);
+}
+
+async function copyToClipboard(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (e) {
+    // Старые браузеры: копируем через скрытое поле
+    try {
+      const ta = h('textarea', { class: 'hidden' });
+      ta.value = text;
+      document.body.append(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      ta.remove();
+      return ok;
+    } catch (e2) {
+      return false;
+    }
+  }
+}
+
+/**
+ * Опрос состояния. Возвращает { pollNow, stop }.
+ * Нет сети — не чаще раза в 5 секунд; появилась сеть — сразу.
+ */
+function startDuelPoll(duelId, onState, onError) {
+  let stopped = false, busy = false, again = false, timer = null;
+
+  const schedule = (ms) => {
+    if (stopped) return;
+    clearTimeout(timer);
+    timer = setTimeout(run, ms);
+  };
+
+  async function run() {
+    if (stopped) return;
+    if (busy) { again = true; return; }
+    busy = true;
+    try {
+      const st = await apiGet({ action: 'duelState', duelId, employee: session.name }, 15000);
+      busy = false;
+      if (stopped) return;
+      onState(st);
+      schedule(DUEL_POLL_MS);
+    } catch (e) {
+      busy = false;
+      if (stopped) return;
+      onError(e);
+      schedule(e instanceof NetworkError ? DUEL_POLL_OFFLINE_MS : DUEL_POLL_MS);
+    } finally {
+      if (again && !stopped) { again = false; schedule(0); }
+    }
+  }
+
+  const onOnline = () => { if (!stopped) { if (busy) again = true; else schedule(0); } };
+  window.addEventListener('online', onOnline);
+  run();
+
+  return {
+    pollNow: () => { if (!stopped) { if (busy) again = true; else schedule(0); } },
+    stop: () => { stopped = true; clearTimeout(timer); window.removeEventListener('online', onOnline); },
+  };
+}
+
+/** Плитка «Дуэль»: если матч уже идёт — сразу возвращаемся в него. */
+async function openDuel() {
+  const saved = await db.get('kv', DUEL_ACTIVE_KEY);
+  if (saved && saved.duelId) {
+    try {
+      const st = await apiGet({ action: 'duelState', duelId: saved.duelId, employee: session.name }, 15000);
+      if (st.status === 'playing') return go(screenDuelBattle, { duelId: st.duelId, initialState: st });
+      if (st.status === 'waiting') return go(screenDuelWait, { duelId: st.duelId, code: st.code, now: st.now, expiresAt: st.deadline });
+      if (st.status === 'finished') return go(screenDuelResult, { duelId: st.duelId, initialState: st });
+    } catch (e) {
+      if (e instanceof ApiError) await clearDuelActive();
+      else return toast(duelErrorText(e), 'bad');
+    }
+  }
+  go(screenDuelStart);
+}
+
+/** Восстановление после закрытия приложения: матч живёт на сервере. */
+let duelRestoring = false;
+async function restoreDuelIfAny() {
+  if (duelRestoring || !session) return;
+  const saved = await db.get('kv', DUEL_ACTIVE_KEY);
+  if (!saved || !saved.duelId) return;
+  duelRestoring = true;
+  try {
+    const st = await apiGet({ action: 'duelState', duelId: saved.duelId, employee: session.name }, 15000);
+    if (st.status === 'playing') go(screenDuelBattle, { duelId: st.duelId, initialState: st });
+    else if (st.status === 'waiting') go(screenDuelWait, { duelId: st.duelId, code: st.code, now: st.now, expiresAt: st.deadline });
+    else if (st.status === 'finished') go(screenDuelResult, { duelId: st.duelId, initialState: st });
+  } catch (e) {
+    if (e instanceof ApiError) await clearDuelActive();
+  } finally {
+    duelRestoring = false;
+  }
+}
+
+/** Deep-link ?duel=КОД или возврат в незакрытый матч. */
+async function handleDuelEntry() {
+  if (!session) return;
+  if (pendingDuelCode) {
+    const code = pendingDuelCode;
+    pendingDuelCode = '';
+    return joinDuelByCode(code);
+  }
+  return restoreDuelIfAny();
+}
+
+async function joinDuelByCode(code) {
+  try {
+    const res = await apiPost({ action: 'duelJoin', employee: session.name, code }, 20000);
+    await saveDuelActive(res.duelId, res.code, res.role);
+    if (res.status === 'playing') return go(screenDuelBattle, { duelId: res.duelId });
+    if (res.status === 'finished') return go(screenDuelResult, { duelId: res.duelId });
+    return go(screenDuelWait, { duelId: res.duelId, code: res.code, now: res.now, expiresAt: res.now + 2 * 60 * 1000 });
+  } catch (e) {
+    toast(duelErrorText(e), 'bad');
+    go(screenDuelStart, { code });
+  }
+}
+
+async function loadDuelRatingCard(box) {
+  try {
+    const r = await apiGet({ action: 'duelRating', employee: session.name }, 15000);
+    box.replaceChildren(
+      h('div', { class: 'duel-rating-line' },
+        h('span', { class: 'duel-rating-num' }, String(r.rating)),
+        h('span', { class: 'duel-rating-label' }, 'рейтинг')),
+      h('p', { class: 'muted' }, r.matches
+        ? `${r.matches} ${r.matches === 1 ? 'матч' : (r.matches < 5 ? 'матча' : 'матчей')} · место ${r.place} из ${r.players}`
+        : 'Матчей ещё нет — стартовый рейтинг 1000'),
+    );
+  } catch (e) {
+    box.replaceChildren(h('p', { class: 'muted' }, e instanceof NetworkError
+      ? 'Рейтинг: нет связи'
+      : 'Рейтинг пока недоступен'));
+  }
+}
+
+// ---------- Экран 1: создание и вход по коду ----------
+
+function screenDuelStart(prefill = {}) {
+  const root = h('main', { class: 'screen' }, header('Дуэль'));
+  const ratingBox = h('div', { class: 'duel-rating-card' }, h('p', { class: 'muted' }, 'Рейтинг загружается…'));
+  const codeInput = h('input', {
+    type: 'text', class: 'duel-code-input', maxlength: '10', placeholder: 'КОД',
+    autocomplete: 'off', autocapitalize: 'characters', spellcheck: 'false',
+    value: prefill.code || '',
+  });
+  codeInput.addEventListener('input', () => {
+    codeInput.value = codeInput.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 10);
+  });
+  const createBtn = h('button', { class: 'primary' }, 'Создать дуэль');
+  const joinBtn = h('button', { class: 'secondary' }, 'Присоединиться');
+
+  createBtn.addEventListener('click', async () => {
+    if (createBtn.disabled) return;
+    createBtn.disabled = true;
+    try {
+      const res = await apiPost({ action: 'duelCreate', employee: session.name }, 20000);
+      await saveDuelActive(res.duelId, res.code, res.role);
+      go(screenDuelWait, { duelId: res.duelId, code: res.code, now: res.now, expiresAt: res.expiresAt });
+    } catch (e) {
+      createBtn.disabled = false;
+      toast(duelErrorText(e), 'bad');
+    }
+  });
+
+  joinBtn.addEventListener('click', async () => {
+    const code = codeInput.value.trim().toUpperCase();
+    if (!code) { codeInput.focus(); return toast('Введите код комнаты', 'bad'); }
+    if (joinBtn.disabled) return;
+    joinBtn.disabled = true;
+    try {
+      const res = await apiPost({ action: 'duelJoin', employee: session.name, code }, 20000);
+      await saveDuelActive(res.duelId, res.code, res.role);
+      if (res.status === 'playing') go(screenDuelBattle, { duelId: res.duelId });
+      else if (res.status === 'finished') go(screenDuelResult, { duelId: res.duelId });
+      else go(screenDuelWait, { duelId: res.duelId, code: res.code, now: res.now, expiresAt: res.now + 2 * 60 * 1000 });
+    } catch (e) {
+      joinBtn.disabled = false;
+      toast(duelErrorText(e), 'bad');
+    }
+  });
+
+  root.append(
+    h('p', { class: 'hint left' }, 'Дуэль двух сотрудников: по 10 HP, 20 секунд на вопрос, правильный ответ отнимает 1 HP. Второй успел ответить правильно за 5 секунд — блок. Матч до 0 HP или 15 раундов. Нужен интернет.'),
+    ratingBox,
+    createBtn,
+    h('p', { class: 'label' }, 'Присоединиться по коду'),
+    codeInput,
+    joinBtn,
+    h('p', { class: 'muted' }, 'Код действует 2 минуты после создания. Ссылку с кодом можно отправить сопернику.'),
+  );
+  loadDuelRatingCard(ratingBox);
+  return root;
+}
+
+// ---------- Экран 2: ожидание соперника ----------
+
+function screenDuelWait({ duelId, code, now, expiresAt }) {
+  const root = h('main', { class: 'screen' }, header('Ожидание соперника'));
+  let offset = (now || Date.now()) - Date.now();
+  let deadline = expiresAt || (Date.now() + 2 * 60 * 1000);
+
+  const codeEl = h('p', { class: 'duel-big-code' }, code);
+  const timerEl = h('p', { class: 'duel-wait-timer' }, '2:00');
+  const bar = h('div', { class: 'duel-timer-bar' });
+  const linkHint = h('p', { class: 'muted duel-link-text' }, duelLink(code));
+  const copyBtn = h('button', { class: 'primary' }, 'Скопировать ссылку');
+  const cancelBtn = h('button', { class: 'danger' }, 'Отменить');
+  const netEl = h('p', { class: 'duel-net hidden' });
+
+  copyBtn.addEventListener('click', async () => {
+    const ok = await copyToClipboard(duelLink(code));
+    toast(ok ? 'Ссылка скопирована' : 'Не удалось скопировать — отправьте код вручную', ok ? 'ok' : 'bad');
+  });
+
+  cancelBtn.addEventListener('click', async () => {
+    if (cancelBtn.disabled) return;
+    cancelBtn.disabled = true;
+    try {
+      await apiGet({ action: 'duelCancel', duelId, employee: session.name }, 15000);
+      await clearDuelActive();
+      toast('Ожидание отменено');
+      resetTo(screenHome);
+    } catch (e) {
+      cancelBtn.disabled = false;
+      toast(duelErrorText(e), 'bad');
+    }
+  });
+
+  let expiredShown = false;
+  const tick = setInterval(() => {
+    const left = Math.max(0, deadline - (Date.now() + offset));
+    const m = Math.floor(left / 60000), s = Math.floor((left % 60000) / 1000);
+    timerEl.textContent = `${m}:${String(s).padStart(2, '0')}`;
+    bar.style.width = `${Math.min(100, (left / (2 * 60 * 1000)) * 100)}%`;
+    bar.classList.toggle('low', left <= 15000);
+    if (left <= 0 && !expiredShown) {
+      expiredShown = true;
+      timerEl.textContent = '0:00';
+      netEl.textContent = 'Время ожидания истекло. Создайте новую комнату.';
+      netEl.classList.remove('hidden');
+    }
+  }, 250);
+  registerCleanup(() => clearInterval(tick));
+
+  let poll = null;
+  poll = startDuelPoll(duelId, (st) => {
+    netEl.classList.add('hidden');
+    offset = st.now - Date.now();
+    deadline = st.deadline || deadline;
+    if (st.status === 'playing') {
+      if (poll) poll.stop();
+      saveDuelActive(duelId, code, 1);
+      go(screenDuelBattle, { duelId });
+    } else if (st.status === 'finished') {
+      if (poll) poll.stop();
+      go(screenDuelResult, { duelId });
+    }
+  }, (e) => {
+    if (e instanceof ApiError) {
+      if (e.code === 'expired' || e.code === 'notfound' || e.code === 'auth') {
+        clearDuelActive();
+        if (poll) poll.stop();
+      }
+      netEl.textContent = e.message;
+      netEl.classList.remove('hidden');
+    } else {
+      netEl.textContent = 'Нет связи — ждём сервер…';
+      netEl.classList.remove('hidden');
+    }
+  });
+  registerCleanup(() => { if (poll) poll.stop(); });
+
+  root.append(
+    h('p', { class: 'label' }, 'Код комнаты'),
+    codeEl,
+    linkHint,
+    copyBtn,
+    h('p', { class: 'label' }, 'Соперник подключится'),
+    timerEl,
+    h('div', { class: 'duel-timer' }, bar),
+    h('p', { class: 'muted' }, 'Пока ждём — отправьте сопернику код или ссылку. Через 2 минуты комната закроется.'),
+    netEl,
+    cancelBtn,
+  );
+  return root;
+}
+
+// ---------- Экран 3: бой ----------
+
+function duelRoundVerdict(lr) {
+  if (!lr) return { text: 'Раунд закрыт', cls: '' };
+  if (lr.blocked) return { text: '🛡 Блок — урона нет', cls: 'ok' };
+  if (lr.damage === 'me') return { text: 'Урон вам: −1 HP', cls: 'bad' };
+  if (lr.damage === 'opponent') return { text: 'Вы нанесли урон: −1 HP сопернику', cls: 'ok' };
+  if (lr.timeout) return { text: '⏱ Никто не ответил — урона нет', cls: '' };
+  return { text: 'Урона нет', cls: '' };
+}
+
+function screenDuelBattle({ duelId, initialState }) {
+  // Кнопка «Назад» остаётся: матч живёт на сервере, вернуться можно с главной.
+  const root = h('main', { class: 'screen duel-screen' }, header('Дуэль'));
+
+  const oppName = h('div', { class: 'duel-name' });
+  const oppMeta = h('div', { class: 'duel-meta' });
+  const oppHpText = h('span', { class: 'duel-hp-text' });
+  const oppBar = h('div', { class: 'duel-hp-bar' });
+  const myName = h('div', { class: 'duel-name' });
+  const myMeta = h('div', { class: 'duel-meta' });
+  const myHpText = h('span', { class: 'duel-hp-text' });
+  const myBar = h('div', { class: 'duel-hp-bar' });
+  const roundLabel = h('span', { class: 'duel-round-label' }, 'Раунд');
+  const timeLabel = h('span', { class: 'duel-time' }, '—');
+  const timerBar = h('div', { class: 'duel-timer-bar' });
+  const oppStatus = h('div', { class: 'duel-opp-status' });
+  const questionEl = h('div', { class: 'duel-question' });
+  const answersEl = h('div', { class: 'duel-answers' });
+  const resultEl = h('div', { class: 'duel-round-result hidden' });
+  const netEl = h('p', { class: 'duel-net hidden' });
+
+  const buttons = {};
+  DUEL_LETTERS.forEach(L => {
+    const text = h('span', { class: 'duel-answer-text' });
+    const b = h('button', { class: 'answer' }, h('span', { class: 'letter' }, L), text);
+    b.addEventListener('click', () => sendAnswer(L));
+    buttons[L] = b;
+    answersEl.append(b);
+  });
+
+  let state = initialState && initialState.status === 'playing' ? initialState : null;
+  let offset = state ? state.now - Date.now() : 0;
+  let deadline = state && state.question ? state.deadline : 0;
+  let shownRound = 0;
+  let sending = false;
+  let navigating = false;
+  let poll = null;
+
+  function setButtonsDisabled(disabled) {
+    DUEL_LETTERS.forEach(L => { buttons[L].disabled = disabled; });
+  }
+
+  function paintTimer() {
+    if (!state) return;
+    if (!state.question) {
+      timeLabel.textContent = 'Разбор';
+      timerBar.style.width = '100%';
+      timerBar.classList.remove('low');
+      return;
+    }
+    const left = Math.max(0, deadline - (Date.now() + offset));
+    timeLabel.textContent = `${Math.ceil(left / 1000)} с`;
+    timerBar.style.width = `${Math.max(0, Math.min(100, (left / DUEL_ROUND_MS) * 100))}%`;
+    timerBar.classList.toggle('low', left <= 5000);
+  }
+  const timer = setInterval(paintTimer, 200);
+  registerCleanup(() => clearInterval(timer));
+
+  function setHp(bar, text, hp) {
+    const v = Math.max(0, Number(hp) || 0);
+    bar.style.width = `${(v / DUEL_HP) * 100}%`;
+    bar.classList.toggle('low', v <= 3);
+    text.textContent = `${v} / ${DUEL_HP}`;
+  }
+
+  function paintQuestion(st) {
+    const q = st.question;
+    questionEl.replaceChildren(
+      h('p', { class: 'duel-cat' }, q['категория'] || ''),
+      h('p', { class: 'quiz-q duel-q' }, q['вопрос']),
+    );
+    DUEL_LETTERS.forEach(L => {
+      buttons[L].querySelector('.duel-answer-text').textContent = q[L] || '';
+      buttons[L].classList.remove('correct', 'wrong', 'picked');
+      buttons[L].disabled = false;
+    });
+    if (st.myAnswer) {
+      buttons[st.myAnswer].classList.add('picked');
+      setButtonsDisabled(true);
+    }
+  }
+
+  function paintResult(lr) {
+    if (!lr) {
+      resultEl.replaceChildren(h('p', { class: 'muted' }, 'Раунд закрыт'));
+      return;
+    }
+    const v = duelRoundVerdict(lr);
+    const mine = lr.myChoice ? `${lr.myChoice}` : '—';
+    const theirs = lr.oppChoice ? `${lr.oppChoice}` : (lr.oppAnswered ? '—' : 'не ответил');
+    resultEl.replaceChildren(
+      h('p', { class: 'duel-verdict ' + v.cls }, v.text),
+      h('p', { class: 'duel-correct' }, `Правильный ответ: ${lr.correct}. ${lr.correctText}`),
+      h('p', { class: 'muted' }, `Вы: ${mine} · Соперник: ${theirs}`),
+      lr.explanation ? h('p', { class: 'duel-explain' }, lr.explanation) : null,
+    );
+  }
+
+  function applyState(st) {
+    if (navigating) return;
+    netEl.classList.add('hidden');
+    offset = st.now - Date.now();
+
+    if (st.status === 'finished') {
+      navigating = true;
+      clearDuelActive();
+      if (poll) poll.stop();
+      return go(screenDuelResult, { duelId: st.duelId, initialState: st });
+    }
+    if (st.status === 'waiting') {
+      navigating = true;
+      if (poll) poll.stop();
+      return go(screenDuelWait, { duelId: st.duelId, code: st.code, now: st.now, expiresAt: st.deadline });
+    }
+
+    state = st;
+
+    oppName.textContent = st.opponent || 'Соперник';
+    oppMeta.textContent = st.oppRating ? `рейтинг ${st.oppRating}` : '';
+    myName.textContent = st.myName;
+    myMeta.textContent = st.myRating ? `рейтинг ${st.myRating}` : '';
+    setHp(oppBar, oppHpText, st.oppHp);
+    setHp(myBar, myHpText, st.myHp);
+    roundLabel.textContent = `Раунд ${st.round} из ${st.maxRounds}`;
+
+    if (st.question) {
+      deadline = st.deadline;
+      questionEl.classList.remove('hidden');
+      answersEl.classList.remove('hidden');
+      resultEl.classList.add('hidden');
+      if (shownRound !== st.round) { shownRound = st.round; paintQuestion(st); }
+      if (st.myAnswer) {
+        buttons[st.myAnswer].classList.add('picked');
+        setButtonsDisabled(true);
+      } else if (!sending) {
+        setButtonsDisabled(false);
+      }
+      oppStatus.textContent = st.oppAnswered ? 'Соперник ответил' : 'Соперник думает…';
+      oppStatus.classList.toggle('done', !!st.oppAnswered);
+    } else {
+      questionEl.classList.add('hidden');
+      answersEl.classList.add('hidden');
+      resultEl.classList.remove('hidden');
+      oppStatus.textContent = '';
+      oppStatus.classList.remove('done');
+      paintResult(st.lastRound);
+    }
+    paintTimer();
+  }
+
+  async function sendAnswer(choice) {
+    if (sending || navigating || !state || !state.question || state.myAnswer) return;
+    const round = state.round;
+    sending = true;
+    setButtonsDisabled(true);
+    buttons[choice].classList.add('picked');
+    netEl.textContent = 'Ответ отправлен…';
+    netEl.classList.remove('hidden');
+    try {
+      await apiPost({ action: 'duelAnswer', duelId, employee: session.name, round, choice }, 15000);
+      netEl.textContent = 'Ответ принят — ждём соперника';
+    } catch (e) {
+      if (e instanceof ApiError) {
+        netEl.textContent = e.message;
+        toast(e.message, 'bad');
+      } else {
+        netEl.textContent = 'Нет связи — проверяем, дошёл ли ответ…';
+        toast('Нет связи — проверяем ответ', 'bad');
+      }
+    } finally {
+      sending = false;
+      if (poll) poll.pollNow();
+    }
+  }
+
+  const oppSide = h('div', { class: 'duel-side opp' },
+    h('div', { class: 'duel-side-head' }, h('div', {}, oppName, oppMeta), oppHpText),
+    h('div', { class: 'duel-hp' }, oppBar));
+  const mySide = h('div', { class: 'duel-side me' },
+    h('div', { class: 'duel-side-head' }, h('div', {}, myName, myMeta), myHpText),
+    h('div', { class: 'duel-hp' }, myBar));
+
+  root.append(
+    oppSide,
+    h('div', { class: 'duel-roundline' }, roundLabel, timeLabel),
+    h('div', { class: 'duel-timer' }, timerBar),
+    oppStatus,
+    questionEl,
+    answersEl,
+    resultEl,
+    netEl,
+    mySide,
+  );
+
+  const stop = startDuelPoll(duelId, applyState, (e) => {
+    if (e instanceof ApiError) {
+      if (e.code === 'notfound' || e.code === 'expired' || e.code === 'auth') {
+        navigating = true;
+        clearDuelActive();
+        toast(e.message, 'bad');
+        resetTo(screenHome);
+        return;
+      }
+      netEl.textContent = e.message;
+    } else {
+      netEl.textContent = 'Нет связи — ждём сервер…';
+    }
+    netEl.classList.remove('hidden');
+  });
+  poll = stop;
+  registerCleanup(() => stop.stop());
+
+  if (state) applyState(state);
+  else {
+    questionEl.replaceChildren(h('p', { class: 'hint' }, 'Загрузка матча…'));
+    netEl.textContent = 'Соединяемся с сервером…';
+    netEl.classList.remove('hidden');
+  }
+  return root;
+}
+
+// ---------- Экран 4: результат ----------
+
+function screenDuelResult({ duelId, initialState }) {
+  const root = h('main', { class: 'screen' }, header('Результат', { showBack: false }));
+  const body = h('div', { class: 'duel-result' }, h('p', { class: 'hint' }, 'Загрузка результата…'));
+  root.append(body);
+
+  function draw(st) {
+    clearDuelActive();
+    const r = st.result || { winner: 'draw', myHp: st.myHp, oppHp: st.oppHp, rounds: st.round };
+    const title = r.winner === 'me' ? 'Победа' : r.winner === 'opponent' ? 'Поражение' : 'Ничья';
+    const cls = r.winner === 'me' ? 'ok' : r.winner === 'opponent' ? 'bad' : '';
+    const rating = st.rating;
+    const delta = rating ? rating.delta : null;
+    const ratingLine = rating
+      ? h('p', { class: 'duel-rating-change ' + (delta > 0 ? 'ok' : delta < 0 ? 'bad' : '') },
+        `Рейтинг: ${rating.before} → ${rating.after}`,
+        h('span', { class: 'duel-delta' }, `${delta >= 0 ? '+' : ''}${delta}`))
+      : h('p', { class: 'muted' }, 'Рейтинг не изменился');
+
+    body.replaceChildren(
+      h('p', { class: 'duel-result-title ' + cls }, title),
+      h('p', { class: 'duel-score-big' }, `${r.myHp} : ${r.oppHp}`),
+      h('p', { class: 'muted' }, `${st.myName} · ${st.opponent}`),
+      h('p', { class: 'muted' }, `Раундов: ${r.rounds}`),
+      h('div', { class: 'duel-rating-card' },
+        h('p', { class: 'label' }, 'Ваш рейтинг'), ratingLine,
+        st.oppRatingChange !== null && st.oppRatingChange !== undefined
+          ? h('p', { class: 'muted' }, `Соперник: ${st.oppRatingChange >= 0 ? '+' : ''}${st.oppRatingChange}`) : null),
+      h('button', { class: 'primary', onclick: () => go(screenDuelStart) }, 'Ещё раз'),
+      h('button', { class: 'secondary', onclick: () => resetTo(screenHome) }, 'На главную'),
+    );
+  }
+
+  if (initialState && initialState.status === 'finished') {
+    draw(initialState);
+  } else {
+    apiGet({ action: 'duelState', duelId, employee: session.name }, 15000)
+      .then(st => {
+        if (st.status !== 'finished') {
+          body.replaceChildren(
+            h('p', { class: 'hint' }, 'Матч ещё не закончен.'),
+            h('button', { class: 'primary', onclick: () => go(screenDuelBattle, { duelId }) }, 'Вернуться в бой'),
+            h('button', { class: 'secondary', onclick: () => resetTo(screenHome) }, 'На главную'),
+          );
+          return;
+        }
+        draw(st);
+      })
+      .catch(e => {
+        body.replaceChildren(
+          h('p', { class: 'hint' }, e instanceof NetworkError
+            ? 'Нет связи — результат подтянется, когда появится интернет.'
+            : 'Не удалось загрузить результат: ' + e.message),
+          h('button', { class: 'secondary', onclick: () => render() }, 'Повторить'),
+          h('button', { class: 'secondary', onclick: () => resetTo(screenHome) }, 'На главную'),
+        );
+      });
+  }
+  return root;
+}
+
+
+// =====================================================================
 //  ЭКРАН: ОЧЕРЕДЬ И ИСТОРИЯ
 // =====================================================================
 function describe(r) {
@@ -1651,6 +2303,13 @@ function screenQueue() {
 //  СТАРТ
 // =====================================================================
 async function start() {
+  // Ссылка вида …?duel=КОД: запоминаем код и убираем его из адреса,
+  // чтобы обновление страницы не начинало вход заново.
+  pendingDuelCode = duelCodeFromUrl();
+  if (pendingDuelCode) {
+    try { history.replaceState(null, '', location.pathname); } catch (e) { /* не критично */ }
+  }
+
   // Просим браузер не удалять наши данные при нехватке места (особенно важно на iPhone)
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
 
@@ -1686,6 +2345,8 @@ async function start() {
   window.addEventListener('online', () => { flushQuizDisputes(); });
   flushQuizDisputes();
   renderStatus(await getStatus());
+  // Вернулись в приложение — восстанавливаем незакрытую дуэль (или переходим по ссылке)
+  handleDuelEntry();
 }
 
 start();

@@ -9,7 +9,7 @@
 //  иначе телефоны продолжат показывать старую версию.
 // =====================================================================
 
-const VERSION = 'v19';
+const VERSION = 'v21';
 const CACHE = 'bar-app-' + VERSION;
 const FILES = [
   './',
@@ -23,6 +23,7 @@ const FILES = [
   './js/sync.js',
   './js/voice.js',
   './js/icons.js',
+  './js/label.js',
   './icons/icon-192.png',
   './icons/icon-512.png',
   './icons/apple-touch-icon.png',

@@ -9,7 +9,7 @@
 //  иначе телефоны продолжат показывать старую версию.
 // =====================================================================
 
-const VERSION = 'v21';
+const VERSION = 'v22';
 const CACHE = 'bar-app-' + VERSION;
 const FILES = [
   './',
@@ -29,6 +29,7 @@ const FILES = [
   './icons/apple-touch-icon.png',
   './icons/logo-white.png',
   './icons/logo-gold.png',
+  './docs/labels/test.html',
 ];
 
 // Установка: скачиваем и кладём в кэш все файлы

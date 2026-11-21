@@ -255,7 +255,18 @@ textarea { margin-top: 16px; resize: vertical; }
 .label-btns { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 14px; }
 .label-btns.single { grid-template-columns: 1fr; }
 .label-btns .primary, .label-btns .secondary { margin-top: 0; min-height: 48px; }
-.label-save { display: block; margin: 12px auto 0; font-size: 15px; text-decoration: underline; }
+.label-btns .wide { grid-column: 1 / -1; }
+.label-hint { color: var(--muted); font-size: 12.5px; line-height: 1.4; margin: 8px 0 0; }
+.label-howto {
+  color: var(--text); font-size: 12.5px; line-height: 1.5;
+  margin: 10px 0 0; padding: 8px 10px;
+  background: var(--panel-2); border-radius: 8px;
+}
+.label-howto .line { display: block; }
+.label-more { margin-top: 10px; }
+.label-more summary { color: var(--muted); font-size: 13.5px; padding: 4px 0; cursor: pointer; }
+.label-more .secondary { margin-top: 8px; min-height: 44px; }
+.label-help { display: inline-block; margin-top: 8px; font-size: 14px; color: var(--muted); }
 
 /* =====================================================================
    ПЕЧАТЬ ЭТИКЕТКИ

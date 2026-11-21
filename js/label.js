@@ -5,8 +5,9 @@
 //  240 × 160 точек. Приложение производителя (Label Expert / AiYin)
 //  печатает ИМПОРТИРОВАННУЮ КАРТИНКУ, а не наш шаблон; поэтому весь
 //  макет рисуем здесь, на canvas, и отдаём готовый файл:
-//    • «Поделиться» — системное меню телефона: Label Expert, а если его нет —
-//      «Сохранить изображение» (файл уходит в «Фото»/«Галерею»);
+//    • «Поделиться» (Android) — системное меню: Label Expert принимает PNG;
+//    • «Сохранить в Фото» (iOS) — системное меню → «Сохранить изображение»:
+//      Label Expert на iOS не принимает картинку из «Поделиться», только из альбома;
 //    • «Сохранить PNG» / «Сохранить JPG» — файлы в «Загрузки» (латиница, DPI);
 //    • «PDF (30 × 20 мм)» — спрятан в «Ещё»: window.print() для офисного
 //      принтера/PDF. Системный диалог AirPrint/Mopria НЕ видит B21.
@@ -530,11 +531,16 @@ export function labelFileName(info, ext) {
   return `etiketka-30x20-${p(d.getDate())}.${p(d.getMonth() + 1)}.${e === 'jpg' || e === 'jpeg' ? 'jpg' : 'png'}`;
 }
 
-/** Готовый файл для navigator.share({files}) и скачивания. */
+/**
+ * Готовый файл для navigator.share({files}) и скачивания.
+ * MIME выставляем явно, а не через blob.type: на iOS при потере типа
+ * расширение не понимает, что получило картинку.
+ */
 export async function labelFile(canvas, fileName, format) {
   const jpg = format === 'jpg' || format === 'jpeg';
   const blob = jpg ? await labelJpegBlob(canvas) : await labelPngBlob(canvas);
-  return new File([blob], fileName || (jpg ? 'etiketka-30x20.jpg' : 'etiketka-30x20.png'), { type: blob.type });
+  const type = jpg ? 'image/jpeg' : 'image/png';
+  return new File([blob], fileName || (jpg ? 'etiketka-30x20.jpg' : 'etiketka-30x20.png'), { type });
 }
 
 /**
@@ -552,12 +558,18 @@ export function canShareFiles() {
   }
 }
 
-/** Поделиться картинкой: системное меню → «Сохранить изображение» / Label Expert. */
-export async function shareLabel(canvas, fileName, format) {
+/**
+ * Поделиться картинкой: системное меню.
+ * @param {object} [opts] filesOnly — отдать только files, без title/text
+ *   (для iOS: там важен ровно один image-item, лишние поля не нужны).
+ */
+export async function shareLabel(canvas, fileName, format, opts = {}) {
   if (!canShareFiles()) return { ok: false, error: 'Устройство не умеет «Поделиться» картинкой' };
   const file = await labelFile(canvas, fileName, format);
+  const payload = { files: [file] };
+  if (!opts.filesOnly) payload.title = 'Этикетка 30×20';
   try {
-    await navigator.share({ files: [file], title: 'Этикетка 30×20' });
+    await navigator.share(payload);
     return { ok: true };
   } catch (e) {
     if (e && e.name === 'AbortError') return { ok: false, error: 'Отменено' };

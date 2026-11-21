@@ -391,12 +391,13 @@ function fmtDateTime(iso) {
 //  Название пустое (акт без рецепта/позиций) — спрашиваем тут же,
 //  обычным полем ввода; срок по умолчанию 24 ч, его можно поменять.
 //
-//  Главная кнопка — «Поделиться» (navigator.share с файлом): в системном меню
-//  есть Label Expert, если он умеет принимать картинки; там же «Сохранить
-//  изображение» — запасной путь. Ниже — «Сохранить PNG»/«Сохранить JPG».
-//  Системная «Печать» убрана в «Ещё» → «PDF (30 × 20 мм)»: диалог печати
-//  iOS/Android не видит Bluetooth-принтер этикеток B21, он виден только
-//  приложению Label Expert по его BLE-протоколу.
+//  Android: главная кнопка — «Поделиться» (navigator.share с файлом), в меню
+//  выбирают Label Expert — проверено владельцем.
+//  iOS: Label Expert из «Поделиться» открывается пустым (нет приёма картинки),
+//  поэтому главная кнопка — «Сохранить в Фото» (Save Image → альбом).
+//  Ниже — «Сохранить PNG»/«Сохранить JPG». Системная «Печать» убрана в
+//  «Ещё» → «PDF (30 × 20 мм)»: диалог печати iOS/Android не видит
+//  Bluetooth-принтер этикеток B21, он виден только Label Expert по BLE.
 // =====================================================================
 const LABEL_DEFAULT_HOURS = 24;
 
@@ -405,6 +406,22 @@ function isPhoneLike() {
   const ua = navigator.userAgent || '';
   if (/Android|iPhone|iPod/i.test(ua)) return true;
   return /Macintosh/i.test(ua) && (navigator.maxTouchPoints || 0) > 1; // iPadOS притворяется Mac
+}
+
+/**
+ * iOS/iPadOS. Полевой тест 21.11.2026: Android принимает PNG из «Поделиться»
+ * и печатает, а на iPhone Label Expert открывается, но картинку не берёт.
+ * Поэтому на iOS главная кнопка — «Сохранить в Фото» (Save Image), а не
+ * «Поделиться → Label Expert».
+ */
+function isIOSLike() {
+  const ua = navigator.userAgent || '';
+  return /iPhone|iPod/i.test(ua) || (/Macintosh/i.test(ua) && (navigator.maxTouchPoints || 0) > 1);
+}
+
+/** Подпись главной кнопки: на iOS — «Сохранить в Фото», на Android — «Поделиться». */
+function shareButtonText() {
+  return isIOSLike() ? 'Сохранить в Фото' : 'Поделиться';
 }
 
 /** Ключ сравнения названий: регистр, «ё», лишние пробелы. */
@@ -427,8 +444,8 @@ function shelfLifeHours(name) {
 
 /**
  * Блок этикетки: превью 2×, название (если его надо спрашивать),
- * срок хранения, «Поделиться» / «Сохранить PNG» / «Сохранить JPG»,
- * инструкция для Label Expert и «Ещё» → PDF.
+ * срок хранения, «Поделиться» (Android) / «Сохранить в Фото» (iOS),
+ * «Сохранить PNG/JPG», инструкция для Label Expert и «Ещё» → PDF.
  * @returns {{el:HTMLElement, madeAt:Date, refresh:Function}}
  */
 function createLabelBox(opts = {}) {
@@ -438,6 +455,7 @@ function createLabelBox(opts = {}) {
     hoursTouched: false,
   };
   const shareOk = canShareFiles();
+  const ios = isIOSLike();
   let info = null;
 
   const preview = h('img', { class: 'label-preview', alt: 'Превью этикетки 30×20 мм' });
@@ -510,7 +528,10 @@ function createLabelBox(opts = {}) {
   async function onShare() {
     const cur = prepare();
     if (!cur) return;
-    const res = await shareLabel(cur.canvas, labelFileName(cur, 'png'), 'png');
+    // На iOS отдаём только files (без title/text): там нужен один image-item,
+    // а Label Expert всё равно не принимает картинку из «Поделиться» — путь
+    // через «Сохранить изображение» → Image Print из альбома.
+    const res = await shareLabel(cur.canvas, labelFileName(cur, 'png'), 'png', { filesOnly: ios });
     if (!res.ok && res.error !== 'Отменено') toast(res.error, 'bad');
   }
 
@@ -526,26 +547,33 @@ function createLabelBox(opts = {}) {
     }
   }
 
-  // Главный путь — «Поделиться»: в системном меню есть Label Expert (если он
-  // установлен и умеет принимать файлы). «Печать» убрана с первого плана:
-  // системный диалог iOS/Android не видит Bluetooth-принтер этикеток.
+  // Android: «Поделиться» → Label Expert работает (проверено владельцем).
+  // iOS: Label Expert из «Поделиться» открывается пустым (нет приёма картинки),
+  // поэтому там главная кнопка — «Сохранить в Фото» (Save Image → альбом).
   const buttons = h('div', { class: 'label-btns' },
-    shareOk ? h('button', { class: 'primary wide', onclick: onShare }, 'Поделиться') : null,
+    shareOk ? h('button', { class: 'primary wide', onclick: onShare }, shareButtonText()) : null,
     h('button', { class: 'secondary', onclick: () => onDownload('png') }, 'Сохранить PNG'),
     h('button', { class: 'secondary', onclick: () => onDownload('jpg') }, 'Сохранить JPG'),
   );
 
   const howto = h('p', { class: 'label-howto' },
-    h('span', { class: 'line' }, 'Печатать через приложение Label Expert: Поделиться → Label Expert → Image Print → 30×20, Original.'),
-    h('span', { class: 'line' }, 'Нет Label Expert в меню? Поделиться → «Сохранить изображение» (iPhone) / Google Фото (Android), затем Label Expert → Image Print → из альбома.'));
+    ios
+      ? h('span', { class: 'line' }, 'Печатать через Label Expert: «Сохранить в Фото» → «Сохранить изображение» → Label Expert → Image Print → 30×20, Original.')
+      : h('span', { class: 'line' }, 'Печатать через приложение Label Expert: Поделиться → Label Expert → Image Print → 30×20, Original.'),
+    ios
+      ? h('span', { class: 'line' }, 'Если Label Expert открылся пустым из «Поделиться» — так и должно быть: у него нет приёма картинки из меню. Сохраняйте в «Фото» и импортируйте из альбома.')
+      : h('span', { class: 'line' }, 'Нет Label Expert в меню? «Сохранить PNG» → Label Expert → Image Print → из файлов/альбома.'));
 
   const shareHint = !shareOk
     ? h('p', { class: 'label-hint' },
       'Меню «Поделиться» картинкой в этом браузере недоступно: сохраните PNG (или JPG) и откройте файл в Label Expert → Image Print → из файлов/альбома.')
-    : !isPhoneLike()
+    : ios
       ? h('p', { class: 'label-hint' },
-        'На компьютере «Поделиться» открывает системное меню. Этикетку печатают с телефона: сохраните файл и откройте его в Label Expert.')
-      : null;
+        'В меню выберите «Сохранить изображение». Если открыть Label Expert прямо из «Поделиться», он останется на главном экране — у него нет приёма картинки из меню.')
+      : !isPhoneLike()
+        ? h('p', { class: 'label-hint' },
+          'На компьютере «Поделиться» открывает системное меню. Этикетку печатают с телефона: сохраните файл и откройте его в Label Expert.')
+        : null;
 
   const more = h('details', { class: 'label-more' },
     h('summary', {}, 'Ещё'),

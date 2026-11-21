@@ -537,7 +537,7 @@ function createLabelBox(opts = {}) {
 
   const howto = h('p', { class: 'label-howto' },
     h('span', { class: 'line' }, 'Печатать через приложение Label Expert: Поделиться → Label Expert → Image Print → 30×20, Original.'),
-    h('span', { class: 'line' }, 'Нет Label Expert в меню? Поделиться → «Сохранить изображение», затем Label Expert → Image Print → из альбома.'));
+    h('span', { class: 'line' }, 'Нет Label Expert в меню? Поделиться → «Сохранить изображение» (iPhone) / Google Фото (Android), затем Label Expert → Image Print → из альбома.'));
 
   const shareHint = !shareOk
     ? h('p', { class: 'label-hint' },

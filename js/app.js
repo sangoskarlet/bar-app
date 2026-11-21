@@ -391,11 +391,28 @@ function fmtDateTime(iso) {
 //  Название пустое (акт без рецепта/позиций) — спрашиваем тут же,
 //  обычным полем ввода; срок по умолчанию 24 ч, его можно поменять.
 //
-//  «Поделиться» показываем только если navigator.canShare({files}) умеет
-//  файлы — иначе кнопки нет вовсе. «Печать» — window.print() страницы
-//  30×20 мм (не Bluetooth: протокол B21 ещё не проверен физически).
+//  Главная кнопка на телефоне — «Сохранить в Фото/Галерею» (это
+//  navigator.share с файлом: в системном меню есть «Сохранить изображение»,
+//  откуда картинку видит Label Expert). Рядом — «Скачать PNG» и «Скачать JPG»
+//  с латинскими именами и DPI; «Печать» — обычный принтер или PDF, не B21.
 // =====================================================================
 const LABEL_DEFAULT_HOURS = 24;
+
+/** Телефон: там «Поделиться» действительно сохраняет картинку в Фото/Галерею. */
+function isPhoneLike() {
+  const ua = navigator.userAgent || '';
+  if (/Android|iPhone|iPod/i.test(ua)) return true;
+  return /Macintosh/i.test(ua) && (navigator.maxTouchPoints || 0) > 1; // iPadOS притворяется Mac
+}
+
+/** Подпись главной кнопки: на iPhone — «Фото», на Android — «Галерея». */
+function shareButtonText() {
+  const ua = navigator.userAgent || '';
+  const iOS = /iPhone|iPod/i.test(ua) || (/Macintosh/i.test(ua) && (navigator.maxTouchPoints || 0) > 1);
+  if (iOS) return 'Сохранить в Фото';
+  if (/Android/i.test(ua)) return 'Сохранить в Галерею';
+  return 'Поделиться картинкой';
+}
 
 /** Ключ сравнения названий: регистр, «ё», лишние пробелы. */
 function nameKey(s) {
@@ -417,7 +434,8 @@ function shelfLifeHours(name) {
 
 /**
  * Блок этикетки: превью 2×, название (если его надо спрашивать),
- * срок хранения и кнопки «Печать» / «Поделиться» / «Сохранить картинку».
+ * срок хранения и кнопки «Сохранить в Фото/Галерею» / «Скачать PNG» /
+ * «Скачать JPG» / «Печать».
  * @returns {{el:HTMLElement, madeAt:Date, refresh:Function}}
  */
 function createLabelBox(opts = {}) {
@@ -498,25 +516,41 @@ function createLabelBox(opts = {}) {
   async function onShare() {
     const cur = prepare();
     if (!cur) return;
-    const res = await shareLabel(cur.canvas, labelFileName(cur));
+    const res = await shareLabel(cur.canvas, labelFileName(cur, 'png'), 'png');
     if (!res.ok && res.error !== 'Отменено') toast(res.error, 'bad');
   }
 
-  async function onSave() {
+  /** Скачать файл: формат 'png' (основной) или 'jpg' (если нужен только JPG). */
+  async function onDownload(format) {
     const cur = prepare();
     if (!cur) return;
     try {
-      await saveLabel(cur.canvas, labelFileName(cur));
-      toast('Картинка сохраняется в загрузки');
+      await saveLabel(cur.canvas, labelFileName(cur, format), format);
+      toast(format === 'jpg' ? 'JPG сохраняется в загрузки' : 'PNG сохраняется в загрузки');
     } catch (e) {
-      toast('Не удалось сохранить картинку', 'bad');
+      toast('Не удалось сохранить файл', 'bad');
     }
   }
 
-  const buttons = h('div', { class: 'label-btns' + (shareOk ? '' : ' single') },
-    shareOk ? h('button', { class: 'secondary', onclick: onShare }, 'Поделиться') : null,
-    h('button', { class: 'primary', onclick: onPrint }, 'Печать'),
+  const buttons = h('div', { class: 'label-btns' },
+    shareOk ? h('button', { class: 'primary wide', onclick: onShare }, shareButtonText()) : null,
+    h('button', { class: 'secondary', onclick: () => onDownload('png') }, 'Скачать PNG'),
+    h('button', { class: 'secondary', onclick: () => onDownload('jpg') }, 'Скачать JPG'),
+    h('button', { class: 'secondary wide', onclick: onPrint }, 'Печать'),
   );
+
+  const printNote = h('p', { class: 'label-hint' },
+    '«Печать» — обычный принтер или PDF. Bluetooth-принтер этикеток B21 печатает не отсюда, а из Label Expert / AiYin.');
+
+  const shareHint = h('p', { class: 'label-hint' },
+    !shareOk
+      ? '«Сохранить в Фото» в этом браузере недоступно: скачайте PNG (или JPG) и откройте файл в Label Expert → Image Print → из файлов/альбома.'
+      : isPhoneLike()
+        ? 'Картинка уйдёт в «Фото»/«Галерею» — оттуда её видит Label Expert. В нём: Image Print, размер 30 × 20, эффект Original, Smart crop выкл.'
+        : 'На компьютере «Поделиться» открывает системное меню, а не галерею. На телефоне эта же кнопка сохраняет картинку в «Фото»/«Галерею».');
+
+  const help = h('a', { class: 'label-help', href: './docs/labels/test.html', target: '_blank', rel: 'noopener' },
+    'Файл не открывается в приложении? Проверка и инструкция →');
 
   const el = h('div', { class: 'label-box' },
     h('p', { class: 'group' }, 'Этикетка 30×20'),
@@ -525,7 +559,9 @@ function createLabelBox(opts = {}) {
     nameInput ? h('div', {}, h('p', { class: 'label' }, 'Название'), nameInput) : null,
     h('div', { class: 'label-hours-row' }, h('span', { class: 'label' }, 'Срок хранения'), hoursInput, h('span', { class: 'unit' }, 'ч')),
     buttons,
-    h('button', { class: 'link label-save', onclick: onSave }, 'Сохранить картинку (PNG)'),
+    printNote,
+    shareHint,
+    help,
   );
 
   refresh();

@@ -4,16 +4,19 @@
 //  Принтер: 203 dpi = 8 точек/мм, поэтому 30 × 20 мм — это ровно
 //  240 × 160 точек. Приложение производителя (Label Expert / AiYin)
 //  печатает ИМПОРТИРОВАННУЮ КАРТИНКУ, а не наш шаблон; поэтому весь
-//  макет рисуем здесь, на canvas, и отдаём готовый PNG:
-//    • «Поделиться» — системное меню телефона → Label Expert;
-//    • «Печать»    — window.print() страницы 30×20 мм (обычный принтер);
-//    • «Сохранить картинку» — скачивание PNG (если share-меню не помогло).
+//  макет рисуем здесь, на canvas, и отдаём готовый файл:
+//    • «Сохранить в Фото/Галерею» — системное меню «Поделиться» → сохранить;
+//    • «Скачать PNG» / «Скачать JPG» — файлы в «Загрузки» (латиница, DPI);
+//    • «Печать» — window.print() страницы 30×20 мм (обычный принтер/PDF).
 //
 //  Требования к картинке (docs/labels/ИССЛЕДОВАНИЕ.md):
 //    • ровно 240 × 160, без масштабирования;
 //    • чисто чёрно-белая, без полутонов — термопринтер их «выедает»;
+//    • 8-битный полутоновой PNG без альфа-канала (color type 0);
+//    • pHYs: 8000 точек/м = 8 точек/мм (203 dpi) — иначе телефон считает
+//      картинку 72–96 dpi, и приложение видит «63 × 42 мм» вместо «30 × 20»;
 //    • безопасная зона 2 мм (16 точек) от края;
-//    • на этикетке только: название (до 2 строк), дата производства,
+//    • на этикетке только: название (до трёх строк), дата производства,
 //      «годен до». Ни QR, ни сотрудника, ни логотипа.
 //
 //  Прямой печати по Bluetooth здесь нет: протокол B21 физически не
@@ -28,6 +31,17 @@ export const LABEL = {
   height: 160,
   safe: 16,          // 2 мм — безопасная зона
 };
+
+/**
+ * Сколько точек на метр у принтера: 8 точек/мм = 8000. Именно это число
+ * пишется в pHYs (и в JFIF у JPG): 240 точек при 8000/м = ровно 30,00 мм,
+ * 160 — ровно 20,00 мм. Номинал «203 dpi» — это те же 8 точек/мм,
+ * округлённые производителем (203,2).
+ */
+export const PIXELS_PER_METER = 8000;
+
+/** Номинал для JFIF-заголовка JPG: в нём DPI — целое число. */
+export const LABEL_DPI = 203;
 
 /** Шрифт: системный sans-serif, кириллица есть в любом из стека. */
 const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
@@ -302,29 +316,221 @@ export function buildLabel(opts = {}) {
   };
 }
 
-/** PNG как data:URL — для превью и печати. */
+/** PNG как data:URL — только для превью на экране и печати. */
 export function labelDataUrl(canvas) {
   return canvas.toDataURL('image/png');
 }
 
-/** Имя файла: etiketka-30x20-21.11.png (без пробелов и двоеточий). */
-export function labelFileName(info) {
-  const d = info && info.madeAt instanceof Date ? info.madeAt : new Date();
-  const p = n => String(n).padStart(2, '0');
-  return `etiketka-30x20-${p(d.getDate())}.${p(d.getMonth() + 1)}.png`;
+// ---------------------------------------------------------------------
+//  PNG ДЛЯ ПРИЛОЖЕНИЯ: 8-битный полутоновой, без альфа-канала, с DPI
+//
+//  canvas.toBlob('image/png') отдаёт RGBA (color type 6) и НЕ пишет pHYs.
+//  Телефон из такого файла видит «240 × 160 при 72–96 dpi», то есть
+//  63 × 42 мм вместо 30 × 20, и приложение этикеток либо масштабирует
+//  картинку, либо считает её «не той». Поэтому PNG собираем сами:
+//  пиксели берём с canvas (они уже прошли порог — только 0 и 255),
+//  сжимаем встроенным CompressionStream('deflate') и пишем чанки
+//  IHDR + pHYs + IDAT + IEND. Библиотека для этого не нужна.
+//
+//  Старые браузеры без CompressionStream получают запасной путь:
+//  обычный canvas-PNG, в который дописывается только pHYs.
+// ---------------------------------------------------------------------
+const PNG_SIGNATURE = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+
+/** Таблица CRC32 (полином PNG) — считается один раз. */
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(bytes) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
 }
 
-function canvasToBlob(canvas) {
+/** Один чанк PNG: длина (4) + тип (4) + данные + CRC (4). */
+function pngChunk(type, data) {
+  const out = new Uint8Array(12 + data.length);
+  const view = new DataView(out.buffer);
+  view.setUint32(0, data.length);
+  for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
+  out.set(data, 8);
+  view.setUint32(8 + data.length, crc32(out.subarray(4, 8 + data.length)));
+  return out;
+}
+
+function concatBytes(parts) {
+  const total = parts.reduce((sum, p) => sum + p.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) { out.set(p, off); off += p.length; }
+  return out;
+}
+
+/** pHYs: разрешение в точках на метр (8000 = 8 точек/мм = 30 мм на 240 px). */
+function physChunk() {
+  const data = new Uint8Array(9);
+  const view = new DataView(data.buffer);
+  view.setUint32(0, PIXELS_PER_METER);
+  view.setUint32(4, PIXELS_PER_METER);
+  data[8] = 1; // единица измерения — метр
+  return pngChunk('pHYs', data);
+}
+
+/** Собирает PNG 8 бит/пиксель, полутоновой (color type 0), без альфы. */
+function buildGrayPng(width, height, idat) {
+  const ihdr = new Uint8Array(13);
+  const view = new DataView(ihdr.buffer);
+  view.setUint32(0, width);
+  view.setUint32(4, height);
+  ihdr[8] = 8;   // бит на канал
+  ihdr[9] = 0;   // color type 0 — grayscale, без альфа-канала
+  ihdr[10] = 0;  // сжатие deflate
+  ihdr[11] = 0;  // фильтрация
+  ihdr[12] = 0;  // без интерлейса
+  return concatBytes([
+    PNG_SIGNATURE,
+    pngChunk('IHDR', ihdr),
+    physChunk(),
+    pngChunk('IDAT', idat),
+    pngChunk('IEND', new Uint8Array(0)),
+  ]);
+}
+
+function readU32(bytes, off) {
+  return ((bytes[off] << 24) | (bytes[off + 1] << 16) | (bytes[off + 2] << 8) | bytes[off + 3]) >>> 0;
+}
+
+/** Запасной путь: дописать pHYs в готовый canvas-PNG (перед первым IDAT). */
+function insertPngDpi(bytes) {
+  if (!bytes || bytes.length < 33 || bytes[0] !== PNG_SIGNATURE[0] || bytes[1] !== PNG_SIGNATURE[1]) return bytes;
+  let off = 8;
+  let insertAt = -1;
+  while (off + 12 <= bytes.length) {
+    const len = readU32(bytes, off);
+    const type = String.fromCharCode(bytes[off + 4], bytes[off + 5], bytes[off + 6], bytes[off + 7]);
+    if (type === 'pHYs') return bytes;            // DPI уже есть
+    if (type === 'IDAT') { insertAt = off; break; }
+    off += 12 + len;
+  }
+  if (insertAt < 0) return bytes;
+  return concatBytes([bytes.subarray(0, insertAt), physChunk(), bytes.subarray(insertAt)]);
+}
+
+/** zlib-deflate средствами браузера; null — если браузер не умеет. */
+async function zlibDeflate(bytes) {
+  if (typeof CompressionStream !== 'function') return null;
+  try {
+    const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream('deflate'));
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  } catch (e) {
+    return null;
+  }
+}
+
+function canvasBytes(canvas, type, quality) {
   return new Promise((resolve, reject) => {
-    if (canvas.toBlob) canvas.toBlob(b => (b ? resolve(b) : reject(new Error('Нет PNG'))), 'image/png');
-    else reject(new Error('Браузер не умеет toBlob'));
+    if (!canvas.toBlob) return reject(new Error('Браузер не умеет toBlob'));
+    canvas.toBlob(blob => {
+      if (!blob) return reject(new Error('Браузер не собрал файл'));
+      blob.arrayBuffer().then(resolve, reject);
+    }, type, quality);
   });
 }
 
-/** PNG-файл для navigator.share({files}). */
-export async function labelFile(canvas, fileName) {
-  const blob = await canvasToBlob(canvas);
-  return new File([blob], fileName || 'etiketka-30x20.png', { type: 'image/png' });
+/**
+ * PNG-файл этикетки: 240 × 160, 8-битный чёрно-белый, без альфа-канала,
+ * с pHYs = 8000 точек/м (203 dpi). Основной формат для Label Expert.
+ * @returns {Promise<Blob>} тип image/png
+ */
+export async function labelPngBlob(canvas) {
+  const { width, height } = canvas;
+  let bytes = null;
+  try {
+    const pixels = canvas.getContext('2d').getImageData(0, 0, width, height).data;
+    // Строка PNG = байт фильтра (0 = None) + по байту на пиксель.
+    const raw = new Uint8Array(height * (width + 1));
+    for (let y = 0; y < height; y++) {
+      const row = y * (width + 1);
+      raw[row] = 0;
+      for (let x = 0; x < width; x++) {
+        const i = (y * width + x) * 4;
+        const gray = (pixels[i] * 299 + pixels[i + 1] * 587 + pixels[i + 2] * 114) / 1000;
+        raw[row + 1 + x] = gray < 128 ? 0 : 255;
+      }
+    }
+    const idat = await zlibDeflate(raw);
+    if (idat) bytes = buildGrayPng(width, height, idat);
+  } catch (e) {
+    bytes = null;
+  }
+  if (!bytes) bytes = insertPngDpi(await canvasBytes(canvas, 'image/png'));
+  return new Blob([bytes], { type: 'image/png' });
+}
+
+/**
+ * JPG-файл этикетки: качество 100 %, белая подложка (JPG не умеет
+ * прозрачность — без подложки она станет чёрной), DPI 203 в JFIF.
+ * Нужен приложениям, которые принимают только JPG.
+ * @returns {Promise<Blob>} тип image/jpeg
+ */
+export async function labelJpegBlob(canvas) {
+  const flat = document.createElement('canvas');
+  flat.width = canvas.width;
+  flat.height = canvas.height;
+  const ctx = flat.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, flat.width, flat.height);
+  ctx.drawImage(canvas, 0, 0);
+  const bytes = await canvasBytes(flat, 'image/jpeg', 1);
+  return new Blob([withJpegDpi(bytes)], { type: 'image/jpeg' });
+}
+
+/** Правит JFIF-заголовок JPG: единицы — dpi, плотность 203 × 203. */
+function withJpegDpi(buffer) {
+  const bytes = new Uint8Array(buffer);
+  if (bytes.length < 20 || bytes[0] !== 0xFF || bytes[1] !== 0xD8) return bytes;
+  let off = 2;
+  while (off + 4 < bytes.length && bytes[off] === 0xFF) {
+    const marker = bytes[off + 1];
+    if (marker === 0xDA) break; // SOS — дальше сжатые данные
+    const len = (bytes[off + 2] << 8) | bytes[off + 3];
+    if (len < 2) break;
+    const isJfif = marker === 0xE0 && len >= 16 &&
+      bytes[off + 4] === 0x4A && bytes[off + 5] === 0x46 &&
+      bytes[off + 6] === 0x49 && bytes[off + 7] === 0x46; // «JFIF»
+    if (isJfif) {
+      bytes[off + 11] = 1;                  // единица измерения — dpi
+      bytes[off + 12] = LABEL_DPI >> 8;
+      bytes[off + 13] = LABEL_DPI & 0xFF;
+      bytes[off + 14] = LABEL_DPI >> 8;
+      bytes[off + 15] = LABEL_DPI & 0xFF;
+      return bytes;
+    }
+    off += 2 + len;
+  }
+  return bytes;
+}
+
+/** Имя файла: etiketka-30x20-21.11.png (латиница, без пробелов и двоеточий). */
+export function labelFileName(info, ext) {
+  const d = info && info.madeAt instanceof Date ? info.madeAt : new Date();
+  const p = n => String(n).padStart(2, '0');
+  const e = String(ext || 'png').toLowerCase();
+  return `etiketka-30x20-${p(d.getDate())}.${p(d.getMonth() + 1)}.${e === 'jpg' || e === 'jpeg' ? 'jpg' : 'png'}`;
+}
+
+/** Готовый файл для navigator.share({files}) и скачивания. */
+export async function labelFile(canvas, fileName, format) {
+  const jpg = format === 'jpg' || format === 'jpeg';
+  const blob = jpg ? await labelJpegBlob(canvas) : await labelPngBlob(canvas);
+  return new File([blob], fileName || (jpg ? 'etiketka-30x20.jpg' : 'etiketka-30x20.png'), { type: blob.type });
 }
 
 /**
@@ -342,10 +548,10 @@ export function canShareFiles() {
   }
 }
 
-/** Поделиться PNG: системное меню → Label Expert / AiYin → печать. */
-export async function shareLabel(canvas, fileName) {
-  if (!canShareFiles()) return { ok: false, error: 'Телефон не умеет «Поделиться» картинкой' };
-  const file = await labelFile(canvas, fileName);
+/** Поделиться картинкой: системное меню → «Сохранить изображение» / Label Expert. */
+export async function shareLabel(canvas, fileName, format) {
+  if (!canShareFiles()) return { ok: false, error: 'Устройство не умеет «Поделиться» картинкой' };
+  const file = await labelFile(canvas, fileName, format);
   try {
     await navigator.share({ files: [file], title: 'Этикетка 30×20' });
     return { ok: true };
@@ -355,13 +561,13 @@ export async function shareLabel(canvas, fileName) {
   }
 }
 
-/** Скачать PNG. Работает везде, даже если share-меню не даёт выбрать приложение. */
-export async function saveLabel(canvas, fileName) {
-  const blob = await canvasToBlob(canvas);
-  const url = URL.createObjectURL(blob);
+/** Скачать файл (PNG по умолчанию, JPG — по запросу). */
+export async function saveLabel(canvas, fileName, format) {
+  const file = await labelFile(canvas, fileName, format);
+  const url = URL.createObjectURL(file);
   const a = document.createElement('a');
   a.href = url;
-  a.download = fileName || 'etiketka-30x20.png';
+  a.download = file.name;
   a.rel = 'noopener';
   document.body.append(a);
   a.click();

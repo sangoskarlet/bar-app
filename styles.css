@@ -93,6 +93,25 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .who { display: flex; justify-content: space-between; align-items: center; color: var(--muted); margin: 4px 0; }
 .who b { color: var(--text); }
 
+/* Факт дня: одна строка под «Смена: …», без фона, рамки и анимации.
+   Максимум две строки с многоточием; по нажатию раскрывается источник. */
+.fact-line, .fact {
+  color: var(--muted); font-size: 14px; line-height: 1.35;
+  margin: 2px 0 6px; max-width: 100%;
+}
+.fact summary { list-style: none; cursor: pointer; padding: 0; }
+.fact summary::-webkit-details-marker { display: none; }
+.fact-text {
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+  overflow: hidden; overflow-wrap: break-word;
+}
+.fact[open] .fact-text { display: block; overflow: visible; -webkit-line-clamp: unset; }
+.fact-source {
+  margin: 6px 0 0; padding: 8px 10px; border-radius: 8px;
+  background: var(--panel); color: var(--muted);
+  font-size: 12.5px; line-height: 1.4; overflow-wrap: break-word;
+}
+
 /* Кнопки-выбор (направление, причина, зона, имя) */
 .chips { display: flex; flex-wrap: wrap; gap: 8px; }
 .chip {

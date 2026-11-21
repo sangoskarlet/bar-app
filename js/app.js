@@ -304,6 +304,7 @@ function screenHome() {
         },
       }, 'Сменить'),
     ),
+    factLine(config && config.factOfDay),
     h('div', { class: 'tiles' }, isAdmin()
       ? [ // Админ: только эти плитки
         tile('transfer', 'Перенос', 'между точками', () => go(screenItemsForm, 'transfer')),
@@ -322,6 +323,22 @@ function screenHome() {
         tile('duel', 'Дуэль', 'два игрока', openDuel),
         actsTile(),
       ]),
+  );
+}
+
+/**
+ * Факт дня: одна строка мелким шрифтом под «Смена: …», без фона и анимации.
+ * Если сервер прислал null — строки нет вообще, плитки не сдвигаются.
+ * С источником — по нажатию раскрывается маленькая панель с полным текстом
+ * и источником (без модалки поверх экрана).
+ */
+function factLine(fact) {
+  if (!fact || !fact.text) return null;
+  const text = h('span', { class: 'fact-text' }, fact.text);
+  if (!fact.source) return h('p', { class: 'fact-line' }, text);
+  return h('details', { class: 'fact' },
+    h('summary', {}, text),
+    h('p', { class: 'fact-source' }, 'Источник: ' + fact.source),
   );
 }
 

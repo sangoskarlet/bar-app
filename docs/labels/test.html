@@ -257,15 +257,30 @@ const COLOR_NAMES = { 0: 'полутоновой (grayscale)', 2: 'RGB', 3: 'п�
 const fmtBytes = n => n >= 1024 ? (n / 1024).toFixed(1).replace('.', ',') + ' КБ' : n + ' Б';
 
 async function decodeCheck(blob) {
-  if (typeof createImageBitmap !== 'function') return null;
-  try {
-    const bmp = await createImageBitmap(blob);
-    const res = { width: bmp.width, height: bmp.height };
-    if (bmp.close) bmp.close();
-    return res;
-  } catch (e) {
-    return { error: (e && e.message) || 'не открывается' };
+  // createImageBitmap есть не во всех Safari — тогда проверяем обычным <img>.
+  if (typeof createImageBitmap === 'function') {
+    try {
+      const bmp = await createImageBitmap(blob);
+      const res = { width: bmp.width, height: bmp.height };
+      if (bmp.close) bmp.close();
+      return res;
+    } catch (e) {
+      /* падаем в проверку через <img> */
+    }
   }
+  return new Promise(resolve => {
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve({ width: img.naturalWidth, height: img.naturalHeight });
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      resolve({ error: 'не открывается' });
+    };
+    img.src = url;
+  });
 }
 
 const VARIANTS = [

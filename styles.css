@@ -230,6 +230,49 @@ textarea { margin-top: 16px; resize: vertical; }
 .act-summary { margin: 8px 0 4px; }
 .total.warn { color: var(--bad); }
 
+/* =====================================================================
+   ЭТИКЕТКА 30×20
+   Картинка 240 × 160 точек = 30 × 20 мм при 203 dpi. На экране
+   показываем её в 2× (480 × 320), чтобы было видно, как ляжет на бумагу.
+   Пиксели не сглаживаем: это 1-битная картинка для термопринтера.
+   ===================================================================== */
+.label-box {
+  margin-top: 18px; padding: 12px 14px 14px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+}
+.label-box .group { margin: 0 0 10px; }
+.label-frame { background: #fff; border-radius: 8px; overflow: hidden; line-height: 0; }
+.label-preview {
+  display: block; width: 480px; max-width: 100%; height: auto; aspect-ratio: 240 / 160;
+  image-rendering: pixelated;
+}
+.label-note { color: var(--muted); font-size: 12.5px; line-height: 1.35; margin: 8px 0 0; }
+.label-note.bad { color: var(--bad); }
+.label-name { margin-top: 4px; }
+.label-hours-row { display: grid; grid-template-columns: 1fr 84px 22px; gap: 8px; align-items: center; margin-top: 10px; }
+.label-hours-row .label { margin: 0; }
+.label-hours { text-align: center; }
+.label-btns { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 14px; }
+.label-btns.single { grid-template-columns: 1fr; }
+.label-btns .primary, .label-btns .secondary { margin-top: 0; min-height: 48px; }
+.label-save { display: block; margin: 12px auto 0; font-size: 15px; text-decoration: underline; }
+
+/* =====================================================================
+   ПЕЧАТЬ ЭТИКЕТКИ
+   window.print() для страницы ровно 30 × 20 мм без полей: на обычном
+   принтере этикетка выходит в натуральную величину. На экране блок
+   .print-only не виден вовсе.
+   ===================================================================== */
+.print-only { display: none; }
+@media print {
+  @page { size: 30mm 20mm; margin: 0; }
+  html, body { background: #fff !important; color: #000 !important; }
+  body { padding: 0 !important; }
+  body > *:not(.print-only) { display: none !important; }
+  .print-only { display: block !important; }
+  .print-only img { display: block; width: 30mm; height: 20mm; }
+}
+
 /* Логотип ESSE (картинка зависит от темы) */
 .logo { background: var(--logo) center / contain no-repeat; }
 .top .logo { height: 34px; width: 100%; }

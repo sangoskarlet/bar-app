@@ -24,6 +24,9 @@ import {
 } from './sync.js';
 import { voiceSupported, listenOnce, voiceErrorText, parseInventoryPhrase, confident, parseCustomPhrase } from './voice.js';
 import { icon } from './icons.js';
+import {
+  buildLabel, labelDataUrl, labelFileName, canShareFiles, shareLabel, saveLabel, printLabel,
+} from './label.js';
 
 const app = document.getElementById('app');
 const statusEl = document.getElementById('status');
@@ -374,6 +377,184 @@ function fmtDateTime(iso) {
   return `${p(d.getDate())}.${p(d.getMonth() + 1)} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
+// =====================================================================
+//  ЭТИКЕТКА 30×20 КАК ИЗ АКТА ПЕРЕРАБОТКИ
+//
+//  Блок появляется, когда акт готов: вписан выход (или акт закрыли).
+//  Картинку рисует js/label.js — ровно 240×160 точек (30×20 мм при
+//  203 dpi), чёрно-белая, безопасная зона 2 мм.
+//
+//  Срок хранения берём из справочника «Сроки хранения» (config.shelfLife).
+//  Позиции нет в справочнике — подставляем 24 часа и пишем об этом
+//  мелким текстом под превью; на самой этикетке только срок.
+//
+//  Название пустое (акт без рецепта/позиций) — спрашиваем тут же,
+//  обычным полем ввода; срок по умолчанию 24 ч, его можно поменять.
+//
+//  «Поделиться» показываем только если navigator.canShare({files}) умеет
+//  файлы — иначе кнопки нет вовсе. «Печать» — window.print() страницы
+//  30×20 мм (не Bluetooth: протокол B21 ещё не проверен физически).
+// =====================================================================
+const LABEL_DEFAULT_HOURS = 24;
+
+/** Ключ сравнения названий: регистр, «ё», лишние пробелы. */
+function nameKey(s) {
+  return String(s || '').toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ').trim();
+}
+
+/** Строка справочника «Сроки хранения» для названия (или null). */
+function shelfLifeFor(name) {
+  const key = nameKey(name);
+  if (!key) return null;
+  const list = (config && config.shelfLife) || [];
+  return list.find(x => nameKey(x.name) === key) || null;
+}
+
+function shelfLifeHours(name) {
+  const hit = shelfLifeFor(name);
+  return hit && Number(hit.hours) > 0 ? Number(hit.hours) : LABEL_DEFAULT_HOURS;
+}
+
+/**
+ * Блок этикетки: превью 2×, название (если его надо спрашивать),
+ * срок хранения и кнопки «Печать» / «Поделиться» / «Сохранить картинку».
+ * @returns {{el:HTMLElement, madeAt:Date, refresh:Function}}
+ */
+function createLabelBox(opts = {}) {
+  const state = {
+    name: String(opts.name || ''),
+    madeAt: opts.madeAt instanceof Date && !isNaN(opts.madeAt) ? opts.madeAt : new Date(),
+    hoursTouched: false,
+  };
+  const shareOk = canShareFiles();
+  let info = null;
+
+  const preview = h('img', { class: 'label-preview', alt: 'Превью этикетки 30×20 мм' });
+  const note = h('p', { class: 'label-note' });
+  const nameInput = opts.nameEditable
+    ? h('input', { type: 'text', class: 'label-name', placeholder: 'Например: Имбирная заготовка', value: state.name })
+    : null;
+  const hoursInput = h('input', {
+    type: 'text', inputmode: 'decimal', class: 'label-hours',
+    value: String(shelfLifeHours(state.name)).replace('.', ','),
+  });
+
+  /** Перерисовать превью и подписи. Возвращает актуальную этикетку. */
+  function refresh() {
+    const name = state.name.trim();
+    const hours = parseQty(hoursInput.value);
+    const hoursOk = hours > 0;
+    const hit = shelfLifeFor(name);
+    info = buildLabel({ name, madeAt: state.madeAt, hours: hoursOk ? hours : LABEL_DEFAULT_HOURS });
+    preview.src = labelDataUrl(info.canvas);
+    const parts = [];
+    if (!name) parts.push('Название не заполнено — картинка не напечатается');
+    if (!hoursOk) parts.push('Срок хранения: впишите число часов');
+    else if (hit && hit.hours === hours) parts.push(`Срок ${fmtNum(hours)} ч — из справочника «Сроки хранения»`);
+    else if (hit) parts.push(`Срок ${fmtNum(hours)} ч (в справочнике ${fmtNum(hit.hours)} ч) — поправлено вручную`);
+    else parts.push(`Срок ${fmtNum(hours)} ч: позиции нет в справочнике «Сроки хранения», проверьте`);
+    if (info.truncated) parts.push('название не помещается целиком — сократите его');
+    note.textContent = parts.join(' · ');
+    note.classList.toggle('bad', !name || !hoursOk || info.truncated);
+    return info;
+  }
+
+  let timer = 0;
+  const schedule = () => { clearTimeout(timer); timer = setTimeout(refresh, 120); };
+
+  if (nameInput) {
+    nameInput.addEventListener('input', () => {
+      state.name = nameInput.value;
+      if (!state.hoursTouched) hoursInput.value = String(shelfLifeHours(state.name)).replace('.', ',');
+      schedule();
+    });
+  }
+  hoursInput.addEventListener('input', () => { state.hoursTouched = true; schedule(); });
+
+  /** Перед действием: проверки и гарантированно свежая картинка. */
+  function prepare() {
+    const cur = refresh();
+    if (!state.name.trim()) {
+      if (nameInput) nameInput.focus();
+      toast('Впишите название заготовки', 'bad');
+      return null;
+    }
+    if (!(parseQty(hoursInput.value) > 0)) {
+      hoursInput.focus();
+      toast('Срок хранения: нужно число часов больше нуля', 'bad');
+      return null;
+    }
+    return cur;
+  }
+
+  async function onPrint() {
+    const cur = prepare();
+    if (cur) await printLabel(cur.canvas);
+  }
+
+  async function onShare() {
+    const cur = prepare();
+    if (!cur) return;
+    const res = await shareLabel(cur.canvas, labelFileName(cur));
+    if (!res.ok && res.error !== 'Отменено') toast(res.error, 'bad');
+  }
+
+  async function onSave() {
+    const cur = prepare();
+    if (!cur) return;
+    try {
+      await saveLabel(cur.canvas, labelFileName(cur));
+      toast('Картинка сохраняется в загрузки');
+    } catch (e) {
+      toast('Не удалось сохранить картинку', 'bad');
+    }
+  }
+
+  const buttons = h('div', { class: 'label-btns' + (shareOk ? '' : ' single') },
+    shareOk ? h('button', { class: 'secondary', onclick: onShare }, 'Поделиться') : null,
+    h('button', { class: 'primary', onclick: onPrint }, 'Печать'),
+  );
+
+  const el = h('div', { class: 'label-box' },
+    h('p', { class: 'group' }, 'Этикетка 30×20'),
+    h('div', { class: 'label-frame' }, preview),
+    note,
+    nameInput ? h('div', {}, h('p', { class: 'label' }, 'Название'), nameInput) : null,
+    h('div', { class: 'label-hours-row' }, h('span', { class: 'label' }, 'Срок хранения'), hoursInput, h('span', { class: 'unit' }, 'ч')),
+    buttons,
+    h('button', { class: 'link label-save', onclick: onSave }, 'Сохранить картинку (PNG)'),
+  );
+
+  refresh();
+  return { el, madeAt: state.madeAt, refresh };
+}
+
+/** Экран «Акт сохранён / закрыт»: сразу с этикеткой, печать в один тап. */
+function screenActDone(opts = {}) {
+  const name = String(opts.name || '');
+  const root = h('main', { class: 'screen' }, header(opts.title || 'Акт сохранён'));
+  const box = createLabelBox({ name, madeAt: opts.madeAt, nameEditable: !name });
+  root.append(
+    name ? h('p', { class: 'total' }, name) : h('p', { class: 'label' }, 'Название заготовки'),
+    opts.note ? h('p', { class: 'hint left' }, opts.note) : null,
+    box.el,
+    h('button', { class: 'secondary', onclick: () => resetTo(screenActs) }, 'Готово'),
+  );
+  return root;
+}
+
+/** Пустая заготовка: акта нет, название вводится руками. */
+function screenLabel() {
+  const root = h('main', { class: 'screen' }, header('Этикетка 30×20'));
+  const box = createLabelBox({ name: '', madeAt: new Date(), nameEditable: true });
+  root.append(
+    h('p', { class: 'hint left' }, 'Пустая заготовка: впишите название и срок хранения — этикетка напечатается так же, как из акта.'),
+    box.el,
+  );
+  setTimeout(() => box.el.querySelector('input.label-name')?.focus(), 80);
+  return root;
+}
+
 /** Закрыть акт: вписать, сколько получилось. Может любой бармен. */
 function screenCloseAct(a) {
   const root = h('main', { class: 'screen' }, header('Закрыть акт'));
@@ -382,6 +563,23 @@ function screenCloseAct(a) {
   const comment = h('textarea', { rows: '2', placeholder: 'Комментарий (необязательно)' });
   const saveBtn = h('button', { class: 'primary' }, '✅ Закрыть акт');
   const dev = v => (a.expected > 0 ? (v - a.expected) / a.expected * 100 : 0);
+
+  // Этикетка: акт закрыт = выход есть. Дата производства — начало акта:
+  // времени закрытия в таблице нет, а заготовка сделана, когда акт начали.
+  const startedAt = a.date ? new Date(a.date) : new Date();
+  const labelSlot = h('div', {});
+  let labelBox = null;
+  const syncLabel = () => {
+    if (!(parseQty(qty.value) > 0)) {
+      if (labelBox) { labelSlot.replaceChildren(); labelBox = null; }
+      return;
+    }
+    if (labelBox) return;
+    const name = a.item || '';
+    labelBox = createLabelBox({ name, madeAt: startedAt, nameEditable: !name });
+    labelSlot.replaceChildren(labelBox.el);
+  };
+
   qty.addEventListener('input', () => {
     const v = parseQty(qty.value);
     if (!(v > 0) || !(a.expected > 0)) { info.textContent = ''; return; }
@@ -389,6 +587,7 @@ function screenCloseAct(a) {
     info.textContent = Math.abs(d) < 1 ? 'Точно как ожидалось' : `${d > 0 ? '+' : ''}${fmtNum(d)}% от ожидаемого`;
     info.classList.toggle('warn', Math.abs(d) >= 15);
   });
+  qty.addEventListener('input', syncLabel);
   saveBtn.addEventListener('click', async () => {
     const v = parseQty(qty.value);
     if (!(v > 0)) return toast('Введите, сколько получилось', 'bad');
@@ -398,10 +597,17 @@ function screenCloseAct(a) {
       if (!comment.value.trim()) { comment.focus(); return toast('Напишите в комментарии, почему выход другой', 'bad'); }
     }
     saveBtn.disabled = true;
+    const madeAt = labelBox ? labelBox.madeAt : startedAt;
     await enqueue({ type: 'processingClose', name: session.name, pin: session.pin, actId: a.id, act: a.act,
       qty: v, unit: a.unit, comment: comment.value.trim() });
     toast('Акт закрыт');
-    back();
+    stack.pop(); // экран закрытия в истории заменяем на «Акт закрыт» + этикетка
+    go(screenActDone, {
+      title: 'Акт закрыт',
+      name: a.item || '',
+      madeAt,
+      note: 'Дата производства — время начала акта: время закрытия в таблице не хранится.',
+    });
   });
   root.append(
     h('p', { class: 'label' }, a.act),
@@ -412,7 +618,7 @@ function screenCloseAct(a) {
     a.comment ? h('p', { class: 'muted' }, '💬 ' + a.comment) : null,
     h('p', { class: 'label' }, `Получилось: ${a.item}, ${a.unit}`),
     a.expected > 0 ? h('p', { class: 'hint left' }, `Ожидается ≈ ${fmtNum(a.expected)} ${a.unit} · ${a.basis}`) : null,
-    qty, info, comment, saveBtn);
+    qty, info, labelSlot, comment, saveBtn);
   setTimeout(() => qty.focus(), 50);
   return root;
 }
@@ -1125,7 +1331,10 @@ function screenActs() {
   ] : []));
   getOpenActs(false).then(drawOpen);
   getOpenActs(true).then(drawOpen);
-  root.append(openBox, search, list);
+  // Пустая заготовка: акта нет, но этикетку печатаем теми же кнопками
+  const blank = h('button', { class: 'row', onclick: () => go(screenLabel) },
+    h('span', {}, '🏷 Этикетка пустой заготовки'), h('span', { class: 'muted' }, 'название вручную'));
+  root.append(openBox, blank, search, list);
   return root;
 }
 
@@ -1138,6 +1347,22 @@ function screenAct(act) {
   const saveBtn = h('button', { class: 'primary' }, 'Сохранить акт');
   const outInput = numInput(true);
   let expectedOut = null;
+
+  // Этикетка появляется, как только вписан выход: акт готов.
+  // Пока выхода нет — блока нет вообще (печатать нечего).
+  const labelSlot = h('div', {});
+  let labelBox = null;
+  const syncLabel = () => {
+    if (!(parseQty(outInput.value) > 0)) {
+      if (labelBox) { labelSlot.replaceChildren(); labelBox = null; }
+      return;
+    }
+    if (labelBox) return;
+    const labelName = (act.output && act.output.item) || '';
+    labelBox = createLabelBox({ name: labelName, madeAt: new Date(), nameEditable: !labelName });
+    labelSlot.replaceChildren(labelBox.el);
+  };
+  outInput.addEventListener('input', syncLabel);
 
   // ---------- Простой акт: было → стало ----------
   if (!isRecipe) {
@@ -1158,19 +1383,23 @@ function screenAct(act) {
       if (!(k > 0)) return toast('Введите, сколько было', 'bad');
       if (!later && !(o > 0)) return toast('Проверьте, сколько стало', 'bad');
       saveBtn.disabled = true;
+      const madeAt = labelBox ? labelBox.madeAt : new Date();
       await enqueue({ type: 'processing', name: session.name, pin: session.pin, act: act.name, comment: comment.value.trim(),
         pending: later,
         lines: [{ role: 'Сырьё', item: key.item, unit: key.unit, qty: k },
                 { role: 'Результат', item: act.output.item, unit: act.output.unit, qty: o }] });
       toast(later ? 'Сохранено. Выход впишете позже в «⏳ В работе»' : 'Акт сохранён');
-      back();
+      if (later) return back();
+      // Акт готов — сразу этикетка, чтобы не искать её потом
+      stack.pop();
+      go(screenActDone, { name: act.output.item || '', madeAt });
     });
     setSaveLabel(saveBtn, outInput);
     root.append(
       h('p', { class: 'label' }, `Было: ${key.item}, ${key.unit}`), keyInput,
       h('p', { class: 'label' }, `Стало: ${act.output.item}, ${act.output.unit}`), outInput,
       h('p', { class: 'muted' }, 'Ещё не готово? Оставьте «стало» пустым — допишете потом.'),
-      info, comment, saveBtn);
+      info, labelSlot, comment, saveBtn);
     setTimeout(() => keyInput.focus(), 50);
     return root;
   }
@@ -1233,10 +1462,13 @@ function screenAct(act) {
     if (!later && !(o > 0)) return toast('Проверьте, сколько получилось', 'bad');
     lines.push({ role: 'Результат', item: act.output.item, unit: act.output.unit, qty: o });
     saveBtn.disabled = true;
+    const madeAt = labelBox ? labelBox.madeAt : new Date();
     await enqueue({ type: 'processing', name: session.name, pin: session.pin, act: act.name, lines, comment: comment.value.trim(),
       pending: later, expected: later ? expectedOut : null });
     toast(later ? 'Сохранено. Выход впишете позже в «⏳ В работе»' : 'Акт сохранён');
-    back();
+    if (later) return back();
+    stack.pop();
+    go(screenActDone, { name: act.output.item || '', madeAt });
   });
   outInput.addEventListener('input', () => setSaveLabel(saveBtn, outInput));
   setSaveLabel(saveBtn, outInput);
@@ -1266,7 +1498,7 @@ function screenAct(act) {
     h('div', { class: 'lines' }, ...restRows.map(block)),
     h('p', { class: 'label' }, `Получилось: ${act.output.item}, ${act.output.unit}`), outInput,
     h('p', { class: 'muted' }, 'Ещё варится? Оставьте пустым — выход впишете потом.'),
-    info, comment, saveBtn);
+    info, labelSlot, comment, saveBtn);
   recalc();
   setTimeout(() => (keyRow.raw || keyRow.amount).focus(), 50);
   return root;

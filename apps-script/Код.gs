@@ -50,6 +50,7 @@ const SHEETS = {
   characters: 'Персонажи',          // персонаж сотрудника (создаётся автоматически)
   itemCatalog: 'Предметы',          // каталог предметов и эффектов (создаётся автоматически)
   inventory: 'Инвентарь',           // полученные предметы и экипировка (создаётся автоматически)
+  shelfLife: 'Сроки хранения',      // сроки хранения заготовок для этикетки 30×20 (создаётся автоматически)
 };
 
 // В каком столбце листа лежит ID записи (считаем с 1: A=1, B=2 ...).
@@ -161,10 +162,15 @@ function getConfig_() {
 
   const acts = actTemplates_(ss);
 
+  // Сроки хранения заготовок (для этикетки 30×20). Отдаём вместе со справочником,
+  // чтобы телефон не делал отдельный запрос перед каждой печатью.
+  const shelfLife = shelfLife_(ss);
+
   // Оформление приложения: «Списки»!F2 — обычное / зимнее / авто (пусто = авто)
   const theme = lists.length ? str_(lists[0][5]) : '';
   return {
-    theme, ok: true, employees, items, reasons, zones, ttk, inventory, acts, directions: DIRECTIONS, units: UNITS };
+    theme, ok: true, employees, items, reasons, zones, ttk, inventory, acts, shelfLife,
+    directions: DIRECTIONS, units: UNITS };
 }
 
 /** Места Gift-shop из «Списки»!E (по умолчанию Кабинет и Витрина). */
@@ -218,6 +224,96 @@ function inventoryItems_(ss) {
       tare: num_(r[5]),
       density: num_(r[6]),
     }));
+}
+
+/* =====================================================================
+ *  СРОКИ ХРАНЕНИЯ — справочник для этикетки 30×20
+ * =====================================================================
+ *
+ *  Лист «Сроки хранения» (создаётся автоматически при первом чтении config):
+ *    заготовка | срок_часов | примечание | активен
+ *
+ *  «заготовка» — ровно то название, которое попадает на этикетку
+ *  (для акта это название результата, например «Имбирная заготовка»).
+ *  Срок — в часах, можно дробный (0,5 = 30 минут).
+ *  «активен» — галочка; снятая галочка убирает строку из config, но не удаляет.
+ *
+ *  Первое заполнение — из названий результатов актов переработки и ТТК
+ *  со сроком 24 часа и пометкой «значение по умолчанию, проверьте»:
+ *  цифры должны быть настоящими, их знает только владелец.
+ * ===================================================================== */
+
+const SHELF_LIFE_DEFAULT_HOURS = 24;
+const SHELF_LIFE_NOTE = 'значение по умолчанию, проверьте';
+const SHELF_LIFE_HEADERS = ['заготовка', 'срок_часов', 'примечание', 'активен'];
+
+/**
+ * Лист «Сроки хранения»: находит или создаёт, пишет шапку и первое заполнение.
+ * Повторный запуск ничего не дублирует: строки пишутся только в пустой лист.
+ */
+function ensureShelfLifeSheet_(ss) {
+  let sh = ss.getSheetByName(SHEETS.shelfLife);
+  if (!sh) {
+    try {
+      sh = ss.insertSheet(SHEETS.shelfLife);
+    } catch (e) {
+      // Параллельный запрос успел создать лист — просто берём его
+      sh = ss.getSheetByName(SHEETS.shelfLife);
+    }
+    if (!sh) throw new Error('Не удалось создать лист «' + SHEETS.shelfLife + '»');
+    log_('Сроки хранения', 'создан лист «' + SHEETS.shelfLife + '»');
+  }
+  if (!str_(sh.getRange(1, 1).getValue())) {
+    sh.getRange(1, 1, 1, SHELF_LIFE_HEADERS.length).setValues([SHELF_LIFE_HEADERS]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+    sh.setColumnWidth(1, 300);
+    sh.setColumnWidth(3, 300);
+  }
+  if (sh.getLastRow() < 2) seedShelfLife_(ss, sh);
+  return sh;
+}
+
+/** Первое заполнение справочника: результаты актов + названия из ТТК, все по 24 ч. */
+function seedShelfLife_(ss, sh) {
+  const names = [];
+  const seen = {};
+  const add = function (v) {
+    const n = str_(v);
+    if (!n) return;
+    const key = n.toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ');
+    if (seen[key]) return;
+    seen[key] = true;
+    names.push(n);
+  };
+  actTemplates_(ss).forEach(function (a) { if (a.output) add(a.output.item); });
+  rows_(ss, SHEETS.ttk).forEach(function (r) { add(r[0]); });
+  if (!names.length) return 0;
+
+  const values = names.map(function (n) {
+    return [text_(n, 200), SHELF_LIFE_DEFAULT_HOURS, SHELF_LIFE_NOTE, true];
+  });
+  sh.getRange(2, 1, values.length, SHELF_LIFE_HEADERS.length).setValues(values);
+  log_('Сроки хранения', 'заполнено строк: ' + values.length + ' (по ' + SHELF_LIFE_DEFAULT_HOURS + ' ч)');
+  return values.length;
+}
+
+/**
+ * Справочник сроков для телефона: только активные строки.
+ * Пустой или нулевой срок считаем «не задан» и отдаём 24 ч —
+ * приложение тогда подставляет 24 и честно пишет об этом на экране.
+ */
+function shelfLife_(ss) {
+  const sh = ensureShelfLifeSheet_(ss);
+  return rows_(ss, SHEETS.shelfLife)
+    .filter(function (r) { return str_(r[0]) && r[3] !== false; })
+    .map(function (r) {
+      const hours = num_(r[1]);
+      return {
+        name: str_(r[0]),
+        hours: hours > 0 ? hours : SHELF_LIFE_DEFAULT_HOURS,
+        note: str_(r[2]),
+      };
+    });
 }
 
 /**
@@ -675,9 +771,10 @@ function setup() {
   const ss = ss_();
   // «Эталоны уборки» и листы викторины к обязательным не относятся:
   // эталоны необязательны, а листы викторины создаёт отдельная функция setupQuiz().
-  // Листы дуэли и рейтинга создаются сами при первой дуэли (ensureDuelSheets_).
+  // Листы дуэли и рейтинга создаются сами при первой дуэли (ensureDuelSheets_),
+  // «Сроки хранения» — при первом чтении справочника (ensureShelfLifeSheet_).
   const auto = ['refs', 'questions', 'disputes', 'duels', 'ratings', 'quizTries',
-    'characters', 'itemCatalog', 'inventory'];
+    'characters', 'itemCatalog', 'inventory', 'shelfLife'];
   const missing = Object.keys(SHEETS).filter(k => auto.indexOf(k) === -1)
     .map(k => SHEETS[k]).filter(n => !ss.getSheetByName(n));
   if (missing.length) throw new Error('В таблице нет листов: ' + missing.join(', '));

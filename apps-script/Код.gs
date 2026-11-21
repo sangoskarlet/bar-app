@@ -51,6 +51,7 @@ const SHEETS = {
   itemCatalog: 'Предметы',          // каталог предметов и эффектов (создаётся автоматически)
   inventory: 'Инвентарь',           // полученные предметы и экипировка (создаётся автоматически)
   shelfLife: 'Сроки хранения',      // сроки хранения заготовок для этикетки 30×20 (создаётся автоматически)
+  facts:     'Факты',               // факт дня на главном экране (создаётся автоматически)
 };
 
 // В каком столбце листа лежит ID записи (считаем с 1: A=1, B=2 ...).
@@ -166,10 +167,20 @@ function getConfig_() {
   // чтобы телефон не делал отдельный запрос перед каждой печатью.
   const shelfLife = shelfLife_(ss);
 
+  // Факт дня. Отдаём вместе со справочником: приложение не делает отдельный
+  // запрос на старте и не ждёт его. Ошибка в листе «Факты» не должна ломать
+  // справочник — тогда просто не будет строки.
+  let factOfDay = null;
+  try {
+    factOfDay = factOfDay_(ss);
+  } catch (e) {
+    log_('Факт дня', 'не прочитан: ' + String(e && e.stack || e));
+  }
+
   // Оформление приложения: «Списки»!F2 — обычное / зимнее / авто (пусто = авто)
   const theme = lists.length ? str_(lists[0][5]) : '';
   return {
-    theme, ok: true, employees, items, reasons, zones, ttk, inventory, acts, shelfLife,
+    theme, ok: true, employees, items, reasons, zones, ttk, inventory, acts, shelfLife, factOfDay,
     directions: DIRECTIONS, units: UNITS };
 }
 
@@ -349,6 +360,254 @@ function shelfLife_(ss) {
         note: h.note >= 0 ? str_(r[h.note]) : '',
       };
     });
+}
+
+/* =====================================================================
+ *  ФАКТ ДНЯ — одна строка на главном экране
+ * =====================================================================
+ *
+ *  Лист «Факты» (создаётся автоматически при первом чтении справочника):
+ *    id | текст | источник | активен | дата_показа
+ *
+ *  «текст» — одна короткая фраза (до 180 символов), «источник» — книга,
+ *  сайт или документ, откуда факт взят. «активен» — галочка.
+ *  «дата_показа» бэкенд пишет сам, когда факт реально ушёл в приложение:
+ *  по ней видно, какие факты ещё не показывались.
+ *
+ *  Выбор — только на сервере и только по дате:
+ *    номер дня по UTC+3 (Москва) по модулю числа активных фактов,
+ *    сортировка по id. Двое барменов в один момент видят один и тот же
+ *    факт, а на следующий день — следующий.
+ *
+ *  Факт приходит вместе с config, отдельного запроса на старте нет.
+ *  Пустой лист или все галочки сняты — возвращаем null, строки в
+ *  приложении просто нет.
+ * ===================================================================== */
+
+const FACT_HEADERS = ['id', 'текст', 'источник', 'активен', 'дата_показа'];
+const FACT_MAX_TEXT = 180;
+const FACT_DAY_MS = 24 * 3600 * 1000;
+const FACT_TZ_OFFSET_MS = 3 * 3600 * 1000; // UTC+3: в Москве нет перехода на летнее время
+
+/**
+ * Первое заполнение листа. 40 фактов: 25 общих (история баров, коктейлей
+ * и джаза) и 15 про бар ESSE — из чек-листов и коктейльной карты «Лето 25».
+ * Все тексты короче 180 символов. Спорные версии происхождения помечены
+ * словами «связывают» / «по распространённой версии».
+ */
+const FACTS_SEED = [
+  { text: 'В 1806 году «коктейль» впервые определили как смесь спиртного, сахара, воды и биттеров.',
+    source: 'The Balance and Columbian Repository, 13.05.1806' },
+  { text: 'На открытии смены на 2 этаже ESSE включают подачу газа к пиву.',
+    source: 'Чек листы бармена Эссе — Открытие 2 этаж' },
+  { text: 'Одно из первых печатных упоминаний слова cocktail — 1798 год, лондонская The Morning Post.',
+    source: 'The Morning Post and Gazetteer, 20.03.1798' },
+  { text: 'Морс в ESSE готовят из 800 г клюквы, 400 г сахара и 500 мл горячей воды.',
+    source: 'Чек листы бармена Эссе — Лайн-чек' },
+  { text: 'Первый в США сборник рецептов бармена — «How to Mix Drinks» Джерри Томаса, 1862 год.',
+    source: 'Jerry Thomas, How to Mix Drinks (1862)' },
+  { text: 'Малиновую заготовку в ESSE делают из 500 г малины и 500 мл малинового сиропа.',
+    source: 'Чек листы бармена Эссе — Лайн-чек' },
+  { text: 'Биттеры Angostura создал в 1824 году врач Иоганн Зигерт в Венесуэле.',
+    source: 'Angostura — Our Story' },
+  { text: 'Имбирная заготовка ESSE — равные части имбиря, лимона и мёда, по 300 г.',
+    source: 'Чек листы бармена Эссе — Лайн-чек' },
+  { text: 'Вермут как категорию придумал в Турине в 1786 году Антонио Бенедетто Карпано.',
+    source: 'Carpano — The History' },
+  { text: 'Кордиал «Красный дракон» в ESSE готовят в су-виде 1 час при 57 °C.',
+    source: 'Чек листы бармена Эссе — Лайн-чек' },
+  { text: 'Sazerac — официальный коктейль Нового Орлеана с 2008 года.',
+    source: 'Louisiana State Legislature, Act 928 (2008)' },
+  { text: 'В грейпфрутовую пену ESSE кладут 6 г бентонита и 3 г ксантановой камеди.',
+    source: 'Чек листы бармена Эссе — Лайн-чек' },
+  { text: 'Рецепт «Дайкири» связывают с американским инженером Дженнингсом Коксом и 1898 годом.',
+    source: 'Wikipedia — Daiquiri' },
+  { text: 'Заготовку для «Кровавой мэри» в ESSE готовят в су-виде 3 часа при 53 °C.',
+    source: 'Чек листы бармена Эссе — Лайн-чек' },
+  { text: 'Американский бар Harry’s New York Bar открылся в Париже в 1911 году.',
+    source: 'The New York Times, 24.11.1961' },
+  { text: 'В кордиале «Грейпфрут–клюква–тимьян» ESSE всего 1 г тимьяна.',
+    source: 'Чек листы бармена Эссе — Лайн-чек' },
+  { text: 'Франция запретила абсент в 1915 году и снова разрешила его производство в 2011-м.',
+    source: 'Radio France, 16.03.1915' },
+  { text: 'Облепиховую заготовку ESSE пробивают с 150 г груши.',
+    source: 'Чек листы бармена Эссе — Лайн-чек' },
+  { text: 'Первые записи джаза сделала в 1917 году Original Dixieland Jass Band.',
+    source: 'The New York Times, 28.06.1987' },
+  { text: 'Бойлер от накипи в баре ESSE чистят раз в две недели.',
+    source: 'Чек листы бармена Эссе — Уборка' },
+  { text: 'В США сухой закон действовал с 1920 по 1933 год.',
+    source: 'Wikipedia — Prohibition in the United States' },
+  { text: 'Коктейль «Опунция IV» вдохновлён альбомом IV группы BADBADNOTGOOD.',
+    source: 'Лето 25 — Опунция IV' },
+  { text: '«Кровавую мэри», по распространённой версии, придумал в 1921 году Фернан Петио в Harry’s New York Bar.',
+    source: 'RTBF — Bloody Mary' },
+  { text: '«Лавандовый туман» построен на ощущении пространства в поздних альбомах Джона Колтрейна.',
+    source: 'Лето 25 — Лавандовый туман' },
+  { text: 'Cotton Club открылся в Гарлеме в 1923 году.',
+    source: 'Oxford Reference — Cotton Club' },
+  { text: 'Коктейль «Эманон» назван в честь альбома Уэйна Шортера о путешествии без карты.',
+    source: 'Лето 25 — Эманон' },
+  { text: '«Мимозу» связывают с парижским Ritz и барменом Фрэнком Мейером, около 1925 года.',
+    source: 'Wikipedia — Mimosa (cocktail)' },
+  { text: '«Бардо» вдохновлён альбомом A Humdrum Star группы GoGo Penguin.',
+    source: 'Лето 25 — Бардо' },
+  { text: 'В 1934 году в Калифорнии открылись Don the Beachcomber и Trader Vic’s — будущие тики-бары.',
+    source: 'WGBH — Tiki Drink Culture' },
+  { text: '«Полуночный блюз» посвящён альбому Black Coffee Пегги Ли.',
+    source: 'Лето 25 — Полуночный блюз' },
+  { text: 'Village Vanguard открылся в Нью-Йорке в 1935 году.',
+    source: 'The New York Times, 22.02.2015' },
+  { text: 'Лейбл Blue Note основан в Нью-Йорке в 1939 году.',
+    source: 'Blue Note Records — 80th Anniversary' },
+  { text: 'По распространённой версии, «Московский мул» придумали в 1941 году в лос-анджелесском баре Cock ’n Bull.',
+    source: 'Oxford Reference — Moscow Mule' },
+  { text: '«Беллини» создал Джузеппе Чиприани в Венеции в 1948 году.',
+    source: 'Cipriani — Heritage' },
+  { text: 'Ньюпортский джазовый фестиваль впервые прошёл в 1954 году.',
+    source: 'The New York Times, 03.07.1993' },
+  { text: 'Montreux Jazz Festival основал Клод Нобс в 1967 году.',
+    source: 'The New York Times, 12.01.2013' },
+  { text: 'Первый «Мишлен» выпустили в 1900 году как бесплатный справочник для автомобилистов.',
+    source: 'Michelin Guide — History' },
+  { text: 'Звёзды «Мишлен» впервые появились в 1926 году.',
+    source: 'Michelin Guide — History' },
+  { text: 'В 1806 году Фредерик Тюдор начал возить лёд из Бостона в Карибы.',
+    source: 'Gavin Weightman, The Frozen Water Trade' },
+  { text: 'Слово restaurant во французском сначала означало укрепляющий бульон, а не заведение.',
+    source: 'Merriam-Webster — The History of Restaurant' },
+];
+
+/** Колонки ищем по названиям в шапке — порядок не ломается при правках владельца. */
+function factsHeader_(sh) {
+  const width = Math.max(sh.getLastColumn(), FACT_HEADERS.length);
+  const head = sh.getRange(1, 1, 1, width).getValues()[0].map(str_);
+  return {
+    id: head.indexOf(FACT_HEADERS[0]),
+    text: head.indexOf(FACT_HEADERS[1]),
+    source: head.indexOf(FACT_HEADERS[2]),
+    active: head.indexOf(FACT_HEADERS[3]),
+    shown: head.indexOf(FACT_HEADERS[4]),
+  };
+}
+
+/** Галочка (true), а также «да»/«true»/«1» — на случай, если владелец впишет текст. */
+function factActive_(v) {
+  if (v === true) return true;
+  const s = str_(v).toLowerCase();
+  return s === 'да' || s === 'true' || s === '1' || s === 'yes' || s === 'истина';
+}
+
+/**
+ * Лист «Факты». Если листа нет — создаёт и один раз заполняет 40 фактами.
+ * Если лист есть, но пуст, ничего не досеивает: пустой лист = «факта нет»
+ * (так владелец может временно выключить строку, не удаляя лист).
+ */
+function ensureFactsSheet_(ss) {
+  let sh = ss.getSheetByName(SHEETS.facts);
+  if (sh) return sh;
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) return null;
+  try {
+    sh = ss.getSheetByName(SHEETS.facts);
+    if (sh) return sh;
+    sh = ss.insertSheet(SHEETS.facts);
+    sh.getRange(1, 1, 1, FACT_HEADERS.length).setValues([FACT_HEADERS]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+    sh.setColumnWidth(1, 70);
+    sh.setColumnWidth(2, 620);
+    sh.setColumnWidth(3, 320);
+    sh.setColumnWidth(4, 80);
+    sh.setColumnWidth(5, 120);
+    seedFacts_(sh);
+    log_('Факт дня', 'создан лист «' + SHEETS.facts + '», фактов: ' + FACTS_SEED.length);
+    return sh;
+  } catch (e) {
+    // Параллельный запрос мог создать лист первым — берём уже готовый
+    sh = ss.getSheetByName(SHEETS.facts);
+    if (sh) return sh;
+    throw e;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Записывает 40 стартовых фактов и ставит галочки-чекбоксы в колонке «активен». */
+function seedFacts_(sh) {
+  const rows = FACTS_SEED.map(function (f, i) {
+    return [
+      text_('f' + String(i + 1).padStart(3, '0'), 20),
+      text_(f.text, FACT_MAX_TEXT),
+      text_(f.source, 300),
+      true,
+      '',
+    ];
+  });
+  sh.getRange(2, 1, rows.length, FACT_HEADERS.length).setValues(rows);
+  sh.getRange(2, 4, rows.length, 1)
+    .setDataValidation(SpreadsheetApp.newDataValidation().requireCheckbox().build());
+  sh.getRange(2, 5, rows.length, 1).setNumberFormat('@'); // дата_показа — текст ISO
+}
+
+/** Детерминированный выбор по номеру дня: сортировка по id, затем по модулю. */
+function pickFactForDay_(facts, day) {
+  if (!facts || !facts.length) return null;
+  const sorted = facts.slice().sort(function (a, b) {
+    return a.id.localeCompare(b.id, 'en', { numeric: true });
+  });
+  return sorted[Math.abs(day) % sorted.length];
+}
+
+/** Факт дня: { id, text, source } или null. */
+function factOfDay_(ss) {
+  const sh = ensureFactsSheet_(ss);
+  if (!sh) return null;
+  const h = factsHeader_(sh);
+  if (h.id < 0 || h.text < 0 || h.active < 0) return null;
+
+  const facts = rows_(ss, SHEETS.facts)
+    .filter(function (r) {
+      return str_(r[h.id]) && str_(r[h.text]) && factActive_(r[h.active]);
+    })
+    .map(function (r) {
+      return {
+        id: str_(r[h.id]),
+        text: str_(r[h.text]),
+        source: h.source >= 0 ? str_(r[h.source]) : '',
+      };
+    });
+
+  if (!facts.length) return null;
+
+  const now = new Date();
+  const day = Math.floor((now.getTime() + FACT_TZ_OFFSET_MS) / FACT_DAY_MS);
+  const fact = pickFactForDay_(facts, day);
+  if (fact) markFactShown_(sh, h, fact.id, now);
+  return fact;
+}
+
+/** Пишет дату показа (UTC+3) в строку факта, но не чаще одного раза в день. */
+function markFactShown_(sh, h, id, now) {
+  if (h.shown < 0) return;
+  const last = sh.getLastRow();
+  if (last < 2) return;
+
+  const ids = sh.getRange(2, h.id + 1, last - 1, 1).getValues();
+  let row = -1;
+  for (let i = 0; i < ids.length; i++) {
+    if (str_(ids[i][0]) === id) { row = i + 2; break; }
+  }
+  if (row < 0) return;
+
+  const cell = sh.getRange(row, h.shown + 1);
+  const today = Utilities.formatDate(now, 'Europe/Moscow', 'yyyy-MM-dd');
+  const cur = cell.getValue();
+  const curText = cur instanceof Date
+    ? Utilities.formatDate(cur, 'Europe/Moscow', 'yyyy-MM-dd')
+    : str_(cur).slice(0, 10);
+  if (curText === today) return;
+  cell.setValue(today);
 }
 
 /**
@@ -809,7 +1068,7 @@ function setup() {
   // Листы дуэли и рейтинга создаются сами при первой дуэли (ensureDuelSheets_),
   // «Сроки хранения» — при первом чтении справочника (ensureShelfLifeSheet_).
   const auto = ['refs', 'questions', 'disputes', 'duels', 'ratings', 'quizTries',
-    'characters', 'itemCatalog', 'inventory', 'shelfLife'];
+    'characters', 'itemCatalog', 'inventory', 'shelfLife', 'facts'];
   const missing = Object.keys(SHEETS).filter(k => auto.indexOf(k) === -1)
     .map(k => SHEETS[k]).filter(n => !ss.getSheetByName(n));
   if (missing.length) throw new Error('В таблице нет листов: ' + missing.join(', '));

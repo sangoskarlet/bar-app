@@ -408,8 +408,10 @@ function readU32(bytes, off) {
 }
 
 /** Запасной путь: дописать pHYs в готовый canvas-PNG (перед первым IDAT). */
-function insertPngDpi(bytes) {
-  if (!bytes || bytes.length < 33 || bytes[0] !== PNG_SIGNATURE[0] || bytes[1] !== PNG_SIGNATURE[1]) return bytes;
+function insertPngDpi(input) {
+  // canvasBytes отдаёт ArrayBuffer, а разбирать чанки удобнее по байтам.
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  if (bytes.length < 33 || bytes[0] !== PNG_SIGNATURE[0] || bytes[1] !== PNG_SIGNATURE[1]) return bytes;
   let off = 8;
   let insertAt = -1;
   while (off + 12 <= bytes.length) {

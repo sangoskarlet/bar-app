@@ -231,25 +231,42 @@ function inventoryItems_(ss) {
  * =====================================================================
  *
  *  Лист «Сроки хранения» (создаётся автоматически при первом чтении config):
- *    заготовка | срок_часов | примечание | активен
+ *    заготовка | короткое_имя | срок_часов | примечание | активен
  *
- *  «заготовка» — ровно то название, которое попадает на этикетку
- *  (для акта это название результата, например «Имбирная заготовка»).
+ *  «заготовка» — название результата акта (по нему ищем строку).
+ *  «короткое_имя» — что печатать на этикетке вместо полного названия;
+ *  пусто — печатаем полное. Это решение владельца, а не обрезка в приложении:
+ *  «Кордиал Лимонграсс–Бузина–Лаванда» на 30 мм целиком не читается.
  *  Срок — в часах, можно дробный (0,5 = 30 минут).
  *  «активен» — галочка; снятая галочка убирает строку из config, но не удаляет.
  *
  *  Первое заполнение — из названий результатов актов переработки и ТТК
  *  со сроком 24 часа и пометкой «значение по умолчанию, проверьте»:
- *  цифры должны быть настоящими, их знает только владелец.
+ *  цифры должны быть настоящими, их знает только владелец. Короткие имена
+ *  не выдумываем — колонка остаётся пустой, её заполняет владелец.
  * ===================================================================== */
 
 const SHELF_LIFE_DEFAULT_HOURS = 24;
 const SHELF_LIFE_NOTE = 'значение по умолчанию, проверьте';
-const SHELF_LIFE_HEADERS = ['заготовка', 'срок_часов', 'примечание', 'активен'];
+const SHELF_LIFE_HEADERS = ['заготовка', 'короткое_имя', 'срок_часов', 'примечание', 'активен'];
+
+/** Колонки ищутся по названиям в шапке — порядок не ломается при правках владельца. */
+function shelfLifeHeader_(sh) {
+  const width = Math.max(sh.getLastColumn(), SHELF_LIFE_HEADERS.length);
+  const head = sh.getRange(1, 1, 1, width).getValues()[0].map(str_);
+  return {
+    name: head.indexOf(SHELF_LIFE_HEADERS[0]),
+    short: head.indexOf(SHELF_LIFE_HEADERS[1]),
+    hours: head.indexOf(SHELF_LIFE_HEADERS[2]),
+    note: head.indexOf(SHELF_LIFE_HEADERS[3]),
+    active: head.indexOf(SHELF_LIFE_HEADERS[4]),
+  };
+}
 
 /**
- * Лист «Сроки хранения»: находит или создаёт, пишет шапку и первое заполнение.
- * Повторный запуск ничего не дублирует: строки пишутся только в пустой лист.
+ * Лист «Сроки хранения»: находит или создаёт, приводит шапку к текущему
+ * формату (5 колонок), пишет первое заполнение.
+ * Повторный запуск ничего не дублирует и не переставляет данные.
  */
 function ensureShelfLifeSheet_(ss) {
   let sh = ss.getSheetByName(SHEETS.shelfLife);
@@ -263,14 +280,29 @@ function ensureShelfLifeSheet_(ss) {
     if (!sh) throw new Error('Не удалось создать лист «' + SHEETS.shelfLife + '»');
     log_('Сроки хранения', 'создан лист «' + SHEETS.shelfLife + '»');
   }
-  if (!str_(sh.getRange(1, 1).getValue())) {
+
+  let h = shelfLifeHeader_(sh);
+  if (h.name === -1 || h.hours === -1) {
+    // Пустой лист или шапки нет — пишем шапку целиком
     sh.getRange(1, 1, 1, SHELF_LIFE_HEADERS.length).setValues([SHELF_LIFE_HEADERS]).setFontWeight('bold');
     sh.setFrozenRows(1);
     sh.setColumnWidth(1, 300);
-    sh.setColumnWidth(3, 300);
+    sh.setColumnWidth(2, 220);
+    sh.setColumnWidth(4, 300);
+    h = shelfLifeHeader_(sh);
+  } else if (h.short === -1) {
+    // Старый формат (4 колонки, без «короткое_имя»): вставляем колонку B,
+    // чтобы остальные данные не поехали. Проверяем по шапке, поэтому
+    // повторный запуск колонку не добавит.
+    sh.insertColumnBefore(2);
+    sh.getRange(1, 2).setValue(SHELF_LIFE_HEADERS[1]).setFontWeight('bold');
+    sh.setColumnWidth(2, 220);
+    log_('Сроки хранения', 'добавлена колонка «короткое_имя»');
+    h = shelfLifeHeader_(sh);
   }
+
   if (sh.getLastRow() < 2) seedShelfLife_(ss, sh);
-  return sh;
+  return h;
 }
 
 /** Первое заполнение справочника: результаты актов + названия из ТТК, все по 24 ч. */
@@ -290,7 +322,9 @@ function seedShelfLife_(ss, sh) {
   if (!names.length) return 0;
 
   const values = names.map(function (n) {
-    return [text_(n, 200), SHELF_LIFE_DEFAULT_HOURS, SHELF_LIFE_NOTE, true];
+    // короткое_имя пустое: на этикетке печатается полное название,
+    // пока владелец не напишет своё
+    return [text_(n, 200), '', SHELF_LIFE_DEFAULT_HOURS, SHELF_LIFE_NOTE, true];
   });
   sh.getRange(2, 1, values.length, SHELF_LIFE_HEADERS.length).setValues(values);
   log_('Сроки хранения', 'заполнено строк: ' + values.length + ' (по ' + SHELF_LIFE_DEFAULT_HOURS + ' ч)');
@@ -303,15 +337,16 @@ function seedShelfLife_(ss, sh) {
  * приложение тогда подставляет 24 и честно пишет об этом на экране.
  */
 function shelfLife_(ss) {
-  const sh = ensureShelfLifeSheet_(ss);
+  const h = ensureShelfLifeSheet_(ss);
   return rows_(ss, SHEETS.shelfLife)
-    .filter(function (r) { return str_(r[0]) && r[3] !== false; })
+    .filter(function (r) { return str_(r[h.name]) && r[h.active] !== false; })
     .map(function (r) {
-      const hours = num_(r[1]);
+      const hours = num_(r[h.hours]);
       return {
-        name: str_(r[0]),
+        name: str_(r[h.name]),
+        short: h.short >= 0 ? str_(r[h.short]) : '',
         hours: hours > 0 ? hours : SHELF_LIFE_DEFAULT_HOURS,
-        note: str_(r[2]),
+        note: h.note >= 0 ? str_(r[h.note]) : '',
       };
     });
 }

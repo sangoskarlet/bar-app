@@ -445,15 +445,18 @@ function createLabelBox(opts = {}) {
     const hours = parseQty(hoursInput.value);
     const hoursOk = hours > 0;
     const hit = shelfLifeFor(name);
-    info = buildLabel({ name, madeAt: state.madeAt, hours: hoursOk ? hours : LABEL_DEFAULT_HOURS });
+    // Короткое имя из справочника: владелец сам решает, что печатать
+    const printName = (hit && hit.short) ? hit.short.trim() : name;
+    info = buildLabel({ name: printName, madeAt: state.madeAt, hours: hoursOk ? hours : LABEL_DEFAULT_HOURS });
     preview.src = labelDataUrl(info.canvas);
     const parts = [];
     if (!name) parts.push('Название не заполнено — картинка не напечатается');
     if (!hoursOk) parts.push('Срок хранения: впишите число часов');
-    else if (hit && hit.hours === hours) parts.push(`Срок ${fmtNum(hours)} ч — из справочника «Сроки хранения»`);
-    else if (hit) parts.push(`Срок ${fmtNum(hours)} ч (в справочнике ${fmtNum(hit.hours)} ч) — поправлено вручную`);
-    else parts.push(`Срок ${fmtNum(hours)} ч: позиции нет в справочнике «Сроки хранения», проверьте`);
-    if (info.truncated) parts.push('название не помещается целиком — сократите его');
+    else if (hit && hit.hours === hours) parts.push(`Срок ${fmtNum(hours)} ч (справочник)`);
+    else if (hit) parts.push(`Срок ${fmtNum(hours)} ч (правили вручную; в справочнике ${fmtNum(hit.hours)} ч)`);
+    else parts.push(`Срок ${fmtNum(hours)} ч (по умолчанию) — позиции нет в справочнике`);
+    if (printName && printName !== name) parts.push(`на этикетке: «${printName}»`);
+    if (info.truncated) parts.push('название не помещается целиком — сократите его или заполните «короткое_имя»');
     note.textContent = parts.join(' · ');
     note.classList.toggle('bad', !name || !hoursOk || info.truncated);
     return info;

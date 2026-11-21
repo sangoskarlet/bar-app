@@ -32,12 +32,21 @@ export const LABEL = {
 /** Шрифт: системный sans-serif, кириллица есть в любом из стека. */
 const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
 
-const TITLE_ONE_LINE_SIZES = [40, 36, 32, 28];   // одна строка названия
-const TITLE_TWO_LINE_SIZES = [30, 28, 26, 24, 22]; // две строки названия
+// Кегли названия по числу строк: одна строка (40→28), две (30→22),
+// три (24→22). Три строки влезают только мелким кеглем — зато длинное
+// название печатается целиком, а не обрывком с «…».
+const TITLE_PLANS = [
+  { lines: 1, sizes: [40, 36, 32, 28] },
+  { lines: 2, sizes: [30, 28, 26, 24, 22] },
+  { lines: 3, sizes: [24, 22] },
+];
 const TITLE_MIN = 22;      // ниже — уже не читается на термо (≈2,75 мм)
+// Даты: 24→18. Если название занимает три строки, даты уходят на 18 —
+// это единственный кегль, при котором всё влезает в 128 точек безопасной зоны.
 const DATE_SIZES = [24, 22, 20, 18];
+const DATE_THREE_LINE = 18;
 const DATE_MIN = 18;
-const GAP = 6;             // зазор между названием и датами, точек
+const GAP = 8;             // зазор между названием и датами, точек
 
 const titleFont = size => `800 ${size}px ${FONT}`;
 const dateFont = size => `600 ${size}px ${FONT}`; // 600, а не 700: «годен до 22.11 17:45» влезает в 208 точек кеглем 22
@@ -57,60 +66,129 @@ function ellipsize(ctx, text, maxWidth) {
 }
 
 /**
- * Две строки названия: перенос по словам, самое «ровное» место.
- * Одно сверхдлинное слово (> 13 символов) режем по символам с дефисом —
- * иначе оно не влезет ни при каком кегле.
+ * Разбивка названия на куски, между которыми можно переносить строку:
+ * слова и, внутри слова, части после дефиса/тире. «Лимонграсс–Бузина–Лаванда»
+ * рвётся по тире — так длинное двойное название влезает без обрезки.
  */
-function bestTwoLines(ctx, text, size) {
-  ctx.font = titleFont(size);
-  const words = text.trim().split(/\s+/).filter(Boolean);
-  if (words.length < 2) {
-    const w = words[0] || '';
-    if (w.length > 13) {
-      const cut = Math.ceil(w.length / 2);
-      return [w.slice(0, cut) + '-', w.slice(cut)];
+function titleTokens(text) {
+  const tokens = [];
+  text.trim().split(/\s+/).filter(Boolean).forEach((word, wi) => {
+    const parts = word.split(/(?<=[-–—])/).filter(Boolean);
+    parts.forEach((part, pi) => tokens.push({ text: part, space: wi > 0 && pi === 0 }));
+  });
+  return tokens;
+}
+
+function joinTokens(tokens) {
+  return tokens.map((t, i) => (t.space && i > 0 ? ' ' : '') + t.text).join('');
+}
+
+/** Куски, которые сами шире строки, режем по символам с дефисом. */
+function splitLongTokens(ctx, tokens, maxWidth) {
+  const out = [];
+  tokens.forEach(t => {
+    if (ctx.measureText(t.text).width <= maxWidth) { out.push(t); return; }
+    let rest = t.text;
+    let first = true;
+    while (rest.length > 1) {
+      let cut = rest.length;
+      for (let i = rest.length; i > 0; i--) {
+        if (ctx.measureText(rest.slice(0, i) + '-').width <= maxWidth) { cut = i; break; }
+        cut = 1;
+      }
+      out.push({ text: rest.slice(0, cut) + '-', space: first ? t.space : false });
+      rest = rest.slice(cut);
+      first = false;
     }
-    return [w, ''];
-  }
-  let best = null;
-  for (let i = 1; i < words.length; i++) {
-    const a = words.slice(0, i).join(' ');
-    const b = words.slice(i).join(' ');
-    const m = Math.max(ctx.measureText(a).width, ctx.measureText(b).width);
-    if (!best || m < best.m) best = { lines: [a, b], m };
-  }
-  return best.lines;
+    if (rest) out.push({ text: rest, space: false });
+  });
+  return out;
 }
 
 /**
- * Подбор кегля названия: сначала пробуем одну строку (40→28), потом две
- * (30→22). Шрифт уменьшаем до минимального читаемого и только потом
- * обрезаем — «обрывок» названия на этикетке хуже мелкого кегля.
+ * Раскладка названия в n строк: перебираем места переноса и берём
+ * самый «ровный» вариант (минимальная максимальная ширина строки).
+ * allowSplit=false — переносить только по словам и тире; резать слово
+ * по буквам разрешаем лишь когда иначе не влезает совсем.
  */
-function fitTitle(ctx, text, maxWidth, maxHeight) {
-  for (const size of TITLE_ONE_LINE_SIZES) {
-    ctx.font = titleFont(size);
-    if (ctx.measureText(text).width <= maxWidth) {
-      const lineH = Math.round(size * 1.12);
-      if (lineH <= maxHeight) return { lines: [text], size, truncated: false };
+function bestLines(ctx, text, n, size, maxWidth, allowSplit) {
+  ctx.font = titleFont(size);
+  let tokens = titleTokens(text);
+  if (allowSplit) {
+    tokens = splitLongTokens(ctx, tokens, maxWidth);
+  } else if (tokens.some(t => ctx.measureText(t.text).width > maxWidth)) {
+    return null;
+  }
+  if (tokens.length < n) return null;
+  if (n === 1) return [joinTokens(tokens)];
+
+  let best = null;
+  const measure = s => ctx.measureText(s).width;
+  if (n === 2) {
+    for (let i = 1; i < tokens.length; i++) {
+      const a = joinTokens(tokens.slice(0, i));
+      const b = joinTokens(tokens.slice(i));
+      const w = Math.max(measure(a), measure(b));
+      if (!best || w < best.w) best = { lines: [a, b], w };
+    }
+  } else {
+    for (let i = 1; i < tokens.length - 1; i++) {
+      for (let j = i + 1; j < tokens.length; j++) {
+        const a = joinTokens(tokens.slice(0, i));
+        const b = joinTokens(tokens.slice(i, j));
+        const c = joinTokens(tokens.slice(j));
+        const w = Math.max(measure(a), measure(b), measure(c));
+        if (!best || w < best.w) best = { lines: [a, b, c], w };
+      }
     }
   }
-  for (const size of TITLE_TWO_LINE_SIZES) {
-    const lines = bestTwoLines(ctx, text, size);
-    ctx.font = titleFont(size);
-    if (!lines[0] || !lines[1]) continue;
-    const ok = ctx.measureText(lines[0]).width <= maxWidth && ctx.measureText(lines[1]).width <= maxWidth;
-    const lineH = Math.round(size * 1.12);
-    if (ok && lineH * 2 <= maxHeight) return { lines, size, truncated: false };
-  }
+  return best ? best.lines : null;
+}
 
-  // Не влезает даже двумя строками по 22: режем вторую строку с «…».
+/**
+ * Подбор раскладки названия и кегля дат.
+ * Порядок: одна строка с обычными датами → две строки → три строки с датами 18.
+ * Слово по буквам не рвём, пока есть хоть один кегль и раскладка, где оно
+ * остаётся целым: сначала перебираем все варианты без разрыва слов, и только
+ * если совсем не влезает — разрешаем резать слово.
+ * Обрезка с «…» — последнее средство, когда не влезают и три строки по 22.
+ */
+function layoutTitle(ctx, text, maxWidth, dateSizeMax) {
+  const attempt = (allowSplit) => {
+    for (const plan of TITLE_PLANS) {
+      const dateSizes = plan.lines === 3
+        ? [Math.min(dateSizeMax, DATE_THREE_LINE)]
+        : [dateSizeMax];
+      for (const dateSize of dateSizes) {
+        const availH = (LABEL.height - LABEL.safe * 2) - 2 * Math.round(dateSize * 1.2) - GAP;
+        for (const size of plan.sizes) {
+          const lines = bestLines(ctx, text, plan.lines, size, maxWidth, allowSplit);
+          if (!lines) continue;
+          const lineH = Math.round(size * 1.12);
+          ctx.font = titleFont(size);
+          const fits = lines.every(l => ctx.measureText(l).width <= maxWidth);
+          if (fits && lineH * lines.length <= availH) {
+            return { lines, size, dateSize, truncated: false };
+          }
+        }
+      }
+    }
+    return null;
+  };
+
+  const whole = attempt(false);
+  if (whole) return whole;
+  const split = attempt(true);
+  if (split) return split;
+
+  // Не влезает и в три строки по 22: режем строки с «…» (с конца).
+  const dateSize = Math.min(dateSizeMax, DATE_THREE_LINE);
   ctx.font = titleFont(TITLE_MIN);
-  let lines = bestTwoLines(ctx, text, TITLE_MIN);
-  if (!lines[1]) lines = [ellipsize(ctx, lines[0] || text, maxWidth), ''];
-  else lines[1] = ellipsize(ctx, lines[1], maxWidth);
-  if (ctx.measureText(lines[0]).width > maxWidth) lines[0] = ellipsize(ctx, lines[0], maxWidth);
-  return { lines, size: TITLE_MIN, truncated: true };
+  let lines = bestLines(ctx, text, 3, TITLE_MIN, maxWidth, true) || [ellipsize(ctx, text, maxWidth), '', ''];
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (ctx.measureText(lines[i]).width > maxWidth) lines[i] = ellipsize(ctx, lines[i], maxWidth);
+  }
+  return { lines: lines.filter(Boolean), size: TITLE_MIN, dateSize, truncated: true };
 }
 
 /** Подбор кегля дат: обе строки должны влезть при одном размере. */
@@ -156,7 +234,6 @@ export function buildLabel(opts = {}) {
 
   const { width: W, height: H, safe } = LABEL;
   const maxW = W - safe * 2;        // 208 точек
-  const maxH = H - safe * 2;        // 128 точек
 
   const canvas = document.createElement('canvas');
   canvas.width = W;
@@ -176,19 +253,27 @@ export function buildLabel(opts = {}) {
     'изг. ' + formatLabelDate(madeAt),
     'годен до ' + formatLabelDate(until),
   ];
-  const dateSize = fitDates(ctx, dateLines, maxW);
+  const dateSizeMax = fitDates(ctx, dateLines, maxW);
+  const titleText = name || '— без названия —';
+
+  // Название: до трёх строк; если три — даты мельче (18), чтобы всё влезло
+  const title = layoutTitle(ctx, titleText, maxW, dateSizeMax);
+  const dateSize = title.dateSize;
   const dateLineH = Math.round(dateSize * 1.2);
   const datesH = dateLineH * dateLines.length;
 
-  // Название — сверху, над датами
-  const titleMaxH = maxH - datesH - GAP;
-  const titleText = name || '— без названия —';
-  const title = fitTitle(ctx, titleText, maxW, Math.max(titleMaxH, TITLE_MIN));
+  // Одна сетка: даты всегда заканчиваются у нижней границы безопасной зоны,
+  // между названием и датами — один и тот же зазор GAP. Остаток высоты
+  // (у коротких названий) делится пополам: немного отступа сверху,
+  // остальное — в зазор, иначе посреди этикетки получается дырка.
+  const datesTop = H - safe - datesH;
+  const titleH = title.lines.length * Math.round(title.size * 1.12);
+  const availH = datesTop - GAP - safe;
+  const titleTop = safe + Math.max(0, Math.round((availH - titleH) / 2));
 
-  // Рисуем название сверху безопасной зоны
   ctx.font = titleFont(title.size);
   const titleLineH = Math.round(title.size * 1.12);
-  let y = safe;
+  let y = titleTop;
   title.lines.forEach(line => {
     if (line) ctx.fillText(line, safe, y);
     y += titleLineH;
@@ -196,7 +281,7 @@ export function buildLabel(opts = {}) {
 
   // Даты — по нижней границе безопасной зоны
   ctx.font = dateFont(dateSize);
-  let dy = H - safe - datesH;
+  let dy = datesTop;
   dateLines.forEach(line => {
     ctx.fillText(line, safe, dy);
     dy += dateLineH;

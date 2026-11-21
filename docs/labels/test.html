@@ -130,56 +130,60 @@
 
 <main class="wrap">
   <section class="card intro">
-    <p><b>Главный путь — «Поделиться».</b> В системном меню телефона выберите <b>Label Expert</b> → Image Print. Если Label Expert в меню нет — сохраните картинку в «Фото»/«Галерею» и откройте её в приложении <b>из альбома</b>. Браузерное «Сохранить PNG» кладёт файл в «Загрузки», куда выбор «из альбома» часто не заглядывает; а без метки DPI телефон считает картинку 63 × 42 мм вместо 30 × 20. Ниже — три варианта файла и оба пути.</p>
+    <p><b>Android:</b> главный путь — <b>«Поделиться» → Label Expert</b> (проверено). <b>iPhone:</b> Label Expert из «Поделиться» открывается пустым, поэтому путь один — <b>«Сохранить в Фото» → «Сохранить изображение»</b>, затем Label Expert → Image Print → <b>из альбома</b>. Браузерное «Сохранить PNG» кладёт файл в «Загрузки», куда выбор «из альбома» часто не заглядывает; а без метки DPI телефон считает картинку 63 × 42 мм вместо 30 × 20. Ниже — три варианта файла и оба пути.</p>
+    <div class="warnbox" style="margin-top:12px">
+      <b>Полевой тест 21.11.2026.</b> <b>Android:</b> «Поделиться» → Label Expert → печать — <b>работает</b>. <b>iPhone:</b> Label Expert из «Поделиться» открывается, но остаётся на главном экране — картинка не подхватывается. Это не файл (Android его печатает), а отсутствие рабочего приёма изображения из меню на iOS. На iPhone путь один: <b>«Сохранить в Фото» → «Сохранить изображение» → Label Expert → Image Print → из альбома</b>.
+    </div>
     <div class="statusline" id="caps" aria-live="polite"></div>
   </section>
 
   <div id="variants"></div>
 
   <section class="card">
-    <h2>Label Expert в меню «Поделиться» — есть или нет?</h2>
-    <p>Наш «Поделиться» — это системное меню телефона, а не наше окно. Что в нём будет, зависит от самого Label Expert: на iOS это Share Extension, на Android — обработчик «Поделиться» (ACTION_SEND). В инструкции вендора описан импорт из альбома и «Choose File», а не расширение «Поделиться», поэтому наличие Label Expert в меню надо проверить один раз на конкретном телефоне.</p>
+    <h2>Label Expert в «Поделиться»: Android — да, iPhone — пустой</h2>
+    <p>Наш «Поделиться» — это системное меню телефона. На <b>Android</b> Label Expert зарегистрирован как получатель картинки и принимает наш PNG — полевой тест это подтвердил. На <b>iPhone</b> пункт Label Expert в меню тоже есть, приложение открывается, но остаётся на главном экране: рабочего приёма изображения из «Поделиться» у него нет (или расширение не принимает payload). Это не лечится нашим кодом — поэтому на iPhone мы не ведём через «Поделиться», а сохраняем в «Фото» и импортируем из альбома.</p>
     <div class="steps">
       <div class="phone">
-        <h3>Проверка на iPhone</h3>
+        <h3>iPhone: что делать</h3>
         <ol class="step">
-          <li>Откройте «Фото», выберите любую картинку → <b>«Поделиться»</b>.</li>
-          <li>Пролистайте ряд приложений и «Ещё». Если <b>Label Expert</b> есть — наша кнопка «Поделиться» тоже покажет его (возможно, после «Ещё»).</li>
-          <li>Если нет — в нашем меню выберите <b>«Сохранить изображение»</b>, затем Label Expert → Image Print → из альбома.</li>
+          <li>Не выбирайте Label Expert в «Поделиться» — он откроется пустым.</li>
+          <li>В меню выберите <b>«Сохранить изображение»</b> — картинка уйдёт в «Фото».</li>
+          <li>Откройте Label Expert → <b>Image Print</b> → <b>«Из альбома»</b>.</li>
         </ol>
       </div>
       <div class="phone">
-        <h3>Проверка на Android</h3>
+        <h3>Android: что делать</h3>
         <ol class="step">
-          <li>Откройте «Галерею» или Google Фото, выберите картинку → <b>«Поделиться»</b>.</li>
-          <li>Если <b>Label Expert</b> есть в списке — он появится и у нас. Если нет — сохраните через Google Фото/Галерею и откройте Label Expert → Image Print → из галереи.</li>
-          <li>Иногда Label Expert появляется не в «Поделиться», а в <b>«Открыть с помощью»</b> при открытии файла из «Загрузок» — это другой механизм, но тоже рабочий.</li>
+          <li>В меню «Поделиться» выберите <b>Label Expert</b> — это рабочий путь.</li>
+          <li>Дальше <b>Image Print</b> → выбрать картинку.</li>
+          <li>Если Label Expert в меню нет — «Сохранить PNG» → Label Expert → Image Print → из файлов/альбома.</li>
         </ol>
       </div>
     </div>
-    <p class="small muted">Мы не можем гарантировать пункт Label Expert в меню: это решает само приложение и версия ОС. Поэтому основной шаг в инструкции — «Поделиться», а запасной — «Сохранить изображение» → из альбома.</p>
+    <p class="small muted">Проверить наличие пункта можно так: «Фото»/«Галерея» → любая картинка → «Поделиться» → пролистать приложения и «Ещё». Но на iPhone наличие пункта не значит, что картинка дойдёт — полевой тест показал пустой экран.</p>
   </section>
 
   <section class="card">
     <h2>Как открыть файл в Label Expert / AiYin</h2>
-    <p class="small muted">Инструкция одинаковая для PNG и JPG; различается только способ сохранить картинку на телефон. Скриншотов чужого приложения у нас нет — только шаги.</p>
+    <p class="small muted">Сценарии разные. Скриншотов чужого приложения у нас нет — только шаги.</p>
     <div class="steps">
       <div class="phone">
         <h3>iPhone <span class="os">iOS</span></h3>
         <ol class="step">
-          <li>Нажмите <b>«Поделиться»</b> у варианта «PNG с DPI».</li>
-          <li>Если в меню есть <b>Label Expert</b> — выберите его и переходите к шагу 4. Если нет — выберите <b>«Сохранить изображение»</b> (уйдёт в «Фото»). Если есть только «Сохранить в Файлы» — файл будет в «Файлы» → «Загрузки», его надо будет открыть через Import.</li>
+          <li>У варианта «PNG с DPI» нажмите <b>«Сохранить в Фото»</b>.</li>
+          <li>В меню выберите <b>«Сохранить изображение»</b> (не Label Expert — он откроется пустым). Если пункта нет, выберите «Сохранить в Файлы» и потом Import.</li>
           <li>Откройте <b>Label Expert</b> → <b>Image Print</b> → <b>«Из альбома»</b> (или Import / «Из файлов» → «Загрузки»).</li>
           <li>Размер этикетки — <b>30 × 20 мм</b>. Эффект — <b>Original</b>. <b>Smart crop — выключить.</b> Масштаб 1:1, без «fit».</li>
           <li>Нажмите <b>Печать</b> и выберите принтер B21 (Bluetooth должен быть сопряжён внутри приложения).</li>
         </ol>
+        <p class="small muted" style="margin-top:10px">Если всё же выбрали Label Expert в «Поделиться» и увидели главный экран без картинки — так и должно быть. Вернитесь в «Фото» и импортируйте из альбома.</p>
       </div>
       <div class="phone">
         <h3>Android <span class="os">Android</span></h3>
         <ol class="step">
-          <li>Нажмите <b>«Поделиться»</b> у варианта «PNG с DPI».</li>
-          <li>Если в меню есть <b>Label Expert</b> — выберите его и переходите к шагу 4. Если нет — выберите <b>Google Фото</b> или <b>Галерею</b> → <b>«Сохранить»</b>. Либо нажмите <b>«Сохранить PNG»</b>, файл будет в <b>«Загрузки»</b>.</li>
-          <li>Откройте <b>Label Expert</b> → <b>Image Print</b> → выбрать картинку <b>из галереи</b> (или из «Файлов» → «Загрузки»).</li>
+          <li>У варианта «PNG с DPI» нажмите <b>«Поделиться»</b>.</li>
+          <li>Выберите <b>Label Expert</b> — этот путь проверен владельцем и работает. Если пункта нет — <b>«Сохранить PNG»</b>, затем Label Expert → Image Print → из файлов/альбома.</li>
+          <li>В Label Expert выберите <b>Image Print</b> → картинку <b>из галереи</b> (или из «Файлов» → «Загрузки»).</li>
           <li>Размер этикетки — <b>30 × 20 мм</b>. Эффект — <b>Original</b>. <b>Smart crop — выключить.</b></li>
           <li>Нажмите <b>Печать</b> и выберите принтер B21.</li>
         </ol>
@@ -190,7 +194,7 @@
   <section class="card">
     <h2>Если приложение всё равно не видит файл</h2>
     <ul class="checklist">
-      <li><b>Картинка должна быть в «Фото» / «Галерее»</b>, а не только в «Загрузках»: выбор «из альбома» папку загрузок не показывает. Сохраняйте через «Поделиться» → «Сохранить изображение» (iPhone) или Google Фото/Галерея (Android); «Сохранить PNG» — запасной путь.</li>
+      <li><b>Картинка должна быть в «Фото» / «Галерее»</b>, а не только в «Загрузках»: выбор «из альбома» папку загрузок не показывает. iPhone — «Сохранить в Фото» → «Сохранить изображение»; Android — «Поделиться» → Label Expert или «Сохранить PNG».</li>
       <li><b>В приложении выбран раздел «Image Print» / «Add Image»</b>, а не «Text» или «PDF». Картинку ищут именно там.</li>
       <li><b>Размер этикетки — 30 × 20 мм</b> (если в списке нет, задайте вручную: ширина 30, высота 20).</li>
       <li><b>Эффект — Original</b>, не Dither и не Black white: картинка уже чёрно-белая. <b>Smart crop выключен</b>, масштаб 1:1.</li>
@@ -199,7 +203,7 @@
       <li><b>Принтер сопряжён внутри Label Expert</b> (раздел принтера), а не только в настройках Bluetooth телефона. Именно поэтому «на ноутбуке Bluetooth есть, а приложение не видит».</li>
     </ul>
     <div class="warnbox" style="margin-top:14px">
-      <b>Почему системное окно печати не видит B21.</b> iOS печатает через AirPrint, Android — через Mopria/IPP: в списке только сетевые принтеры, а «Сохранить в PDF» — это не печать на B21. Наш принтер — Bluetooth LE с протоколом производителя, его видит только Label Expert, когда вы подключаете его внутри приложения. Поэтому в приложении бара «Печать» убрана в <b>«Ещё» → «PDF (30 × 20 мм)»</b> (офисный принтер/PDF), а главный путь — <b>«Поделиться» → Label Expert</b>.
+      <b>Почему системное окно печати не видит B21.</b> iOS печатает через AirPrint, Android — через Mopria/IPP: в списке только сетевые принтеры, а «Сохранить в PDF» — это не печать на B21. Наш принтер — Bluetooth LE с протоколом производителя, его видит только Label Expert, когда вы подключаете его внутри приложения. Поэтому в приложении бара «Печать» убрана в <b>«Ещё» → «PDF (30 × 20 мм)»</b> (офисный принтер/PDF). Путь к B21: <b>Android — «Поделиться» → Label Expert</b>; <b>iPhone — «Сохранить в Фото» → Label Expert → Image Print из альбома</b>.
     </div>
   </section>
 
@@ -350,6 +354,9 @@ const ua = navigator.userAgent || '';
 const iOS = /iPhone|iPod/i.test(ua) || (/Macintosh/i.test(ua) && (navigator.maxTouchPoints || 0) > 1);
 const android = /Android/i.test(ua);
 const phone = iOS || android;
+// На iPhone Label Expert из «Поделиться» открывается пустым — кнопка ведёт
+// к «Сохранить изображение»; на Android/десктопе — честное «Поделиться».
+const shareBtnText = iOS ? 'Сохранить в Фото' : 'Поделиться';
 
 function el(tag, attrs = {}, ...kids) {
   const node = document.createElement(tag);
@@ -384,10 +391,13 @@ function download(blob, name) {
   setTimeout(() => URL.revokeObjectURL(url), 30000);
 }
 
-async function share(blob, name) {
+async function share(blob, name, type) {
   try {
-    const file = new File([blob], name, { type: blob.type });
-    await navigator.share({ files: [file], title: 'Этикетка 30 × 20' });
+    // MIME задаём явно: на iOS потеря типа — частая причина «пустого» приёма.
+    const file = new File([blob], name, { type });
+    const payload = { files: [file] };
+    if (!iOS) payload.title = 'Этикетка 30 × 20';
+    await navigator.share(payload);
   } catch (e) {
     if (e && e.name === 'AbortError') return;
     toast('Не удалось открыть меню «Поделиться»: ' + ((e && e.message) || e), 'bad');
@@ -406,6 +416,13 @@ async function renderVariant(v) {
   const meta = v.kind === 'png' ? pngMeta(bytes) : jpegMeta(bytes);
   const decoded = await decodeCheck(blob);
   const url = URL.createObjectURL(blob);
+  const shareType = v.kind === 'jpeg' ? 'image/jpeg' : 'image/png';
+
+  let shareSupported = false;
+  if (canShareApi) {
+    try { shareSupported = !!navigator.canShare({ files: [new File([blob], v.file, { type: shareType })] }); }
+    catch (e) { shareSupported = false; }
+  }
 
   const metaRows = [];
   const sizeOk = meta.width === 240 && meta.height === 160;
@@ -423,19 +440,13 @@ async function renderVariant(v) {
     metaRows.push(metaRow('Фон', 'белая подложка (прозрачности в JPG нет)', 'ok'));
   }
   metaRows.push(metaRow('Размер файла', fmtBytes(blob.size)));
-  metaRows.push(metaRow('Тип файла', blob.type));
-  metaRows.push(metaRow('Имя файла', v.file));
+  metaRows.push(metaRow('В «Поделиться» уйдёт', v.file + ' · ' + shareType + ' · ' + fmtBytes(blob.size)));
+  metaRows.push(metaRow('canShare(files)', shareSupported ? 'да' : 'нет', shareSupported ? 'ok' : 'bad'));
   metaRows.push(metaRow('Браузер открывает', decoded && !decoded.error ? 'да: ' + decoded.width + ' × ' + decoded.height : 'нет: ' + ((decoded && decoded.error) || 'нет createImageBitmap'), decoded && !decoded.error ? 'ok' : 'bad'));
-
-  let shareSupported = false;
-  if (canShareApi) {
-    try { shareSupported = !!navigator.canShare({ files: [new File([blob], v.file, { type: blob.type })] }); }
-    catch (e) { shareSupported = false; }
-  }
 
   const actions = el('div', { class: 'actions' },
     shareSupported
-      ? el('button', { class: 'primary wide', type: 'button', onclick: () => share(blob, v.file) }, 'Поделиться')
+      ? el('button', { class: 'primary wide', type: 'button', onclick: () => share(blob, v.file, shareType) }, shareBtnText)
       : null,
     el('button', { class: 'secondary wide', type: 'button', onclick: () => download(blob, v.file) }, 'Сохранить ' + (v.kind === 'jpeg' ? 'JPG' : 'PNG')),
     shareSupported ? null : el('p', { class: 'no-share' }, canShareApi ? 'Меню «Поделиться» этот файл не принимает — пользуйтесь «Сохранить».' : 'В этом браузере нет «Поделиться» картинкой. Откройте страницу на телефоне или сохраните файл.'),
@@ -465,6 +476,7 @@ async function boot() {
   caps.append(
     el('span', { class: 'pill ' + (canShareApi ? 'ok' : 'bad') }, 'Web Share с файлами: ' + (canShareFilesProbe ? 'есть' : 'нет')),
     el('span', { class: 'pill' }, phone ? (iOS ? 'телефон: iPhone' : 'телефон: Android') : 'устройство: компьютер'),
+    ...(iOS ? [el('span', { class: 'pill warn' }, 'iPhone: Label Expert из «Поделиться» пустой — сохраняйте в «Фото»')] : []),
     el('span', { class: 'pill warn' }, 'Системная печать B21 не видит — это норма, печатайте через Label Expert'),
   );
 

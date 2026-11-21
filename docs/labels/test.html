@@ -1,0 +1,449 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Проверка картинки этикетки 30 × 20 — ESSE</title>
+<style>
+  :root {
+    color-scheme: light;
+    --ink: #141414;
+    --muted: #6a6a6a;
+    --line: #ded9d0;
+    --bg: #f5f2ec;
+    --card: #ffffff;
+    --ok: #167a3a;
+    --bad: #b3261e;
+    --gold: #b08d3f;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+    -webkit-text-size-adjust: 100%;
+  }
+  .top { background: #111; color: #fff; padding: 18px 16px 20px; }
+  .top .wrap { padding-bottom: 0; }
+  .top h1 { margin: 6px 0 4px; font-size: 23px; line-height: 1.2; letter-spacing: .2px; }
+  .top p { margin: 0; color: #cfc7b8; font-size: 14px; }
+  .top .mark { font-size: 12px; letter-spacing: 2.5px; color: var(--gold); text-transform: uppercase; }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 18px 16px 70px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+    padding: 16px; margin-top: 16px;
+  }
+  h2 { font-size: 19px; margin: 0 0 6px; line-height: 1.25; }
+  h3 { font-size: 16px; margin: 0 0 8px; }
+  p { margin: 0 0 10px; }
+  p:last-child { margin-bottom: 0; }
+  .muted { color: var(--muted); }
+  .small { font-size: 13px; line-height: 1.45; }
+  .intro { margin-top: 0; }
+  .statusline { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .pill {
+    display: inline-block; padding: 4px 10px; border-radius: 999px;
+    background: #efece5; font-size: 13px; border: 1px solid var(--line);
+  }
+  .pill.ok { background: #e7f4eb; border-color: #b9dfc6; color: var(--ok); }
+  .pill.bad { background: #fbe9e7; border-color: #f0c4bf; color: var(--bad); }
+  .pill.warn { background: #fdf5e3; border-color: #ecd9a8; color: #7a5a12; }
+
+  .variant { border-top: 4px solid #111; }
+  .variant-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; margin-bottom: 2px; }
+  .variant-head h2 { margin: 0; }
+  .badge { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; padding: 3px 8px; border-radius: 999px; background: #111; color: #fff; }
+  .badge.old { background: #8a8378; }
+  .badge.alt { background: var(--gold); }
+  .variant .what { font-size: 14px; color: var(--muted); margin: 4px 0 12px; }
+
+  .previews { display: grid; grid-template-columns: 1fr; gap: 14px; align-items: start; }
+  .frame { background: #fff; border: 1px solid var(--line); border-radius: 8px; line-height: 0; overflow: hidden; }
+  .frame img { display: block; image-rendering: pixelated; }
+  .preview-1x { width: 240px; height: 160px; max-width: 100%; }
+  .zoom-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; padding-bottom: 4px; }
+  .zoom-scroll .frame { display: inline-block; }
+  .preview-4x { width: 960px; height: 640px; }
+  .caption { font-size: 12px; color: var(--muted); margin: 4px 0 0; line-height: 1.35; }
+  .preview-col { min-width: 0; }
+
+  .meta { margin: 14px 0 0; display: grid; gap: 4px; }
+  .meta-row { display: grid; grid-template-columns: 132px minmax(0, 1fr); gap: 8px; font-size: 13.5px; line-height: 1.45; }
+  .meta-row dt { color: var(--muted); margin: 0; }
+  .meta-row dd { margin: 0; font-weight: 600; overflow-wrap: anywhere; }
+  .meta-row dd.ok { color: var(--ok); }
+  .meta-row dd.bad { color: var(--bad); }
+
+  .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 14px; }
+  .actions .wide { grid-column: 1 / -1; }
+  @media (max-width: 420px) { .actions { grid-template-columns: 1fr; } .actions .wide { grid-column: auto; } }
+  button {
+    font: inherit; font-weight: 600; min-height: 48px; padding: 10px 14px;
+    border-radius: 10px; border: 1px solid #111; cursor: pointer; touch-action: manipulation;
+  }
+  button.primary { background: #111; color: #fff; }
+  button.secondary { background: #fff; color: #111; }
+  button:active { transform: translateY(1px); }
+  .no-share { grid-column: 1 / -1; font-size: 13px; color: var(--muted); margin: 0; }
+
+  .steps { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 14px; }
+  @media (max-width: 760px) { .steps { grid-template-columns: 1fr; } }
+  .phone { background: #fbf9f5; border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
+  .phone h3 { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .os { font-size: 11px; letter-spacing: 1px; text-transform: uppercase; background: #111; color: #fff; border-radius: 999px; padding: 2px 8px; }
+  ol.step { list-style: none; margin: 0; padding: 0; counter-reset: step; }
+  ol.step li { position: relative; padding: 0 0 12px 38px; counter-increment: step; font-size: 14px; line-height: 1.45; }
+  ol.step li::before {
+    content: counter(step); position: absolute; left: 0; top: -1px;
+    width: 26px; height: 26px; border-radius: 50%; background: #111; color: #fff;
+    font-size: 13px; font-weight: 700; display: flex; align-items: center; justify-content: center;
+  }
+  ol.step li:last-child { padding-bottom: 0; }
+  ol.step b { background: #f1ead8; padding: 0 3px; border-radius: 3px; }
+
+  .checklist { display: grid; gap: 8px; margin: 8px 0 0; padding: 0; list-style: none; }
+  .checklist li { position: relative; padding-left: 26px; font-size: 14px; line-height: 1.45; }
+  .checklist li::before { content: "✓"; position: absolute; left: 2px; top: 0; color: var(--ok); font-weight: 700; }
+  .warnbox { border-left: 3px solid var(--gold); background: #fdf8ec; padding: 10px 12px; border-radius: 0 8px 8px 0; font-size: 14px; }
+  .warnbox.bad { border-color: var(--bad); background: #fdf0ee; }
+  .foot { text-align: center; margin-top: 22px; font-size: 13px; color: var(--muted); }
+  .foot a { color: var(--ink); }
+  .toast {
+    position: fixed; left: 50%; bottom: 24px; transform: translate(-50%, 20px);
+    background: #111; color: #fff; padding: 10px 16px; border-radius: 10px;
+    font-size: 14px; max-width: calc(100% - 32px); opacity: 0; transition: .2s; z-index: 40;
+  }
+  .toast.show { opacity: 1; transform: translate(-50%, 0); }
+  .toast.bad { background: var(--bad); }
+  code { font-size: 13px; background: #f0ece4; padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="wrap">
+    <div class="mark">ESSE · этикетки</div>
+    <h1>Проверка картинки 30 × 20 мм</h1>
+    <p>Файл для Label Expert / AiYin: 240 × 160 точек, 203 dpi, чёрно-белый. Здесь же — инструкция, если приложение «не видит» PNG.</p>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="card intro">
+    <p><b>Почему приложение иногда не видит файл.</b> Браузер на iPhone сохраняет скачанное в <b>«Файлы» → «Загрузки»</b>, а не в «Фото»; на Android — в папку <b>«Загрузки»</b>, куда галерея и выбор картинки часто не заглядывают. Второй риск — сам файл: без метки DPI телефон считает его 72–96 dpi, то есть 63 × 42 мм вместо 30 × 20. Поэтому ниже три варианта одного и того же макета и два способа его отдать.</p>
+    <div class="statusline" id="caps" aria-live="polite"></div>
+  </section>
+
+  <div id="variants"></div>
+
+  <section class="card">
+    <h2>Как открыть файл в Label Expert / AiYin</h2>
+    <p class="small muted">Инструкция одинаковая для PNG и JPG; различается только способ сохранить картинку на телефон. Скриншотов чужого приложения у нас нет — только шаги.</p>
+    <div class="steps">
+      <div class="phone">
+        <h3>iPhone <span class="os">iOS</span></h3>
+        <ol class="step">
+          <li>Нажмите <b>«Сохранить в Фото»</b> у варианта «PNG с DPI». В открывшемся меню выберите <b>«Сохранить изображение»</b>. Если такого пункта нет — <b>«Сохранить в Файлы»</b> (тогда запомните папку, обычно «Загрузки»).</li>
+          <li>Откройте <b>Label Expert</b> (или <b>AiYin</b>).</li>
+          <li>Выберите <b>Image Print</b> → <b>«Из альбома»</b>. Если картинка сохранена в «Файлы» — <b>Import</b> / <b>«Из файлов»</b> → «Загрузки».</li>
+          <li>Размер этикетки — <b>30 × 20 мм</b>. Эффект — <b>Original</b>. <b>Smart crop — выключить.</b> Масштаб 1:1, без «fit».</li>
+          <li>Нажмите <b>Печать</b> и выберите принтер B21 (Bluetooth должен быть сопряжён внутри приложения).</li>
+        </ol>
+      </div>
+      <div class="phone">
+        <h3>Android <span class="os">Android</span></h3>
+        <ol class="step">
+          <li>Нажмите <b>«Сохранить в Галерею»</b> у варианта «PNG с DPI». В меню «Поделиться» выберите <b>Google Фото</b> или <b>Галерею</b> → <b>«Сохранить»</b>. Если пункта нет — нажмите <b>«Скачать PNG»</b>, файл будет в <b>«Загрузки»</b>.</li>
+          <li>Откройте <b>Label Expert</b> (или <b>AiYin</b>).</li>
+          <li>Выберите <b>Image Print</b> → выбрать картинку <b>из галереи</b>. Если сохраняли в «Загрузки» — <b>из «Файлов»</b> → «Загрузки».</li>
+          <li>Размер этикетки — <b>30 × 20 мм</b>. Эффект — <b>Original</b>. <b>Smart crop — выключить.</b></li>
+          <li>Нажмите <b>Печать</b> и выберите принтер B21.</li>
+        </ol>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Если приложение всё равно не видит файл</h2>
+    <ul class="checklist">
+      <li><b>Картинка должна быть в «Фото» / «Галерее»</b>, а не только в «Загрузках»: выбор «из альбома» папку загрузок не показывает. Помогает кнопка «Сохранить в Фото/Галерею», а не «Скачать».</li>
+      <li><b>В приложении выбран раздел «Image Print» / «Add Image»</b>, а не «Text» или «PDF». Картинку ищут именно там.</li>
+      <li><b>Размер этикетки — 30 × 20 мм</b> (если в списке нет, задайте вручную: ширина 30, высота 20).</li>
+      <li><b>Эффект — Original</b>, не Dither и не Black white: картинка уже чёрно-белая. <b>Smart crop выключен</b>, масштаб 1:1.</li>
+      <li><b>Формат.</b> Основной — PNG с DPI (240 × 160, 203 dpi, без альфа-канала). Если приложение принимает только JPG — скачайте JPG: качество 100 %, белый фон, DPI 203.</li>
+      <li><b>Имя файла — латиницей</b>, без пробелов: <code>etiketka-30x20-21.11.png</code>. Приложение не должно спотыкаться об имя.</li>
+      <li><b>Принтер сопряжён внутри Label Expert</b> (раздел принтера), а не только в настройках Bluetooth телефона. Именно поэтому «на ноутбуке Bluetooth есть, а приложение не видит».</li>
+    </ul>
+    <div class="warnbox" style="margin-top:14px">
+      <b>Кнопка «Печать» в приложении бара</b> — это обычный принтер или PDF (страница 30 × 20 мм). Bluetooth-принтер этикеток B21 она не ищет и не обязана: для B21 есть только путь «картинка → Label Expert / AiYin».
+    </div>
+  </section>
+
+  <p class="foot">Файлы собираются прямо в браузере, никуда не отправляются. <a href="../../">← Вернуться в приложение</a></p>
+</main>
+
+<script type="module">
+import { buildLabel, labelPngBlob, labelJpegBlob } from '../../js/label.js';
+
+const SAMPLE = {
+  name: 'Облипиховая заготовка',
+  madeAt: new Date(2026, 10, 21, 17, 45), // 21.11.2026 17:45 — эталон из документации
+  hours: 24,
+};
+
+const info = buildLabel(SAMPLE);
+const canvas = info.canvas;
+
+const u16 = (b, o) => (b[o] << 8) | b[o + 1];
+const u32 = (b, o) => ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
+const typeAt = (b, o) => String.fromCharCode(b[o], b[o + 1], b[o + 2], b[o + 3]);
+
+/** Разбирает PNG: размеры, тип цвета, pHYs. */
+function pngMeta(bytes) {
+  const out = {};
+  let off = 8;
+  while (off + 12 <= bytes.length) {
+    const len = u32(bytes, off);
+    const type = typeAt(bytes, off + 4);
+    if (type === 'IHDR') {
+      out.width = u32(bytes, off + 8);
+      out.height = u32(bytes, off + 12);
+      out.depth = bytes[off + 16];
+      out.colorType = bytes[off + 17];
+    }
+    if (type === 'pHYs') {
+      const ppm = u32(bytes, off + 8);
+      out.ppm = ppm;
+      out.dpi = Math.round(ppm * 0.0254);
+      if (out.width) {
+        out.mmW = out.width / ppm * 1000;
+        out.mmH = out.height / ppm * 1000;
+      }
+    }
+    if (type === 'IDAT') break;
+    off += 12 + len;
+  }
+  return out;
+}
+
+/** Разбирает JPG: размеры из SOF и плотность из JFIF. */
+function jpegMeta(bytes) {
+  const out = {};
+  let off = 2;
+  while (off + 4 < bytes.length) {
+    if (bytes[off] !== 0xFF) { off++; continue; }
+    const marker = bytes[off + 1];
+    off += 2;
+    if (marker === 0xD8 || marker === 0xD9 || (marker >= 0xD0 && marker <= 0xD7)) continue;
+    if (marker === 0xDA) break;
+    const len = u16(bytes, off);
+    if (len < 2) break;
+    const p = off + 2;
+    if (marker === 0xE0 && bytes[p] === 0x4A && bytes[p + 1] === 0x46 && bytes[p + 2] === 0x49 && bytes[p + 3] === 0x46) {
+      const units = bytes[p + 7];
+      const xd = u16(bytes, p + 8);
+      out.dpi = units === 1 ? xd : units === 2 ? Math.round(xd * 2.54) : null;
+    }
+    if (marker >= 0xC0 && marker <= 0xCF && marker !== 0xC4 && marker !== 0xC8 && marker !== 0xCC) {
+      out.height = u16(bytes, p + 1);
+      out.width = u16(bytes, p + 3);
+    }
+    off += len;
+  }
+  return out;
+}
+
+const COLOR_NAMES = { 0: 'полутоновой (grayscale)', 2: 'RGB', 3: 'палитра', 4: 'полутоновой + альфа', 6: 'RGBA (с альфа-каналом)' };
+const fmtBytes = n => n >= 1024 ? (n / 1024).toFixed(1).replace('.', ',') + ' КБ' : n + ' Б';
+
+async function decodeCheck(blob) {
+  if (typeof createImageBitmap !== 'function') return null;
+  try {
+    const bmp = await createImageBitmap(blob);
+    const res = { width: bmp.width, height: bmp.height };
+    if (bmp.close) bmp.close();
+    return res;
+  } catch (e) {
+    return { error: (e && e.message) || 'не открывается' };
+  }
+}
+
+const VARIANTS = [
+  {
+    tag: 'основной', badge: '',
+    title: 'PNG с DPI',
+    file: 'etiketka-30x20-21.11.png',
+    what: 'Этот файл отдаёт приложение бара: 8-битный чёрно-белый PNG без альфа-канала, с меткой 203 dpi — телефон понимает, что это ровно 30 × 20 мм.',
+    make: () => labelPngBlob(canvas),
+    kind: 'png',
+  },
+  {
+    tag: 'старый вариант', badge: 'old',
+    title: 'PNG без DPI',
+    file: 'etiketka-30x20-bez-dpi.png',
+    what: 'Как было раньше: RGBA и без pHYs. Телефон считает такую картинку 72–96 dpi — это 63 × 42 мм вместо 30 × 20, поэтому приложение может «не видеть» файл или масштабировать его.',
+    make: () => new Promise((resolve, reject) => {
+      canvas.toBlob(b => (b ? resolve(b) : reject(new Error('Нет PNG'))), 'image/png');
+    }),
+    kind: 'png',
+  },
+  {
+    tag: 'запасной', badge: 'alt',
+    title: 'JPG',
+    file: 'etiketka-30x20-21.11.jpg',
+    what: 'Если приложение принимает только JPG: качество 100 %, белая подложка (иначе было бы чёрное поле), DPI 203 в заголовке JFIF.',
+    make: () => labelJpegBlob(canvas),
+    kind: 'jpeg',
+  },
+];
+
+const canShareApi = typeof navigator.share === 'function' && typeof navigator.canShare === 'function';
+const canShareFilesProbe = (() => {
+  if (!canShareApi) return false;
+  try {
+    const probe = new File([new Uint8Array([137, 80, 78, 71])], 'probe.png', { type: 'image/png' });
+    return !!navigator.canShare({ files: [probe] });
+  } catch (e) {
+    return false;
+  }
+})();
+const ua = navigator.userAgent || '';
+const iOS = /iPhone|iPod/i.test(ua) || (/Macintosh/i.test(ua) && (navigator.maxTouchPoints || 0) > 1);
+const android = /Android/i.test(ua);
+const phone = iOS || android;
+const shareText = iOS ? 'Сохранить в Фото' : android ? 'Сохранить в Галерею' : 'Поделиться картинкой';
+
+function el(tag, attrs = {}, ...kids) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (v === undefined || v === null || v === false) continue;
+    if (k.startsWith('on')) node.addEventListener(k.slice(2), v);
+    else if (k === 'class') node.className = v;
+    else node.setAttribute(k, v === true ? '' : v);
+  }
+  for (const kid of kids.flat()) {
+    if (kid === null || kid === undefined || kid === false) continue;
+    node.append(kid instanceof Node ? kid : document.createTextNode(String(kid)));
+  }
+  return node;
+}
+
+function toast(text, kind) {
+  const old = document.querySelector('.toast');
+  if (old) old.remove();
+  const t = el('div', { class: 'toast' + (kind ? ' ' + kind : '') }, text);
+  document.body.append(t);
+  requestAnimationFrame(() => t.classList.add('show'));
+  setTimeout(() => { t.classList.remove('show'); setTimeout(() => t.remove(), 300); }, 3200);
+}
+
+function download(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = el('a', { href: url, download: name, rel: 'noopener' });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+
+async function share(blob, name) {
+  try {
+    const file = new File([blob], name, { type: blob.type });
+    await navigator.share({ files: [file], title: 'Этикетка 30 × 20' });
+  } catch (e) {
+    if (e && e.name === 'AbortError') return;
+    toast('Не удалось открыть меню «Поделиться»: ' + ((e && e.message) || e), 'bad');
+  }
+}
+
+function metaRow(label, value, cls) {
+  return el('div', { class: 'meta-row' },
+    el('dt', {}, label),
+    el('dd', { class: cls || null }, value));
+}
+
+async function renderVariant(v) {
+  const blob = await v.make();
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  const meta = v.kind === 'png' ? pngMeta(bytes) : jpegMeta(bytes);
+  const decoded = await decodeCheck(blob);
+  const url = URL.createObjectURL(blob);
+
+  const metaRows = [];
+  const sizeOk = meta.width === 240 && meta.height === 160;
+  metaRows.push(metaRow('Пиксели', meta.width + ' × ' + meta.height + (sizeOk ? ' — ровно как надо' : ' — НЕ 240 × 160'), sizeOk ? 'ok' : 'bad'));
+  if (v.kind === 'png') {
+    metaRows.push(metaRow('Тип', meta.depth + ' бит/пиксель, ' + (COLOR_NAMES[meta.colorType] || ('color type ' + meta.colorType)), meta.colorType === 0 ? 'ok' : 'bad'));
+    if (meta.ppm) {
+      metaRows.push(metaRow('DPI (pHYs)', meta.ppm + ' точек/м = ' + meta.dpi + ' dpi · ' + meta.mmW.toFixed(1).replace('.', ',') + ' × ' + meta.mmH.toFixed(1).replace('.', ',') + ' мм', 'ok'));
+    } else {
+      metaRows.push(metaRow('DPI (pHYs)', 'нет: телефон примет 96 dpi → 63,5 × 42,3 мм', 'bad'));
+    }
+    metaRows.push(metaRow('Альфа-канал', meta.colorType === 6 || meta.colorType === 4 ? 'есть (плохо для термопринтера)' : 'нет', meta.colorType === 6 || meta.colorType === 4 ? 'bad' : 'ok'));
+  } else {
+    metaRows.push(metaRow('DPI (JFIF)', meta.dpi ? meta.dpi + ' dpi' : 'нет метки', meta.dpi ? 'ok' : 'bad'));
+    metaRows.push(metaRow('Фон', 'белая подложка (прозрачности в JPG нет)', 'ok'));
+  }
+  metaRows.push(metaRow('Размер файла', fmtBytes(blob.size)));
+  metaRows.push(metaRow('Тип файла', blob.type));
+  metaRows.push(metaRow('Имя файла', v.file));
+  metaRows.push(metaRow('Браузер открывает', decoded && !decoded.error ? 'да: ' + decoded.width + ' × ' + decoded.height : 'нет: ' + ((decoded && decoded.error) || 'нет createImageBitmap'), decoded && !decoded.error ? 'ok' : 'bad'));
+
+  let shareSupported = false;
+  if (canShareApi) {
+    try { shareSupported = !!navigator.canShare({ files: [new File([blob], v.file, { type: blob.type })] }); }
+    catch (e) { shareSupported = false; }
+  }
+
+  const actions = el('div', { class: 'actions' },
+    shareSupported
+      ? el('button', { class: 'primary wide', type: 'button', onclick: () => share(blob, v.file) }, shareText)
+      : null,
+    el('button', { class: 'secondary wide', type: 'button', onclick: () => download(blob, v.file) }, 'Скачать ' + (v.kind === 'jpeg' ? 'JPG' : 'PNG')),
+    shareSupported ? null : el('p', { class: 'no-share' }, canShareApi ? 'Меню «Поделиться» этот файл не принимает — пользуйтесь «Скачать».' : 'В этом браузере нет «Поделиться» картинкой. Откройте страницу на телефоне или скачайте файл.'),
+  );
+
+  const card = el('section', { class: 'card variant' },
+    el('div', { class: 'variant-head' },
+      el('h2', {}, v.title),
+      el('span', { class: 'badge ' + (v.badge || '') }, v.tag)),
+    el('p', { class: 'what' }, v.what),
+    el('div', { class: 'previews' },
+      el('div', { class: 'preview-col' },
+        el('div', { class: 'frame' }, el('img', { class: 'preview-1x', src: url, width: '240', height: '160', alt: 'Этикетка 1:1, 240 × 160' })),
+        el('p', { class: 'caption' }, '1:1 — ровно 240 × 160 точек (30 × 20 мм на бумаге)')),
+      el('div', { class: 'preview-col' },
+        el('div', { class: 'zoom-scroll' },
+          el('div', { class: 'frame' }, el('img', { class: 'preview-4x', src: url, width: '960', height: '640', alt: 'Та же этикетка в увеличении 4×' }))),
+        el('p', { class: 'caption' }, '4× — видно каждый печатный пиксель; серых полутонов быть не должно'))),
+    el('dl', { class: 'meta' }, ...metaRows),
+    actions,
+  );
+  return card;
+}
+
+async function boot() {
+  const caps = document.getElementById('caps');
+  caps.append(
+    el('span', { class: 'pill ' + (canShareApi ? 'ok' : 'bad') }, 'Web Share с файлами: ' + (canShareFilesProbe ? 'есть' : 'нет')),
+    el('span', { class: 'pill' }, phone ? (iOS ? 'телефон: iPhone' : 'телефон: Android') : 'устройство: компьютер'),
+    el('span', { class: 'pill warn' }, 'Если кнопки «Сохранить в Фото» нет — сохраняйте «Скачать PNG» и открывайте из «Файлов»'),
+  );
+
+  const host = document.getElementById('variants');
+  for (const v of VARIANTS) {
+    try {
+      host.append(await renderVariant(v));
+    } catch (e) {
+      host.append(el('section', { class: 'card' },
+        el('h2', {}, v.title + ' — не собрался'),
+        el('p', { class: 'small' }, 'Ошибка: ' + ((e && e.message) || e) + '. Проверьте, что страница открыта по https (GitHub Pages) или на localhost.'),
+      ));
+    }
+  }
+}
+
+boot();
+</script>
+</body>
+</html>

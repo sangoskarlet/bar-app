@@ -409,3 +409,112 @@ textarea { margin-top: 16px; resize: vertical; }
 .duel-rating-change.ok { color: var(--ok); }
 .duel-rating-change.bad { color: var(--bad); }
 .duel-delta { margin-left: 8px; }
+
+/* =====================================================================
+   ЧЕК-ЛИСТЫ
+   Списки — карточки как остальные строки приложения; прохождение —
+   крупные чекбоксы под палец. Цвета только из переменных темы.
+   ===================================================================== */
+.checklist-list { display: flex; flex-direction: column; gap: 12px; }
+
+.checklist-card {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 14px 16px 12px;
+}
+.checklist-name {
+  margin: 0; font-size: 19px; font-weight: 600; line-height: 1.25;
+  overflow-wrap: break-word;
+}
+.checklist-meta { color: var(--muted); font-size: 13.5px; line-height: 1.35; margin: 5px 0 0; }
+.checklist-bar {
+  height: 6px; border-radius: 999px; background: var(--panel-2);
+  overflow: hidden; margin: 10px 0 8px;
+}
+.checklist-bar > span {
+  display: block; height: 100%; width: 0; border-radius: 999px;
+  background: var(--ok); transition: width .2s ease;
+}
+.checklist-card-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.checklist-card-actions .primary { flex: 1 1 140px; margin-top: 4px; min-height: 48px; }
+.checklist-card-actions .link { margin: 4px 0 0; }
+.checklist-refresh { display: block; margin: 14px auto 0; }
+
+.checklist-progress-head {
+  display: flex; justify-content: space-between; align-items: baseline;
+  color: var(--muted); font-size: 14px; margin: 4px 0 6px;
+}
+.checklist-progress-head b { color: var(--text); font-size: 16px; }
+.checklist-progress {
+  height: 6px; border-radius: 999px; background: var(--panel-2);
+  overflow: hidden; margin-bottom: 8px;
+}
+.checklist-progress > span {
+  display: block; height: 100%; width: 0; border-radius: 999px;
+  background: var(--accent); transition: width .2s ease;
+}
+.checklist-progress.done > span { background: var(--ok); }
+
+.checklist-items { margin-top: 4px; }
+.checklist-item { border-top: 1px solid var(--line); padding: 14px 0 6px; }
+.checklist-item:first-child { border-top: 0; padding-top: 8px; }
+
+.check-row {
+  display: grid; grid-template-columns: 28px minmax(0, 1fr);
+  gap: 12px; align-items: start; cursor: pointer;
+}
+.check-box {
+  appearance: none; -webkit-appearance: none;
+  width: 28px; height: 28px; margin: 1px 0 0; padding: 0;
+  border: 2px solid var(--line); border-radius: 8px;
+  background: var(--panel); cursor: pointer; position: relative; flex: none;
+}
+.check-box:checked { background: var(--ok); border-color: var(--ok); }
+.check-box:checked::after {
+  content: '✓'; position: absolute; inset: 0; display: flex;
+  align-items: center; justify-content: center;
+  color: #06210f; font-weight: 800; font-size: 18px; line-height: 1;
+}
+.check-box:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.check-text { font-size: 16.5px; line-height: 1.35; overflow-wrap: break-word; }
+.checklist-item.done .check-text { color: var(--muted); }
+.check-hint {
+  color: var(--muted); font-size: 13.5px; line-height: 1.4;
+  margin: 6px 0 0 40px; overflow-wrap: break-word;
+}
+.checklist-photo { margin: 10px 0 0 40px; }
+.checklist-photo-label {
+  color: var(--muted); font-size: 12px; text-transform: uppercase;
+  letter-spacing: .04em; margin: 0 0 6px;
+}
+.checklist-photo-view .two { max-width: 320px; }
+.checklist-photo-view .two .secondary { min-height: 44px; font-size: 15px; }
+.checklist-thumb {
+  width: 84px; height: 84px; object-fit: cover; border-radius: 10px;
+  display: block; margin-bottom: 8px; border: 1px solid var(--line);
+}
+.checklist-photo-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.checklist-photo-actions .secondary {
+  width: auto; min-height: 40px; margin: 0; padding: 0 12px; font-size: 14px;
+}
+.checklist-photo-actions .link { font-size: 13px; padding: 6px 4px; }
+.checklist-warn {
+  color: var(--wait); font-size: 13px; line-height: 1.35;
+  margin: 8px 0 0 40px; overflow-wrap: break-word;
+}
+.checklist-warn.done-warn {
+  margin: 12px 0 0; padding: 10px 12px; background: var(--panel);
+  border: 1px solid var(--wait); border-radius: 10px;
+}
+.checklist-item-actions { margin: 6px 0 0 40px; }
+.checklist-comment-toggle { font-size: 14px; padding: 4px 0; color: var(--muted); }
+.checklist-comment { margin: 4px 0 0 40px; }
+.checklist-comment textarea { margin-top: 0; min-height: 64px; }
+
+.checklist-submit { margin-top: 22px; }
+.checklist-done-score {
+  font-size: 30px; font-weight: 800; text-align: center;
+  color: var(--accent); margin: 20px 0 4px;
+}
+.checklist-done-list { text-align: center; }
+.checklist-unmarked { margin: 8px 0 0; padding-left: 22px; }
+.checklist-unmarked li { margin: 5px 0; line-height: 1.35; }

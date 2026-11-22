@@ -20,7 +20,7 @@ import { db } from './db.js';
 import { apiGet, apiPost, ApiError, NetworkError } from './api.js';
 import {
   enqueue, startAutoSync, onSyncChange, getStatus, syncNow,
-  listQueue, listSent, removeFromQueue, retryRejected,
+  listQueue, listSent, removeFromQueue, retryRejected, newId,
 } from './sync.js';
 import { voiceSupported, listenOnce, voiceErrorText, parseInventoryPhrase, confident, parseCustomPhrase } from './voice.js';
 import { icon } from './icons.js';
@@ -317,6 +317,7 @@ function screenHome() {
         tile('transfer', 'Перенос', 'кухня ⇄ бар', () => go(screenItemsForm, 'transfer')),
         tile('writeoff', 'Списание', 'бой, порча, проливы', () => go(screenItemsForm, 'writeoff')),
         tile('photo', 'Фото уборки', 'зоны после смены', () => go(screenPhoto)),
+        tile('checklist', 'Чек-листы', 'смены и заготовки', () => go(screenChecklists)),
         tile('ttk', 'ТТК', 'рецептуры', () => go(screenTtkList)),
         tile('inv', 'Инвентаризация', 'подсчёт остатков', () => go(screenInventory)),
         tile('quiz', 'Викторина', 'вопросы смены', () => go(screenQuizStart)),
@@ -937,6 +938,506 @@ async function compressImage(file) {
   canvas.height = Math.round(h0 * scale);
   canvas.getContext('2d').drawImage(source, 0, 0, canvas.width, canvas.height);
   return canvas.toDataURL('image/jpeg', PHOTO_QUALITY);
+}
+
+// =====================================================================
+//  ЧЕК-ЛИСТЫ
+//
+//  Списки и пункты приходят с сервера в config.checklists — отдельного
+//  запроса на старте нет. Всё, что бармен отметил, сразу ложится в
+//  IndexedDB: незаконченный прогон — в «kv», отправка — в «queue»
+//  (type: 'checklist'). Поэтому перезагрузка и потеря сети не стирают
+//  чек-лист: на экране списка будет «Продолжить», а очередь дослает
+//  отметки, когда появится связь.
+//
+//  runId придумывается при старте прогона и переживает повторные
+//  отправки: сервер не задваивает строки (runId + пункт).
+// =====================================================================
+const CHECKLIST_RUN_PREFIX = 'checklistRun:';
+const checklistRunKey = name => CHECKLIST_RUN_PREFIX + name;
+const checklistChecked = v => v === true || v === 1 ||
+  String(v).toLowerCase() === 'да' || String(v).toLowerCase() === 'true';
+
+/** Ключ сегодняшнего дня по местному времени телефона (yyyy-mm-dd). */
+function dayKey(d = new Date()) {
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/** «1 пункт», «2 пункта», «5 пунктов». */
+function pointsWord(n) {
+  const d = n % 10, dd = n % 100;
+  if (d === 1 && dd !== 11) return 'пункт';
+  if (d >= 2 && d <= 4 && (dd < 12 || dd > 14)) return 'пункта';
+  return 'пунктов';
+}
+
+function fmtShortDate(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return '';
+  return d.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' });
+}
+
+async function loadChecklistRun(name) {
+  const run = await db.get('kv', checklistRunKey(name));
+  if (!run || !run.runId || !Array.isArray(run.items)) return null;
+  return run;
+}
+
+async function saveChecklistRun(run) {
+  await db.put('kv', { ...run, savedAt: new Date().toISOString() }, checklistRunKey(run.list));
+}
+
+async function deleteChecklistRun(name) {
+  await db.del('kv', checklistRunKey(name));
+}
+
+/** Новый прогон: копируем пункты из config, чтобы правка листа не ломала начатый чек-лист. */
+function newChecklistRun(list) {
+  return {
+    runId: newId(),
+    list: list.name,
+    startedAt: new Date().toISOString(),
+    items: list.items.map(it => ({
+      text: it.text,
+      hint: it.hint || '',
+      photo: !!it.photo,
+      checked: false,
+      comment: '',
+      photoData: '',
+    })),
+  };
+}
+
+/**
+ * Сколько пунктов списка закрыто за сегодня на этом телефоне.
+ * Считаем объединение: отправленные прогоны + очередь + незаконченный прогон.
+ * Это не «замок», а подсказка: пройти список второй раз можно всегда.
+ */
+async function todayChecklistDone(list, activeRun, records) {
+  const today = dayKey();
+  if (!records) records = [...await listQueue(), ...await listSent()];
+  const marked = new Set();
+  for (const r of records) {
+    if (r.type !== 'checklist' || r.list !== list.name || r.status === 'rejected') continue;
+    const started = r.startedAt ? new Date(r.startedAt) : null;
+    if (!started || isNaN(started) || dayKey(started) !== today) continue;
+    const marks = Array.isArray(r.marked)
+      ? r.marked
+      : (r.items || []).filter(checklistChecked).map(i => i['пункт'] || i.text);
+    marks.forEach(t => marked.add(t));
+  }
+  if (activeRun && activeRun.startedAt && dayKey(new Date(activeRun.startedAt)) === today) {
+    activeRun.items.filter(i => i.checked).forEach(i => marked.add(i.text));
+  }
+  const current = new Set(list.items.map(i => i.text));
+  return [...marked].filter(t => current.has(t)).length;
+}
+
+// ---------- Экран 1: выбор списка ----------
+
+function screenChecklists() {
+  const root = h('main', { class: 'screen' }, header('Чек-листы'));
+  const lists = (config && Array.isArray(config.checklists))
+    ? config.checklists.filter(l => l && l.name && Array.isArray(l.items) && l.items.length)
+    : [];
+
+  if (!lists.length) {
+    root.append(
+      h('p', { class: 'hint' }, 'Списки чек-листов пока не настроены.'),
+      h('p', { class: 'hint left' },
+        'Владелец добавляет пункты в Google-таблице на листе «Чек-листы». Если лист только что создан — нажмите «Обновить».'),
+      h('button', {
+        class: 'primary',
+        onclick: async () => {
+          await loadConfig();
+          render();
+        },
+      }, 'Обновить'),
+    );
+    return root;
+  }
+
+  root.append(
+    h('p', { class: 'hint left' },
+      'Отмечайте пункты по порядку. Отметки сохраняются на телефоне сразу: без сети они уйдут, когда появится связь.'),
+  );
+
+  const body = h('div', { class: 'checklist-list' });
+  root.append(body);
+
+  // Очередь и история читаем один раз на весь экран, а не по разу на список
+  const recordsPromise = Promise.all([listQueue(), listSent()]).then(([q, s]) => [...q, ...s]);
+
+  lists.forEach(list => {
+    const card = h('div', { class: 'checklist-card' });
+    const meta = h('p', { class: 'checklist-meta' },
+      `${list.items.length} ${pointsWord(list.items.length)}`);
+    const bar = h('div', { class: 'checklist-bar' }, h('span'));
+    const actions = h('div', { class: 'checklist-card-actions' },
+      h('button', { class: 'primary', disabled: true }, 'Загрузка…'));
+    card.append(
+      h('p', { class: 'checklist-name' }, list.name),
+      meta,
+      bar,
+      actions,
+    );
+    body.append(card);
+
+    (async () => {
+      const [run, records] = await Promise.all([loadChecklistRun(list.name), recordsPromise]);
+      const done = await todayChecklistDone(list, run, records);
+      if (!document.body.contains(root)) return; // экран уже закрыли
+
+      const total = list.items.length;
+      const parts = [`${total} ${pointsWord(total)}`, `пройдено ${done} из ${total} за сегодня`];
+      if (run && run.startedAt && dayKey(new Date(run.startedAt)) !== dayKey()) {
+        parts.push(`незаконченный от ${fmtShortDate(run.startedAt)}`);
+      } else if (!run && done >= total) {
+        parts.push('уже пройден, можно ещё раз');
+      }
+      meta.textContent = parts.join(' · ');
+      bar.firstChild.style.width = total ? `${Math.round(done / total * 100)}%` : '0%';
+
+      if (run) {
+        const cont = h('button', {
+          class: 'primary',
+          onclick: () => go(screenChecklistRun, list, run),
+        }, 'Продолжить');
+        const restart = h('button', {
+          class: 'link',
+          onclick: async (e) => {
+            if (e.currentTarget.disabled) return;
+            if (!confirm('Начать список заново? Неотправленные отметки этого прогона пропадут.')) return;
+            e.currentTarget.disabled = true;
+            try {
+              const fresh = newChecklistRun(list);
+              await saveChecklistRun(fresh);
+              go(screenChecklistRun, list, fresh);
+            } catch (err) {
+              e.currentTarget.disabled = false;
+              toast('Не удалось начать чек-лист', 'bad');
+            }
+          },
+        }, 'Начать заново');
+        actions.replaceChildren(cont, restart);
+      } else {
+        const start = h('button', {
+          class: 'primary',
+          onclick: async (e) => {
+            if (e.currentTarget.disabled) return;
+            e.currentTarget.disabled = true;
+            try {
+              const fresh = newChecklistRun(list);
+              await saveChecklistRun(fresh);
+              go(screenChecklistRun, list, fresh);
+            } catch (err) {
+              e.currentTarget.disabled = false;
+              toast('Не удалось начать чек-лист', 'bad');
+            }
+          },
+        }, 'Начать');
+        actions.replaceChildren(start);
+      }
+    })().catch(e => {
+      console.warn('Чек-лист: не прочитан сохранённый прогон', e);
+      if (document.body.contains(root)) {
+        actions.replaceChildren(h('p', { class: 'muted' }, 'Не удалось прочитать сохранённый прогон'));
+      }
+    });
+  });
+
+  root.append(h('button', {
+    class: 'link checklist-refresh',
+    onclick: async () => {
+      await loadConfig();
+      render();
+    },
+  }, 'Обновить списки'));
+  return root;
+}
+
+// ---------- Экран 2: прохождение ----------
+
+function screenChecklistRun(list, passedRun) {
+  const run = passedRun || newChecklistRun(list);
+  const root = h('main', { class: 'screen checklist-run' }, header(list.name));
+  let finished = false;   // прогон отправлен: cleanup не должен сохранять его снова
+  let saveTimer = 0;
+
+  function saveNow() {
+    if (saveTimer) { clearTimeout(saveTimer); saveTimer = 0; }
+    if (finished) return Promise.resolve();
+    return saveChecklistRun(run).catch(e => console.warn('Чек-лист: не сохранён', e));
+  }
+  function scheduleSave() {
+    if (finished) return;
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(saveNow, 350);
+  }
+
+  const progressLabel = h('p', { class: 'checklist-progress-head' });
+  const progressBar = h('div', { class: 'checklist-progress' }, h('span'));
+  const itemsBox = h('div', { class: 'checklist-items' });
+  const warns = [];
+
+  function counts() {
+    const done = run.items.filter(i => i.checked).length;
+    return { done, total: run.items.length };
+  }
+
+  function updateProgress() {
+    const { done, total } = counts();
+    progressLabel.replaceChildren(
+      h('b', {}, `${done} из ${total}`),
+      h('span', {}, total && done === total ? 'всё отмечено' : 'отмечено'),
+    );
+    progressBar.firstChild.style.width = total ? `${Math.round(done / total * 100)}%` : '0%';
+    progressBar.classList.toggle('done', total > 0 && done === total);
+  }
+
+  function updateWarnings() {
+    warns.forEach(({ it, el }) => {
+      const missing = it.photo && it.checked && !it.photoData;
+      el.classList.toggle('hidden', !missing);
+      el.textContent = missing
+        ? 'Нужно фото. Без него пункт уйдёт с пометкой «нет фото» — владелец увидит.'
+        : '';
+    });
+  }
+
+  function photoBlock(it) {
+    if (!it.photo) return null;
+    const camInput = h('input', { type: 'file', accept: 'image/*', capture: 'environment', hidden: true });
+    const galInput = h('input', { type: 'file', accept: 'image/*', hidden: true });
+    const view = h('div', { class: 'checklist-photo-view' });
+    let busy = false;
+
+    async function onFiles(e) {
+      const file = e.target.files && e.target.files[0];
+      e.target.value = '';
+      if (!file || busy) return;
+      busy = true;
+      try {
+        it.photoData = await compressImage(file); // то же сжатие, что у фото уборки
+        scheduleSave();
+        draw();
+        updateWarnings();
+      } catch (err) {
+        toast('Не удалось обработать фото', 'bad');
+      } finally {
+        busy = false;
+      }
+    }
+
+    function draw() {
+      if (it.photoData) {
+        view.replaceChildren(
+          h('img', { src: it.photoData, alt: 'Фото пункта', class: 'checklist-thumb' }),
+          h('div', { class: 'checklist-photo-actions' },
+            h('button', { class: 'secondary', onclick: () => camInput.click() }, '📷 Заменить'),
+            h('button', { class: 'secondary', onclick: () => galInput.click() }, '🖼 Галерея'),
+            h('button', {
+              class: 'link',
+              onclick: () => {
+                it.photoData = '';
+                scheduleSave();
+                draw();
+                updateWarnings();
+              },
+            }, 'Удалить')),
+        );
+      } else {
+        view.replaceChildren(h('div', { class: 'two' },
+          h('button', { class: 'secondary', onclick: () => camInput.click() }, '📷 Камера'),
+          h('button', { class: 'secondary', onclick: () => galInput.click() }, '🖼 Галерея')));
+      }
+    }
+
+    camInput.addEventListener('change', onFiles);
+    galInput.addEventListener('change', onFiles);
+    draw();
+    return h('div', { class: 'checklist-photo' },
+      h('p', { class: 'checklist-photo-label' }, 'Фото обязательно'),
+      view, camInput, galInput);
+  }
+
+  run.items.forEach(it => {
+    const checkbox = h('input', { type: 'checkbox', class: 'check-box' });
+    checkbox.checked = !!it.checked;
+
+    const itemEl = h('div', { class: 'checklist-item' + (it.checked ? ' done' : '') });
+    checkbox.addEventListener('change', () => {
+      it.checked = checkbox.checked;
+      itemEl.classList.toggle('done', it.checked);
+      updateProgress();
+      updateWarnings();
+      scheduleSave();
+    });
+
+    const warn = h('p', { class: 'checklist-warn hidden' });
+    warns.push({ it, el: warn });
+
+    const ta = h('textarea', {
+      rows: '2', placeholder: 'Комментарий (необязательно)', class: 'checklist-comment-input',
+    });
+    ta.value = it.comment || '';
+    ta.addEventListener('input', () => {
+      it.comment = ta.value;
+      if (commentWrap.classList.contains('hidden')) toggle.textContent = commentLabel();
+      scheduleSave();
+    });
+
+    const commentWrap = h('div', { class: 'checklist-comment' + (it.comment ? '' : ' hidden') }, ta);
+    const commentLabel = () => (String(it.comment || '').trim() ? 'Комментарий' : '+ Комментарий');
+    const toggle = h('button', { class: 'link checklist-comment-toggle' }, commentLabel());
+    toggle.addEventListener('click', () => {
+      const hidden = commentWrap.classList.toggle('hidden');
+      toggle.textContent = hidden ? commentLabel() : 'Комментарий';
+      if (!hidden) setTimeout(() => ta.focus(), 30);
+    });
+
+    itemEl.append(
+      h('label', { class: 'check-row' },
+        checkbox,
+        h('span', { class: 'check-text' }, it.text)),
+      it.hint ? h('p', { class: 'check-hint' }, it.hint) : null,
+      photoBlock(it),
+      warn,
+      h('div', { class: 'checklist-item-actions' }, toggle),
+      commentWrap,
+    );
+    itemsBox.append(itemEl);
+  });
+
+  const submitBtn = h('button', { class: 'primary checklist-submit' }, 'Отправить');
+  submitBtn.addEventListener('click', async () => {
+    if (submitBtn.disabled) return;
+    const { done, total } = counts();
+    if (!done) return toast('Отметьте хотя бы один пункт', 'bad');
+
+    const missing = run.items.filter(i => i.photo && i.checked && !i.photoData);
+    if (missing.length && !confirm(
+      `Без фото: ${missing.length} ${pointsWord(missing.length)}. Отправить с пометкой «нет фото»?`)) {
+      const idx = run.items.findIndex(i => i.photo && i.checked && !i.photoData);
+      const el = itemsBox.children[idx];
+      if (el && el.scrollIntoView) el.scrollIntoView({ block: 'center' });
+      return;
+    }
+
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Сохраняем…';
+    await saveNow();
+    finished = true;
+    clearTimeout(saveTimer);
+    saveTimer = 0;
+
+    const items = run.items.map(i => ({
+      'пункт': i.text,
+      'отмечено': !!i.checked,
+      'комментарий': (i.comment || '').trim(),
+      'фото': i.checked ? (i.photoData || '') : '',
+    }));
+
+    try {
+      await enqueue({
+        type: 'checklist',
+        name: session.name,
+        pin: session.pin,
+        runId: run.runId,
+        list: list.name,
+        startedAt: run.startedAt,
+        items,
+        marked: items.filter(i => i['отмечено']).map(i => i['пункт']),
+        done,
+        total,
+      });
+    } catch (e) {
+      finished = false;
+      submitBtn.disabled = false;
+      submitBtn.textContent = 'Отправить';
+      return toast('Не удалось сохранить на телефоне: ' + (e.message || 'ошибка'), 'bad');
+    }
+
+    try {
+      await deleteChecklistRun(list.name);
+    } catch (e) {
+      console.warn('Чек-лист: не удалён локальный прогон', e);
+    }
+    const unmarked = run.items.filter(i => !i.checked).map(i => i.text);
+    const noPhoto = missing.map(i => i.text);
+    const queued = !navigator.onLine;
+    stack.pop(); // экран прохождения заменяем на «Готово»
+    go(screenChecklistDone, {
+      listName: list.name, total, done, unmarked, noPhoto, queued,
+    });
+  });
+
+  root.append(progressLabel, progressBar, itemsBox, submitBtn);
+  updateProgress();
+  updateWarnings();
+
+  const onPageHide = () => { if (!finished) saveNow(); };
+  window.addEventListener('pagehide', onPageHide);
+  registerCleanup(() => {
+    window.removeEventListener('pagehide', onPageHide);
+    if (finished) {
+      clearTimeout(saveTimer);
+      saveTimer = 0;
+      return;
+    }
+    saveNow();
+  });
+  return root;
+}
+
+// ---------- Экран 3: готово ----------
+
+function screenChecklistDone({ listName, total, done, unmarked, noPhoto, queued }) {
+  const root = h('main', { class: 'screen' }, header('Готово'));
+  root.append(
+    h('p', { class: 'checklist-done-score' }, `Готово: ${done} из ${total}`),
+    h('p', { class: 'muted checklist-done-list' }, listName),
+  );
+
+  if (unmarked.length) {
+    root.append(
+      h('p', { class: 'label' }, `Не отмечено: ${unmarked.length} ${pointsWord(unmarked.length)}`),
+      h('ul', { class: 'checklist-unmarked' }, ...unmarked.map(t => h('li', {}, t))),
+    );
+  } else {
+    root.append(h('p', { class: 'hint' }, 'Все пункты отмечены.'));
+  }
+
+  if (noPhoto && noPhoto.length) {
+    root.append(h('p', { class: 'checklist-warn done-warn' },
+      `Без фото: ${noPhoto.length} ${pointsWord(noPhoto.length)}. В таблице у них будет пометка «нет фото» — владелец увидит.`));
+  }
+
+  const netNote = h('p', { class: 'hint left' },
+    queued
+      ? 'Нет сети — отметки сохранены на телефоне и уйдут, когда появится связь.'
+      : 'Отметки сохранены и отправляются в таблицу. Очередь видна внизу экрана.');
+
+  root.append(
+    netNote,
+    h('button', { class: 'primary', onclick: () => resetTo(screenChecklists) }, 'К спискам'),
+    h('button', { class: 'secondary', onclick: () => resetTo(screenHome) }, 'На главную'),
+  );
+
+  // Если экран «Готово» открыт, а сеть вернулась — обновляем подпись, не уходя с экрана
+  if (queued) {
+    const off = onSyncChange(s => {
+      if (!s.pending) {
+        netNote.textContent = 'Отметки отправлены в таблицу.';
+        off();
+      } else if (s.online) {
+        netNote.textContent = `Отправляем… осталось ${s.pending}`;
+      }
+    });
+    registerCleanup(off);
+  }
+  return root;
 }
 
 // =====================================================================
@@ -2729,6 +3230,11 @@ function describe(r) {
   if (r.type === 'transfer') return `Перенос · ${r.direction} · ${r.item} ${r.qty} ${r.unit}`;
   if (r.type === 'writeoff') return `Списание · ${r.item} ${r.qty} ${r.unit} · ${r.reason}`;
   if (r.type === 'photo') return `Фото уборки · ${r.zone}`;
+  if (r.type === 'checklist') {
+    const done = Number(r.done) || (r.marked || []).length;
+    const total = Number(r.total) || (r.items || []).length;
+    return `Чек-лист · ${r.list} · ${done} из ${total}`;
+  }
   if (r.type === 'processing') {
     const res = (r.lines || []).find(l => l.role === 'Результат');
     const first = (r.lines || []).find(l => l.role === 'Сырьё' && l.qty > 0);

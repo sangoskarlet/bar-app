@@ -852,13 +852,13 @@ function openItemPicker(onPick) {
 // =====================================================================
 //  ЭКРАН: ФОТО УБОРКИ
 // =====================================================================
-function screenPhoto() {
-  const form = { zone: '', comment: '', photos: [] }; // photos: [dataURL]
+function screenPhoto(initialZone) {
+  const form = { zone: initialZone || '', comment: '', photos: [] }; // photos: [dataURL]
   const root = h('main', { class: 'screen' }, header('Фото уборки'));
 
   const zones = h('div', { class: 'chips' }, config.zones.map(z =>
     h('button', {
-      class: 'chip',
+      class: 'chip' + (z === form.zone ? ' on' : ''),
       onclick: (e) => {
         form.zone = z;
         zones.querySelectorAll('.chip').forEach(x => x.classList.remove('on'));
@@ -897,11 +897,17 @@ function screenPhoto() {
     if (!form.zone) return toast('Выберите зону', 'bad');
     if (form.photos.length === 0) return toast('Добавьте фото', 'bad');
     saveBtn.disabled = true;
-    for (const image of form.photos) {
-      await enqueue({ type: 'photo', name: session.name, pin: session.pin, zone: form.zone, image, comment: form.comment.trim() });
+    const records = [];
+    try {
+      for (const image of form.photos) {
+        records.push(await enqueue({ type: 'photo', name: session.name, pin: session.pin, zone: form.zone, image, comment: form.comment.trim() }));
+      }
+    } catch (e) {
+      saveBtn.disabled = false;
+      return toast('Не удалось сохранить фото', 'bad');
     }
-    toast(`Сохранено фото: ${form.photos.length}`);
-    resetTo(screenHome);
+    if (!navigator.onLine) { resetTo(screenPhotoSent, records, form.zone); return; }
+    resetTo(screenPhotoChecking, records, form.zone);
   });
 
   root.append(
@@ -911,8 +917,218 @@ function screenPhoto() {
       h('button', { class: 'secondary', onclick: () => camInput.click() }, '📷 Камера'),
       h('button', { class: 'secondary', onclick: () => galInput.click() }, '🖼 Галерея')),
     camInput, galInput, previews, comment, saveBtn,
+    h('button', { class: 'link photo-history-link', onclick: () => go(screenPhotoHistory) }, 'История снимков'),
   );
   return root;
+}
+
+// ---------------------------------------------------------------------
+//  Проверка фото: «Проверяем…» → карточка вердикта / «проверим позже».
+//  Вердикт приходит с сервера в ответе submit (sync кладёт его в sent)
+//  или отдельным GET photoVerdict по ID записи.
+// ---------------------------------------------------------------------
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+/** Ждём вердикты по своим записям, но не дольше timeoutMs. */
+async function waitPhotoVerdicts_(records, timeoutMs) {
+  const byId = new Map();
+  const nextTry = new Map();
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs && byId.size < records.length) {
+    for (const rec of records) {
+      if (byId.has(rec.id)) continue;
+      let v = null;
+      const sent = await db.get('sent', rec.id);
+      if (sent && sent.server && sent.server.level) v = sent.server;
+      if (!v) {
+        const q = await db.get('queue', rec.id);
+        if (q && q.status === 'rejected') {
+          v = { level: 'unclear', verdict: 'не проверено', notes: q.error || 'запись отклонена', error: q.error || '', items: [] };
+        } else if (!q) {
+          // Запись ушла, но вердикта в sent нет (например, duplicate после обрыва) —
+          // спрашиваем сервер по ID, не чаще раза в 1,5 секунды.
+          const now = Date.now();
+          if (navigator.onLine && now >= (nextTry.get(rec.id) || 0)) {
+            nextTry.set(rec.id, now + 1500);
+            try {
+              const res = await apiGet({ action: 'photoVerdict', id: rec.id }, 10000);
+              if (res.photo && res.photo.level) v = res.photo;
+            } catch (e) { /* нет связи — попробуем ещё раз */ }
+          }
+        }
+      }
+      if (v) {
+        v.id = rec.id;
+        if (!v.zone) v.zone = rec.zone;
+        byId.set(rec.id, v);
+      }
+    }
+    if (byId.size >= records.length) break;
+    if (!navigator.onLine) break;
+    await sleep(500);
+  }
+  return records.map(r => byId.get(r.id)).filter(Boolean);
+}
+
+function screenPhotoChecking(records, zone) {
+  const root = h('main', { class: 'screen' }, header('Фото уборки', { showBack: false }),
+    h('div', { class: 'photo-checking' },
+      h('div', { class: 'photo-spinner', 'aria-hidden': 'true' }),
+      h('p', { class: 'photo-checking-title' }, 'Проверяем…'),
+      h('p', { class: 'muted' }, 'Обычно занимает 1–3 секунды'),
+    ));
+  (async () => {
+    const started = Date.now();
+    const verdicts = await waitPhotoVerdicts_(records, 18000);
+    const elapsed = Date.now() - started;
+    if (elapsed < 900) await sleep(900 - elapsed);
+    if (!document.body.contains(root)) return;
+    if (!verdicts.length) { resetTo(screenPhotoSent, records, zone, { slow: true }); return; }
+    resetTo(screenPhotoVerdict, verdicts, { zone, records });
+  })();
+  return root;
+}
+
+/** «Снимок отправлен»: нет сети или проверка не успела за отведённое время. */
+function screenPhotoSent(records, zone, opts = {}) {
+  const slow = !!opts.slow;
+  return h('main', { class: 'screen' }, header('Фото уборки', { showBack: false }),
+    h('section', { class: 'photo-verdict unclear' },
+      h('h2', { class: 'photo-verdict-head' },
+        h('span', { class: 'photo-verdict-icon', 'aria-hidden': 'true' }, '📶'),
+        slow ? 'Проверка идёт дольше обычного' : 'Снимок отправлен'),
+      h('p', { class: 'photo-verdict-lead' }, slow
+        ? 'Снимок сохранён. Вердикт появится в истории, как только будет готов.'
+        : 'Проверим, когда появится связь. Вердикт появится в истории.'),
+      h('p', { class: 'photo-verdict-meta' }, `${zone} · фото: ${records.length}`),
+    ),
+    h('div', { class: 'photo-verdict-actions' },
+      h('button', { class: 'primary', onclick: () => go(screenPhotoHistory) }, 'История снимков'),
+      h('button', { class: 'link photo-close-anyway', onclick: () => resetTo(screenHome) }, 'На главную'),
+    ),
+  );
+}
+
+/** Карточка вердикта: ok — спокойно, warn — замечания, crit — настойчиво. */
+function screenPhotoVerdict(verdicts, meta) {
+  const order = { crit: 3, warn: 2, unclear: 1, ok: 0 };
+  const worst = verdicts.reduce((a, b) => ((order[b.level] || 0) > (order[a.level] || 0) ? b : a), verdicts[0]);
+  const level = worst ? worst.level : 'unclear';
+  const items = [];
+  verdicts.forEach(v => {
+    if ((v.items || []).length) {
+      v.items.forEach(it => {
+        if (it.level === 'crit' || it.level === 'warn') items.push({ level: it.level, text: it.comment || it.criterion });
+      });
+    } else if (v.notes) {
+      v.notes.split(/;\s*/).forEach(t => {
+        const m = /^(crit|warn):\s*(.+)$/i.exec(t);
+        if (m) items.push({ level: m[1].toLowerCase(), text: m[2] });
+      });
+    }
+  });
+  const seen = new Set();
+  const unique = items.filter(it => {
+    const key = it.level + '|' + it.text;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).slice(0, 12);
+
+  const titles = {
+    ok: ['✓', 'Всё чисто', 'Зона выглядит убранной — ничего делать не нужно.'],
+    warn: ['⚠', 'Есть замечания', 'Проверьте список и поправьте, если нужно.'],
+    crit: ['⛔', 'Критично', 'Это стоит исправить сейчас: грязь или беспорядок в зоне.'],
+    unclear: ['?', 'Не удалось проверить', 'Зону не видно целиком или проверка не удалась. Переснимите при свете.'],
+  };
+  const [ico, title, lead] = titles[level] || titles.unclear;
+  const errorText = verdicts.map(v => v.error).filter(Boolean)[0] || '';
+  const pendingCount = Math.max(0, meta.records.length - verdicts.length);
+
+  return h('main', { class: 'screen' }, header('Результат проверки', { showBack: false }),
+    h('section', { class: 'photo-verdict ' + level },
+      h('h2', { class: 'photo-verdict-head' },
+        h('span', { class: 'photo-verdict-icon', 'aria-hidden': 'true' }, ico), title),
+      h('p', { class: 'photo-verdict-lead' }, errorText && level === 'unclear'
+        ? 'Проверка не удалась: ' + errorText : lead),
+      unique.length ? h('ul', { class: 'photo-verdict-list' }, unique.map(it =>
+        h('li', {},
+          h('span', { class: 'level ' + it.level }, it.level === 'crit' ? 'критично' : 'замечание'),
+          h('span', {}, it.text)))) : null,
+      pendingCount ? h('p', { class: 'photo-verdict-meta' },
+        `Ещё ${pendingCount} ${pendingCount === 1 ? 'снимок проверяется' : 'снимка проверяются'} — результат появится в истории.`) : null,
+      h('p', { class: 'photo-verdict-meta' }, `${meta.zone || 'Зона'} · фото: ${meta.records.length}`),
+    ),
+    h('div', { class: 'photo-verdict-actions' },
+      level === 'crit' || level === 'unclear'
+        ? h('button', { class: 'primary', onclick: () => resetTo(screenPhoto, meta.zone) }, 'Переснять')
+        : h('button', { class: 'primary', onclick: () => resetTo(screenHome) }, 'Понятно'),
+      level === 'crit'
+        ? h('button', { class: 'link photo-close-anyway', onclick: () => resetTo(screenHome) }, 'Всё равно закрыть')
+        : null,
+      level === 'unclear'
+        ? h('button', { class: 'link photo-close-anyway', onclick: () => resetTo(screenHome) }, 'Позже')
+        : null,
+      h('button', { class: 'link', onclick: () => go(screenPhotoHistory) }, 'История снимков'),
+    ),
+  );
+}
+
+/** Последние снимки: дата, зона, вердикт, замечания. Критичные — сверху. */
+function screenPhotoHistory() {
+  const list = h('div', { class: 'photo-hist-list' }, h('p', { class: 'photo-hist-empty' }, 'Загрузка…'));
+  let run = () => {};
+  const root = h('main', { class: 'screen' }, header('История фото'),
+    h('div', { class: 'photo-hist-tools' },
+      h('button', { class: 'link', onclick: () => run(true) }, 'Обновить')),
+    list);
+
+  async function load(fresh) {
+    let server = (await db.get('kv', 'photoHistory')) || [];
+    if (fresh && navigator.onLine) {
+      try {
+        const res = await apiGet({ action: 'photos', limit: 30 }, 15000);
+        server = res.photos || [];
+        await db.put('kv', server, 'photoHistory');
+      } catch (e) { /* нет сети — показываем кэш */ }
+    }
+    const queue = (await listQueue()).filter(r => r.type === 'photo');
+    const local = queue.map(r => ({ id: r.id, at: r.createdAt, zone: r.zone, level: 'pending', notes: '', local: true }));
+    const byId = new Map();
+    server.forEach(p => byId.set(p.id, p));
+    local.forEach(p => { if (!byId.has(p.id)) byId.set(p.id, p); });
+    const all = [...byId.values()];
+    const rank = { crit: 3, warn: 2, unclear: 1, unchecked: 1, pending: 0, ok: 0, '': 0 };
+    all.sort((a, b) => ((rank[b.level] || 0) - (rank[a.level] || 0)) || String(b.at || '').localeCompare(String(a.at || '')));
+    if (!document.body.contains(root)) return;
+    if (!all.length) {
+      list.replaceChildren(h('p', { class: 'photo-hist-empty' },
+        navigator.onLine ? 'Пока нет снимков' : 'Нет сети и нет сохранённой истории'));
+    } else {
+      list.replaceChildren(...all.slice(0, 40).map(photoHistRow));
+    }
+  }
+
+  // Сначала кэш, потом свежие данные — строго по очереди, без гонки.
+  let chain = Promise.resolve();
+  run = fresh => { chain = chain.then(() => load(fresh)).catch(() => {}); };
+  run(false);
+  if (navigator.onLine) run(true);
+  return root;
+}
+
+function photoHistRow(p) {
+  const level = p.level || '';
+  const cls = level === 'unchecked' ? 'unclear' : (level || 'unclear');
+  const label = { ok: 'чисто', warn: 'замечания', crit: 'критично', unclear: 'не проверено',
+    unchecked: 'не проверено', pending: 'ждёт отправки', '': 'без вердикта' }[level] || level;
+  return h('div', { class: 'photo-hist-row ' + cls },
+    h('div', { class: 'photo-hist-head' },
+      h('b', {}, p.zone || 'Зона'),
+      h('span', { class: 'photo-hist-badge ' + cls }, label)),
+    h('p', { class: 'photo-hist-date' }, fmtDateTime(p.at) + (p.local ? ' · ждёт отправки' : '')),
+    p.notes ? h('p', { class: 'photo-hist-notes' }, p.notes) : null,
+  );
 }
 
 /**

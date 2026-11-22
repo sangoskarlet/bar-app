@@ -159,8 +159,9 @@ async function sendBatch(records, timeoutMs) {
     if (result.status === 'saved' || result.status === 'duplicate') {
       // PIN и сами фото в историю не сохраняем. У чек-листа ещё и пункты
       // с data-URL: для истории достаточно marked/done/total.
+      // server.verdict — вердикт проверки фото (если сервер его вернул).
       const { pin, image, items, ...forHistory } = r;
-      await db.put('sent', { ...forHistory, sentAt: new Date().toISOString() });
+      await db.put('sent', { ...forHistory, sentAt: new Date().toISOString(), server: result.verdict || null });
       await db.del('queue', r.id);
     } else if (result.retry || result.code === 'locked') {
       await db.put('queue', { ...r, attempts: r.attempts + 1, error: result.error });

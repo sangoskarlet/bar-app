@@ -518,3 +518,83 @@ textarea { margin-top: 16px; resize: vertical; }
 .checklist-done-list { text-align: center; }
 .checklist-unmarked { margin: 8px 0 0; padding-left: 22px; }
 .checklist-unmarked li { margin: 5px 0; line-height: 1.35; }
+
+/* =====================================================================
+   ПРОВЕРКА ФОТО
+   «Проверяем…» → карточка вердикта → «Снимок отправлен» / история.
+   Цвета только из переменных темы: обычная и зимняя работают одинаково.
+   ===================================================================== */
+.photo-history-link { display: block; margin: 18px auto 0; text-align: center; }
+
+.photo-checking { text-align: center; padding: 56px 16px 24px; }
+.photo-spinner {
+  width: 46px; height: 46px; margin: 0 auto 18px;
+  border-radius: 50%; border: 3px solid var(--line); border-top-color: var(--accent);
+  animation: photo-spin .9s linear infinite;
+}
+@keyframes photo-spin { to { transform: rotate(360deg); } }
+.photo-checking-title { font-size: 22px; font-weight: 700; margin: 0 0 4px; }
+
+.photo-verdict {
+  margin-top: 18px; padding: 20px 18px;
+  background: var(--panel); border: 1px solid var(--line);
+  border-left: 4px solid var(--muted); border-radius: var(--radius);
+}
+.photo-verdict.ok { border-left-color: var(--ok); }
+.photo-verdict.warn { border-left-color: var(--wait); }
+.photo-verdict.crit { border-color: var(--bad); border-left-color: var(--bad); }
+.photo-verdict.unclear { border-left-color: var(--muted); }
+.photo-verdict-head {
+  display: flex; align-items: center; gap: 10px;
+  margin: 0; font-size: 22px; font-weight: 700; line-height: 1.2;
+}
+.photo-verdict.ok .photo-verdict-head { color: var(--ok); }
+.photo-verdict.warn .photo-verdict-head { color: var(--wait); }
+.photo-verdict.crit .photo-verdict-head { color: var(--bad); }
+.photo-verdict.unclear .photo-verdict-head { color: var(--text); }
+.photo-verdict-icon { font-size: 26px; line-height: 1; }
+.photo-verdict-lead { color: var(--muted); font-size: 15px; line-height: 1.4; margin: 10px 0 0; }
+.photo-verdict-list {
+  margin: 14px 0 0; padding: 0; list-style: none;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.photo-verdict-list li {
+  display: grid; grid-template-columns: 78px minmax(0, 1fr); gap: 10px;
+  align-items: start; padding: 10px 12px; border-radius: 10px;
+  background: var(--panel-2); font-size: 15px; line-height: 1.35; overflow-wrap: anywhere;
+}
+.photo-verdict-list .level {
+  font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+  font-weight: 700; color: var(--muted); padding-top: 2px;
+}
+.photo-verdict-list .level.crit { color: var(--bad); }
+.photo-verdict-list .level.warn { color: var(--wait); }
+.photo-verdict-meta { color: var(--muted); font-size: 13px; line-height: 1.35; margin: 12px 0 0; }
+.photo-verdict-actions { margin-top: 18px; }
+.photo-verdict-actions .primary { margin-top: 0; }
+.photo-close-anyway { display: block; width: 100%; text-align: center; margin: 10px 0 0; font-size: 14px; }
+.photo-verdict-actions .link:last-child { display: block; width: 100%; text-align: center; margin: 12px 0 0; font-size: 14px; }
+
+.photo-hist-tools { display: flex; justify-content: flex-end; margin: 2px 0 4px; }
+.photo-hist-list { display: flex; flex-direction: column; gap: 8px; margin-top: 6px; }
+.photo-hist-row {
+  background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--line);
+  border-radius: 12px; padding: 12px 14px;
+}
+.photo-hist-row.ok { border-left-color: var(--ok); }
+.photo-hist-row.warn { border-left-color: var(--wait); }
+.photo-hist-row.crit { border-color: var(--bad); border-left-color: var(--bad); }
+.photo-hist-row.unclear { border-left-color: var(--muted); }
+.photo-hist-row.pending { border-left-color: var(--accent); }
+.photo-hist-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+.photo-hist-head b { font-size: 16px; line-height: 1.3; overflow-wrap: anywhere; }
+.photo-hist-badge {
+  font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+  font-weight: 700; color: var(--muted); white-space: nowrap;
+}
+.photo-hist-badge.ok { color: var(--ok); }
+.photo-hist-badge.warn { color: var(--wait); }
+.photo-hist-badge.crit { color: var(--bad); }
+.photo-hist-date { color: var(--muted); font-size: 12.5px; margin: 2px 0 0; }
+.photo-hist-notes { font-size: 14px; line-height: 1.35; margin: 6px 0 0; overflow-wrap: anywhere; }
+.photo-hist-empty { color: var(--muted); text-align: center; margin: 28px 0; }

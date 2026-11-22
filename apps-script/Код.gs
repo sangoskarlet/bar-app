@@ -52,6 +52,8 @@ const SHEETS = {
   inventory: 'Инвентарь',           // полученные предметы и экипировка (создаётся автоматически)
   shelfLife: 'Сроки хранения',      // сроки хранения заготовок для этикетки 30×20 (создаётся автоматически)
   facts:     'Факты',               // факт дня на главном экране (создаётся автоматически)
+  checklists: 'Чек-листы',          // списки пунктов, которые правит владелец (создаётся автоматически)
+  checklistMarks: 'Чек-листы — отметки', // история прохождений (создаётся автоматически)
 };
 
 // В каком столбце листа лежит ID записи (считаем с 1: A=1, B=2 ...).
@@ -104,6 +106,7 @@ function doPost(e) {
     const body = JSON.parse((e && e.postData && e.postData.contents) || '{}');
     if (body.action === 'login') return json_(login_(body.name, body.pin));
     if (body.action === 'submit') return json_(submit_(body.records));
+    if (body.action === 'checklistSave') return json_(checklistSave_(body));
     if (body.action === 'dispute') return json_(dispute_(body));
     if (body.action === 'duelCreate') return json_(duelCreate_(body));
     if (body.action === 'duelJoin') return json_(duelJoin_(body));
@@ -179,8 +182,18 @@ function getConfig_() {
 
   // Оформление приложения: «Списки»!F2 — обычное / зимнее / авто (пусто = авто)
   const theme = lists.length ? str_(lists[0][5]) : '';
+
+  // Чек-листы: отдаём вместе со справочником, отдельного запроса на старте нет.
+  // Ошибка в листе «Чек-листы» не должна ломать config — тогда списков просто нет.
+  let checklists = [];
+  try {
+    checklists = checklists_(ss);
+  } catch (e) {
+    log_('Чек-листы', 'не прочитаны: ' + String(e && e.stack || e));
+  }
+
   return {
-    theme, ok: true, employees, items, reasons, zones, ttk, inventory, acts, shelfLife, factOfDay,
+    theme, ok: true, employees, items, reasons, zones, ttk, inventory, acts, shelfLife, factOfDay, checklists,
     directions: DIRECTIONS, units: UNITS };
 }
 
@@ -631,6 +644,447 @@ function getTtkPhoto_(id) {
 
 
 /* =====================================================================
+ *  ЧЕК-ЛИСТЫ
+ * =====================================================================
+ *
+ *  Что это: списки пунктов, которые бармен отмечает на смене. Содержимое —
+ *  данные, а не код: владелец добавляет и правит пункты прямо в таблице.
+ *
+ *  Два листа (создаются сами при первом чтении справочника):
+ *    «Чек-листы» — что отмечать:
+ *      список | порядок | пункт | подсказка | фото_обязательно | активен
+ *    «Чек-листы — отметки» — история прохождений:
+ *      дата | время | сотрудник | список | прогон_id | пункт | отмечено |
+ *      комментарий | фото
+ *
+ *  Списки уходят в приложение вместе с config (?action=config), поэтому на
+ *  старте нет отдельного запроса. Если лист пуст или все галочки сняты —
+ *  массив пустой, приложение просто не рисует плитку.
+ *
+ *  Идемпотентность: прогон_id придумывает телефон. Повторная отправка того
+ *  же прогона не создаёт вторую строку для того же пункта (runId + пункт).
+ *  Это важно при плохой сети: запрос мог дойти, а ответ — нет.
+ *
+ *  Фото: если пункт с «фото_обязательно = да» пришёл без фото, строку всё
+ *  равно пишем (работа бармена не должна пропадать), а в комментарий
+ *  добавляем «нет фото (обязательно)» — владелец увидит. Файлы лежат на
+ *  Диске в папке «Бар — фото чек-листов» по месяцам, в листе — ссылка.
+ * ===================================================================== */
+
+const CHECKLIST_HEADERS = ['список', 'порядок', 'пункт', 'подсказка', 'фото_обязательно', 'активен'];
+const CHECKLIST_MARK_HEADERS = ['дата', 'время', 'сотрудник', 'список', 'прогон_id', 'пункт', 'отмечено', 'комментарий', 'фото'];
+const CHECKLIST_MAX_ITEMS = 200;
+const CHECKLIST_MAX_TEXT = 200;
+const CHECKLIST_MAX_HINT = 300;
+const CHECKLIST_MAX_COMMENT = 500;
+
+/**
+ * Стартовые списки. Это только первый посев: дальше владелец правит лист
+ * «Чек-листы». Формулировки повелительные и конкретные — чтобы было понятно,
+ * что именно проверить.
+ */
+const CHECKLIST_SEED = [
+  {
+    list: 'Открытие бара',
+    items: [
+      { text: 'Протереть витрину и полки', hint: 'Стекло без разводов, бутылки подписаны и стоят по местам.', photo: true },
+      { text: 'Включить кассу и проверить терминал', hint: 'Касса включается, терминал видит сеть, чек печатается.', photo: false },
+      { text: 'Проверить запас льда', hint: 'Лёдница полная, лёд не слипся.', photo: false },
+      { text: 'Протереть стаканы и бокалы', hint: 'Посуда без пятен и сколов, бокалы под коктейли на месте.', photo: false },
+      { text: 'Проверить чистоту туалета', hint: 'Бумага, мыло, полотенца, зеркало; при необходимости убрать.', photo: true },
+      { text: 'Включить музыку и проверить звук', hint: 'Плейлист смены, громкость в зале и на баре.', photo: false },
+      { text: 'Разложить меню и барные карты', hint: 'Меню чистые, без старых вкладок; на столах и на баре.', photo: false },
+      { text: 'Проверить свет в зале и на баре', hint: 'Перегоревшие лампы заменить, подсветку витрины включить.', photo: false },
+      { text: 'Заправить салфетки и трубочки', hint: 'Держатели на баре и в зале заполнены.', photo: false },
+      { text: 'Проверить свежесть цитрусов и гарниров', hint: 'Лимон, лайм, апельсин нарезаны; вялое убрать.', photo: false },
+      { text: 'Подготовить станцию: соки, сиропы, биттеры', hint: 'Всё под рукой, дозаторы заправлены, бутылки протёрты.', photo: false },
+      { text: 'Проверить запас бокалов под коктейли', hint: 'Хватит на смену; битые убрать.', photo: false },
+    ],
+  },
+  {
+    list: 'Закрытие бара',
+    items: [
+      { text: 'Сдать кассу и снять Z-отчёт', hint: 'Наличные пересчитаны, Z-отчёт распечатан и подписан.', photo: false },
+      { text: 'Выключить кофе-машину и промыть группу', hint: 'Промывка выполнена, пар закрыт, машина выключена.', photo: false },
+      { text: 'Помыть полы в баре и зале', hint: 'Без липких пятен, мусор по углам убран.', photo: true },
+      { text: 'Протереть барную стойку', hint: 'Стойка, кассовая зона и рабочая поверхность без следов.', photo: false },
+      { text: 'Вымыть и убрать посуду', hint: 'Бокалы и стаканы вымыты, сушатся или убраны.', photo: false },
+      { text: 'Закрыть смену в системе', hint: 'Все заказы закрыты, смена завершена.', photo: false },
+      { text: 'Выключить свет и музыку', hint: 'Зал, бар и подсветка выключены; музыка остановлена.', photo: false },
+      { text: 'Проверить входную дверь и сигнализацию', hint: 'Дверь закрыта на ключ, сигнализация поставлена.', photo: false },
+      { text: 'Вынести мусор', hint: 'Мусорные пакеты заменены, коробки вынесены.', photo: false },
+      { text: 'Убрать продукты и заготовки в холодильник', hint: 'Всё подписано и закрыто; ничего не осталось на столе.', photo: false },
+      { text: 'Закрыть и опечатать бар', hint: 'Алкоголь и дорогая посуда убраны, бар закрыт на ключ.', photo: false },
+      { text: 'Проверить туалет перед закрытием', hint: 'Чисто, бумага и мыло есть, вода закрыта.', photo: true },
+    ],
+  },
+  {
+    list: 'Заготовки',
+    items: [
+      { text: 'Сварить сахарный сироп', hint: 'Пропорция 1:1, остудить и перелить в бутылку.', photo: false },
+      { text: 'Нарезать цитрусы для гарниров', hint: 'Лимон, лайм, апельсин — на смену и в контейнеры.', photo: false },
+      { text: 'Сварить морс', hint: 'По рецептуре бара, остудить и убрать в холодильник.', photo: false },
+      { text: 'Подписать заготовки этикетками 30×20', hint: 'Название и дата изготовления на каждой ёмкости.', photo: true },
+      { text: 'Убрать заготовки в холодильник', hint: 'Всё на своих полках, крышки закрыты.', photo: false },
+      { text: 'Записать заготовки в журнал переработки', hint: 'Акты переработки созданы, выход записан.', photo: false },
+    ],
+  },
+];
+
+/** Активен ли пункт: снятая галочка (false) или «нет» выключают строку. */
+function checklistActive_(v) {
+  if (v === false) return false;
+  const s = str_(v).toLowerCase();
+  return !(s === 'нет' || s === 'no' || s === '0' || s === 'false' || s === 'выкл');
+}
+
+/** Нужно ли фото: галочка или «да»/«true»/«1». */
+function checklistPhoto_(v) {
+  if (v === true) return true;
+  const s = str_(v).toLowerCase();
+  return s === 'да' || s === 'true' || s === '1' || s === 'yes' || s === 'истина';
+}
+
+/** Сколько пунктов в стартовом наборе (для сообщений setupChecklists). */
+function checklistSeedCount_() {
+  let n = 0;
+  CHECKLIST_SEED.forEach(function (group) { n += group.items.length; });
+  return n;
+}
+
+/**
+ * Листы чек-листов. Создаются при первом чтении справочника; повторные
+ * вызовы ничего не делают и не дублируют. Если лист уже существует, но пуст,
+ * он НЕ досеивается: так владелец может временно убрать все пункты.
+ */
+function ensureChecklistSheets_(ss) {
+  ss = ss || ss_();
+  let lists = ss.getSheetByName(SHEETS.checklists);
+  let marks = ss.getSheetByName(SHEETS.checklistMarks);
+  if (lists && marks) return { lists: lists, marks: marks };
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) return { lists: lists, marks: marks };
+  try {
+    lists = ss.getSheetByName(SHEETS.checklists);
+    marks = ss.getSheetByName(SHEETS.checklistMarks);
+    let createdList = false;
+
+    if (!lists) {
+      lists = ss.insertSheet(SHEETS.checklists);
+      createdList = true;
+    }
+    if (!marks) marks = ss.insertSheet(SHEETS.checklistMarks);
+
+    if (!str_(lists.getRange(1, 1).getValue())) {
+      lists.getRange(1, 1, 1, CHECKLIST_HEADERS.length).setValues([CHECKLIST_HEADERS]).setFontWeight('bold');
+      lists.setFrozenRows(1);
+      lists.setColumnWidth(1, 180);
+      lists.setColumnWidth(2, 80);
+      lists.setColumnWidth(3, 380);
+      lists.setColumnWidth(4, 460);
+      lists.setColumnWidth(5, 130);
+      lists.setColumnWidth(6, 90);
+      lists.getRange('C:D').setWrap(true);
+    }
+    if (!str_(marks.getRange(1, 1).getValue())) {
+      marks.getRange(1, 1, 1, CHECKLIST_MARK_HEADERS.length).setValues([CHECKLIST_MARK_HEADERS]).setFontWeight('bold');
+      marks.setFrozenRows(1);
+      marks.setColumnWidth(1, 100);
+      marks.setColumnWidth(2, 80);
+      marks.setColumnWidth(3, 140);
+      marks.setColumnWidth(4, 180);
+      marks.setColumnWidth(5, 260);
+      marks.setColumnWidth(6, 380);
+      marks.setColumnWidth(7, 90);
+      marks.setColumnWidth(8, 380);
+      marks.setColumnWidth(9, 260);
+      marks.getRange('F:F').setWrap(true);
+      marks.getRange('H:H').setWrap(true);
+    }
+    if (createdList) {
+      seedChecklists_(lists);
+      log_('Чек-листы', 'создан лист «' + SHEETS.checklists + '», пунктов: ' + checklistSeedCount_());
+    }
+    SpreadsheetApp.flush();
+    return { lists: lists, marks: marks };
+  } catch (e) {
+    // Параллельный запрос мог создать листы первым — берём уже готовые
+    lists = ss.getSheetByName(SHEETS.checklists);
+    marks = ss.getSheetByName(SHEETS.checklistMarks);
+    if (lists && marks) return { lists: lists, marks: marks };
+    throw e;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Записывает стартовые списки. Вызывается только для нового/пустого листа. */
+function seedChecklists_(sh) {
+  const rows = [];
+  CHECKLIST_SEED.forEach(function (group) {
+    group.items.forEach(function (it, i) {
+      rows.push([
+        text_(group.list, 80),
+        i + 1,
+        text_(it.text, CHECKLIST_MAX_TEXT),
+        text_(it.hint, CHECKLIST_MAX_HINT),
+        text_(it.photo ? 'да' : 'нет', 3),
+        true,
+      ]);
+    });
+  });
+  if (!rows.length) return 0;
+  sh.getRange(2, 1, rows.length, CHECKLIST_HEADERS.length).setValues(rows);
+  sh.getRange(2, 6, rows.length, 1)
+    .setDataValidation(SpreadsheetApp.newDataValidation().requireCheckbox().build());
+  return rows.length;
+}
+
+/**
+ * Списки для config: [{name, items:[{text, hint, photo}]}].
+ * Внутри списка сортировка по «порядок» (при равенстве — по строке листа),
+ * сами списки идут в порядке первого появления в листе.
+ */
+function checklists_(ss) {
+  const sheets = ensureChecklistSheets_(ss);
+  if (!sheets.lists) return [];
+
+  const data = rows_(ss, SHEETS.checklists);
+  const map = {};
+  const order = [];
+  data.forEach(function (r) {
+    const name = str_(r[0]);
+    const text = str_(r[2]);
+    if (!name || !text) return;
+    if (!checklistActive_(r[5])) return;
+    if (!map[name]) {
+      map[name] = { name: name, items: [] };
+      order.push(name);
+    }
+    map[name].items.push({
+      text: text,
+      hint: str_(r[3]),
+      photo: checklistPhoto_(r[4]),
+      _order: num_(r[1]),
+      _row: map[name].items.length,
+    });
+  });
+
+  return order.map(function (name) {
+    const list = map[name];
+    list.items.sort(function (a, b) { return (a._order - b._order) || (a._row - b._row); });
+    return {
+      name: list.name,
+      items: list.items.map(function (it) {
+        return { text: it.text, hint: it.hint, photo: it.photo };
+      }),
+    };
+  });
+}
+
+/**
+ * Разово: создать листы чек-листов и залить стартовые списки.
+ * Повторный запуск ничего не дублирует; пустой существующий лист досеивает.
+ */
+function setupChecklists() {
+  const ss = ss_();
+  const sheets = ensureChecklistSheets_(ss);
+  if (!sheets.lists || !sheets.marks) throw new Error('Не удалось создать листы чек-листов');
+  if (sheets.lists.getLastRow() < 2) seedChecklists_(sheets.lists);
+  SpreadsheetApp.flush();
+  const items = Math.max(0, sheets.lists.getLastRow() - 1);
+  const lists = checklists_(ss).length;
+  const msg = 'Листы чек-листов готовы. Списков: ' + lists + ', пунктов: ' + items + '.';
+  log_('Чек-листы', 'setupChecklists: ' + msg);
+  Logger.log('Готово. ' + msg);
+  return msg;
+}
+
+/** Папка для фото чек-листов: «Бар — фото чек-листов» / 2026-11 / файлы. */
+function checklistPhotoFolderFor_(date) {
+  const props = PropertiesService.getScriptProperties();
+  const rootId = props.getProperty('CHECKLIST_PHOTO_FOLDER_ID');
+  let root;
+  try { root = rootId && DriveApp.getFolderById(rootId); } catch (e) { root = null; }
+  if (!root) {
+    root = DriveApp.createFolder('Бар — фото чек-листов');
+    props.setProperty('CHECKLIST_PHOTO_FOLDER_ID', root.getId());
+  }
+  const month = Utilities.formatDate(date, 'Europe/Moscow', 'yyyy-MM');
+  const it = root.getFoldersByName(month);
+  return it.hasNext() ? it.next() : root.createFolder(month);
+}
+
+/** Безопасная часть имени файла: без запрещённых символов, не длиннее max. */
+function checklistFilePart_(s, max) {
+  return str_(s).replace(/[\\/:*?"<>|']/g, '').replace(/\s+/g, ' ').slice(0, max);
+}
+
+/** Сохраняет фото пункта на Диск. Возвращает {file} или {error}. */
+function saveChecklistPhoto_(dataUrl, employee, list, itemText, runId, date) {
+  const m = /^data:(image\/(jpeg|png|webp));base64,(.+)$/.exec(str_(dataUrl));
+  if (!m) return { error: 'неверный формат фото' };
+  let bytes;
+  try {
+    bytes = Utilities.base64Decode(m[3]);
+  } catch (e) {
+    return { error: 'не удалось прочитать фото' };
+  }
+  if (!bytes.length) return { error: 'пустое фото' };
+  if (bytes.length > MAX_PHOTO_BYTES) return { error: 'фото больше 6 МБ' };
+
+  const folder = checklistPhotoFolderFor_(date);
+  const ext = m[2] === 'png' ? 'png' : m[2] === 'webp' ? 'webp' : 'jpg';
+  const fileName = Utilities.formatDate(date, 'Europe/Moscow', 'yyyy-MM-dd_HH-mm') + '_' +
+    checklistFilePart_(employee, 30) + '_' + checklistFilePart_(list, 40) + '_' +
+    checklistFilePart_(itemText, 40) + '_' + runId.slice(0, 6) + '.' + ext;
+  const file = folder.createFile(Utilities.newBlob(bytes, m[1], fileName));
+  return { file: file };
+}
+
+/** Уже записанные пункты этого прогона: Set текстов (идемпотентность). */
+function checklistExisting_(sh, runId) {
+  const last = sh.getLastRow();
+  const set = new Set();
+  if (last < 2) return set;
+  const values = sh.getRange(2, 5, last - 1, 2).getValues(); // E прогон_id, F пункт
+  values.forEach(function (r) {
+    if (str_(r[0]).replace(/^'/, '') === runId) set.add(str_(r[1]).replace(/^'/, ''));
+  });
+  return set;
+}
+
+/**
+ * POST {action:'checklistSave', id, runId, employee, pin?, list, startedAt,
+ *       items:[{пункт, отмечено, комментарий, фото?}]}
+ *
+ * Пишет по строке на каждый пункт (и отмеченные, и нет — владелец видит,
+ * что осталось). Повтор с тем же runId и пунктом не дублирует строку.
+ * PIN необязателен (как у результата викторины), но если пришёл — проверяем.
+ */
+function checklistSave_(body) {
+  body = body || {};
+  const runId = str_(body.runId);
+  const id = str_(body.id) || runId;
+  if (!/^[A-Za-z0-9-]{8,64}$/.test(runId)) return { ok: false, error: 'Некорректный runId' };
+
+  const employee = str_(body.employee).slice(0, 80);
+  if (!employee) return { ok: false, error: 'Не указан сотрудник' };
+  const list = str_(body.list).slice(0, 80);
+  if (!list) return { ok: false, error: 'Не указан список' };
+
+  const items = Array.isArray(body.items) ? body.items : [];
+  if (!items.length) return { ok: false, error: 'Нет пунктов' };
+  if (items.length > CHECKLIST_MAX_ITEMS) return { ok: false, error: 'Слишком много пунктов' };
+
+  const clean = [];
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i] || {};
+    const text = str_(it['пункт'] !== undefined ? it['пункт'] : it.text).slice(0, CHECKLIST_MAX_TEXT);
+    if (!text) return { ok: false, error: 'Пустой пункт в списке' };
+    const mark = it['отмечено'] !== undefined ? it['отмечено'] : it.checked;
+    const checked = mark === true || mark === 1 || str_(mark).toLowerCase() === 'да' || str_(mark).toLowerCase() === 'true';
+    const comment = str_(it['комментарий'] !== undefined ? it['комментарий'] : it.comment).slice(0, CHECKLIST_MAX_COMMENT);
+    const photo = str_(it['фото'] !== undefined ? it['фото'] : it.photo);
+    clean.push({ text: text, checked: checked, comment: comment, photo: photo });
+  }
+
+  const ss = ss_();
+  const sheets = ensureChecklistSheets_(ss);
+  if (!sheets.lists || !sheets.marks) return { ok: false, error: 'Листы чек-листов не готовы' };
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) return { ok: false, error: 'Таблица занята, повторите позже', code: 'busy' };
+  try {
+    // Сотрудник: PIN проверяем, только если он пришёл (приложение всегда шлёт PIN сессии)
+    const staff = rows_(ss, SHEETS.staff);
+    const pin = str_(body.pin);
+    if (pin) {
+      const auth = checkPin_(employee, pin, staff);
+      if (!auth.ok) return { ok: false, error: auth.error, code: auth.code };
+    } else {
+      const row = staff.find(function (r) { return str_(r[0]) === employee && r[3] === true; });
+      if (!row) return { ok: false, error: 'Сотрудник не найден или отключён', code: 'auth' };
+    }
+
+    const created = parseDate_(body.startedAt);
+    const timeText = Utilities.formatDate(created, 'Europe/Moscow', 'HH:mm');
+
+    // Какие пункты этого списка требуют фото — берём из листа, а не с телефона
+    const required = new Set();
+    rows_(ss, SHEETS.checklists).forEach(function (r) {
+      if (str_(r[0]) === list && str_(r[2]) && checklistPhoto_(r[4]) && checklistActive_(r[5])) {
+        required.add(str_(r[2]));
+      }
+    });
+
+    const sh = sheets.marks;
+    const existing = checklistExisting_(sh, runId);
+    let saved = 0;
+    let duplicates = 0;
+    const noPhoto = [];
+
+    clean.forEach(function (it) {
+      if (existing.has(it.text)) { duplicates++; return; }
+
+      let file = null;
+      let photoNote = '';
+      if (it.checked && it.photo) {
+        const res = saveChecklistPhoto_(it.photo, employee, list, it.text, runId, created);
+        if (res.file) file = res.file;
+        else photoNote = 'фото не сохранено: ' + res.error;
+      }
+      if (it.checked && required.has(it.text) && !file) {
+        noPhoto.push(it.text);
+        if (!photoNote) photoNote = 'нет фото (обязательно)';
+      }
+
+      const notes = [];
+      if (photoNote) notes.push(photoNote);
+      if (it.comment) notes.push(it.comment);
+
+      // Дата | время | сотрудник | список | прогон_id | пункт | отмечено | комментарий | фото
+      const row = addRow_(sh, [
+        created,
+        text_(timeText, 10),
+        text_(employee, 80),
+        text_(list, 80),
+        text_(runId, 64),
+        text_(it.text, CHECKLIST_MAX_TEXT),
+        it.checked ? 'да' : 'нет',
+        text_(notes.join('. '), CHECKLIST_MAX_COMMENT),
+        file ? text_(file.getName(), 200) : '',
+      ]);
+      if (file) {
+        sh.getRange(row, 9).setRichTextValue(
+          SpreadsheetApp.newRichTextValue().setText(file.getName()).setLinkUrl(file.getUrl()).build());
+      }
+      saved++;
+    });
+
+    SpreadsheetApp.flush();
+    if (saved) {
+      log_('Чек-листы', 'Прогон ' + runId + ' · ' + list + ' · ' + employee + ': записано ' + saved +
+        (duplicates ? ', уже было ' + duplicates : '') + (noPhoto.length ? ', без фото: ' + noPhoto.length : ''));
+    }
+    return {
+      ok: true,
+      id: id,
+      runId: runId,
+      saved: saved,
+      duplicates: duplicates,
+      duplicate: saved === 0 && duplicates > 0,
+      noPhoto: noPhoto,
+      results: [{ id: id, status: saved > 0 ? 'saved' : 'duplicate' }],
+    };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+/* =====================================================================
  *  ВХОД ПО PIN
  * ===================================================================== */
 
@@ -1068,7 +1522,7 @@ function setup() {
   // Листы дуэли и рейтинга создаются сами при первой дуэли (ensureDuelSheets_),
   // «Сроки хранения» — при первом чтении справочника (ensureShelfLifeSheet_).
   const auto = ['refs', 'questions', 'disputes', 'duels', 'ratings', 'quizTries',
-    'characters', 'itemCatalog', 'inventory', 'shelfLife', 'facts'];
+    'characters', 'itemCatalog', 'inventory', 'shelfLife', 'facts', 'checklists', 'checklistMarks'];
   const missing = Object.keys(SHEETS).filter(k => auto.indexOf(k) === -1)
     .map(k => SHEETS[k]).filter(n => !ss.getSheetByName(n));
   if (missing.length) throw new Error('В таблице нет листов: ' + missing.join(', '));

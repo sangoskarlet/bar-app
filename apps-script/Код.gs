@@ -86,6 +86,8 @@ function doGet(e) {
     const action = (e && e.parameter && e.parameter.action) || '';
     if (action === 'config') return json_(getConfig_());
     if (action === 'ttkPhoto') return json_(getTtkPhoto_(e.parameter.id));
+    if (action === 'photoVerdict') return json_(getPhotoVerdict_(e.parameter.id));
+    if (action === 'photos') return json_(getPhotoHistory_(e.parameter.limit));
     if (action === 'openActs') return json_({ ok: true, acts: openActs_(ss_()) });
     if (action === 'questions') return json_(getQuestions_());
     if (action === 'duelState') return json_(duelState_(e.parameter.duelId, e.parameter.employee));
@@ -1224,8 +1226,17 @@ function saveOne_(ss, staff, authMemo, rec) {
   if (type === 'inventory') return saveInventory_(ss, sheet, auth, rec, id, created, received, comment);
   if (type === 'processing') return saveProcessing_(ss, sheet, auth, rec, id, created, received, comment);
 
-  // type === 'photo'
-  const zone = text_(rec.zone, 120);
+  if (type === 'photo') return savePhoto_(ss, sheet, auth, rec, id, created, received, comment);
+}
+
+/**
+ * ФОТО УБОРКИ. Сначала файл на Диске и строка в листе — потом проверка.
+ * Даже если Gemini ответил ошибкой, запись остаётся, а в лист пишется
+ * «не проверено» и причина. Проверка не блокирует сохранение.
+ */
+function savePhoto_(ss, sheet, auth, rec, id, created, received, comment) {
+  const zonePlain = str_(rec.zone).slice(0, 120);
+  const zone = text_(zonePlain, 120);
   if (!zone) return { id, status: 'error', error: 'Не указана зона' };
   const m = /^data:(image\/(jpeg|png|webp));base64,(.+)$/.exec(String(rec.image || ''));
   if (!m) return { id, status: 'error', error: 'Нет фото или неверный формат' };
@@ -1235,18 +1246,31 @@ function saveOne_(ss, staff, authMemo, rec) {
   const folder = photoFolderFor_(created);
   const ext = m[2] === 'png' ? 'png' : m[2] === 'webp' ? 'webp' : 'jpg';
   const fileName = Utilities.formatDate(created, 'Europe/Moscow', 'yyyy-MM-dd_HH-mm') +
-    '_' + auth.name + '_' + str_(rec.zone).replace(/[\\/:*?"<>|']/g, '') + '_' + id.slice(0, 6) + '.' + ext;
+    '_' + auth.name + '_' + zonePlain.replace(/[\\/:*?"<>|']/g, '') + '_' + id.slice(0, 6) + '.' + ext;
   const file = folder.createFile(Utilities.newBlob(bytes, m[1], fileName));
 
   // Дата | Сотрудник | Зона | Фото | Комментарий | Получено | ID |
   // Проверка ИИ | Что не так | Замечание менеджера | Фото удалено | ID файла
-  // (H–K заполняет проверка ИИ и автоудаление, L — служебный: какой файл на Диске)
+  // M–R — структурированный вердикт (создаются при первом фото / setupPhotoCheck)
   const photoRow = addRow_(sheet, [created, auth.name, zone, 'Открыть фото', comment, received, "'" + id,
     '', '', '', '', "'" + file.getId()]);
   // Делаем текст «Открыть фото» ссылкой на файл (без формулы — так не зависит от языка таблицы)
   sheet.getRange(photoRow, 4).setRichTextValue(
     SpreadsheetApp.newRichTextValue().setText('Открыть фото').setLinkUrl(file.getUrl()).build());
-  return { id, status: 'saved', fileId: file.getId() };
+
+  // Сначала фото и строка уже сохранены — дальше проверка. Любая её ошибка
+  // не отменяет запись: вердикт будет «не проверено» с причиной.
+  let ref = null;
+  try { ref = photoRefFor_(photoRefs_(ss), zonePlain); } catch (e) { log_('Проверка фото', 'эталоны не прочитаны: ' + e); }
+  let verdict;
+  try {
+    verdict = checkPhoto_(zonePlain, Utilities.newBlob(bytes, m[1], fileName), ref, file.getId());
+  } catch (e) {
+    log_('Проверка фото', 'неожиданная ошибка: ' + e);
+    verdict = photoUnchecked_(String(e && e.message || e), ref);
+  }
+  writePhotoVerdict_(sheet, photoRow, verdict);
+  return { id, status: 'saved', fileId: file.getId(), zone: zonePlain, verdict: photoPublic_(verdict) };
 }
 
 /**
@@ -1772,179 +1796,557 @@ function log_(event, details) {
 
 
 /* =====================================================================
- *  ПРОВЕРКА ФОТО УБОРКИ ИСКУССТВЕННЫМ ИНТЕЛЛЕКТОМ (Gemini)
+ *  ПРОВЕРКА ФОТО УБОРКИ (Gemini) — синхронная, при загрузке фото
  *
  *  Как работает:
- *    1. Бармен отправляет фото — оно сразу ложится в таблицу (как раньше).
- *    2. Раз в 10 минут срабатывает checkPhotos: берёт непроверенные фото,
- *       отправляет в Gemini вместе с эталоном зоны и пишет в таблицу:
- *         H «Проверка ИИ»:  ✅ Чисто / ⚠ Замечания / ⚠ Плохое фото
+ *    1. Бармен отправляет фото — файл сразу ложится на Диск, строка —
+ *       в лист «Фото уборки». Это происходит ДО проверки: даже если
+ *       Gemini недоступен, фото и запись уже сохранены.
+ *    2. Сразу после записи сервер отправляет фото в Gemini и пишет вердикт:
+ *         H «Проверка ИИ»:  ✅ Чисто / ⚠ Замечания / ⛔ Критично / ❓ …
  *         I «Что не так»:   коротко, по-русски
- *    3. Раз в сутки (ночью) срабатывает cleanupPhotos: фото старше 30 дней
- *       уходят в корзину Диска, но ТОЛЬКО если ИИ сказал «✅ Чисто»
- *       и в столбце J «Замечание менеджера» пусто.
- *       Фото с замечаниями хранятся, пока вы сами их не удалите.
+ *         M «вердикт»:      ok / warn / crit / unclear / не проверено
+ *         N «уверенность»:  0…1
+ *         O «замечания»:    «crit: …; warn: …»
+ *         P «модель»:       например gemini-flash-lite-latest
+ *         Q «проверено_в»:  дата и время проверки
+ *         R «эталон»:       ссылка на эталон или «нет»
+ *    3. Триггеров нет: 5 фото в день проверяются за секунды. Расписание
+ *       и автоудаление старых фото больше не используются — фото остаются
+ *       доказательством для разбора.
  *
  *  Настройка (один раз):
- *    а) Получить ключ: aistudio.google.com → Get API key → Create API key.
- *    б) В редакторе Apps Script: ⚙ Настройки проекта → Свойства скрипта →
- *       Добавить свойство: GEMINI_API_KEY = ваш ключ.
- *    в) Выбрать функцию setupPhotoCheck и нажать «Выполнить».
+ *    а) ⚙ Настройки проекта → Свойства скрипта → GEMINI_API_KEY = ключ.
+ *    б) Выбрать функцию setupPhotoCheck и нажать «Выполнить» — она только
+ *       добавляет колонки M–R и проверяет, что ключ на месте.
  *
- *  Эталоны: лист «Эталоны уборки» — Зона | Что проверять | Эталонное фото
- *  (ссылка на фото на Google Диске). Если эталона нет — ИИ проверяет по описанию.
+ *  Эталоны: лист «Эталоны уборки» — Зона | Что проверять | Эталонное фото.
+ *  Колонка C пустая — проверяем по тексту критериев. Когда владелец
+ *  положит туда ссылку на фото, сервер отправит два изображения и попросит
+ *  сравнить состав и захламлённость, а не пиксели. Код менять не нужно.
+ *
+ *  Ответ модели — строго JSON:
+ *    {"verdict":"ok|warn|crit|unclear","confidence":0…1,
+ *     "items":[{"criterion":"…","level":"ok|warn|crit|unclear","comment":"…"}]}
+ *  Итог считает СЕРВЕР, а не модель: любой crit → crit; иначе warn → warn;
+ *  иначе ok. confidence < 0.5 → unclear. Невалидный JSON → unclear.
+ *  Ошибка API → «не проверено» + причина; запись всё равно сохраняется.
  * ===================================================================== */
 
 const PHOTO_COL = { status: 8, issues: 9, manager: 10, deleted: 11, fileId: 12 }; // H, I, J, K, L
-const PHOTO_KEEP_DAYS = 30;            // через сколько дней удалять «чистые» фото
-const CHECK_BATCH = 8;                 // сколько фото проверять за один запуск
-const GEMINI_MODELS = ['gemini-flash-latest', 'gemini-2.5-flash']; // первая рабочая модель из списка
+const PHOTO_EXTRA_HEADERS = ['вердикт', 'уверенность', 'замечания', 'модель', 'проверено_в', 'эталон'];
+const PHOTO_EXTRA_KEYS = ['verdict', 'confidence', 'notes', 'model', 'checkedAt', 'reference'];
+const PHOTO_CONFIDENCE_MIN = 0.5;      // ниже — общий вердикт unclear
+const PHOTO_MAX_ITEMS = 30;            // больше пунктов от модели не принимаем
+const PHOTO_GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta';
+// Первая — рабочая (проверена 22.11.2026, 200 и 0,8 с на картинку).
+// Остальные — запас: 22.11.2026 отдавали 503 «высокая нагрузка», но могут ожить.
+const GEMINI_MODELS = ['gemini-flash-lite-latest', 'gemini-3.8-flash', 'gemini-3.1-flash-lite'];
+const PHOTO_STATUS = {
+  ok: '✅ Чисто', warn: '⚠ Замечания', crit: '⛔ Критично',
+  unclear: '❓ Непонятно', unchecked: '❓ Не проверено',
+};
+const PHOTO_GENERIC_CRITERIA = [
+  'Нет мусора и грязной посуды',
+  'Нет пятен и луж',
+  'Нет лишних вещей и неубранного инструмента',
+  'Поверхности сухие и протёртые',
+];
 
-/** Запустить один раз: ставит расписание (проверка каждые 10 минут, чистка каждую ночь). */
+/**
+ * Запустить один раз вручную: добавляет колонки вердикта M–R и проверяет ключ.
+ * Ничего не проверяет и не ставит триггеров — проверка идёт при загрузке фото.
+ */
 function setupPhotoCheck() {
-  if (!PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY')) {
-    throw new Error('Сначала добавьте свойство GEMINI_API_KEY: ⚙ Настройки проекта → Свойства скрипта');
-  }
-  ScriptApp.getProjectTriggers()
-    .filter(t => ['checkPhotos', 'cleanupPhotos'].indexOf(t.getHandlerFunction()) >= 0)
-    .forEach(t => ScriptApp.deleteTrigger(t));
-  ScriptApp.newTrigger('checkPhotos').timeBased().everyMinutes(10).create();
-  ScriptApp.newTrigger('cleanupPhotos').timeBased().atHour(5).everyDays(1).inTimezone('Europe/Moscow').create();
-  const test = checkPhotos(); // сразу проверяем, что ключ работает
-  log_('Проверка фото', 'Включена. ' + test);
-  Logger.log('Готово: проверка каждые 10 минут, чистка каждую ночь в 5:00. ' + test);
-}
-
-/** Проверяет до CHECK_BATCH новых фото. Вызывается по расписанию. */
-function checkPhotos() {
   const ss = ss_();
   const sheet = ss.getSheetByName(SHEETS.photos);
-  if (!sheet || sheet.getLastRow() < 2) return 'Нет фото для проверки';
-  const key = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
-  if (!key) return 'Нет ключа GEMINI_API_KEY';
+  if (!sheet) throw new Error('Нет листа «' + SHEETS.photos + '»');
 
-  const refs = photoRefs_(ss);
-  const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, PHOTO_COL.fileId).getValues();
-  let done = 0;
-  for (let i = 0; i < data.length && done < CHECK_BATCH; i++) {
-    const r = data[i];
-    const fileId = str_(r[PHOTO_COL.fileId - 1]);
-    if (!fileId || str_(r[PHOTO_COL.status - 1]) || str_(r[PHOTO_COL.deleted - 1])) continue;
-    const row = i + 2;
-    let res;
-    try {
-      res = geminiCheck_(key, str_(r[2]), refs[str_(r[2]).toLowerCase()], DriveApp.getFileById(fileId).getBlob());
-    } catch (e) {
-      const msg = String(e && e.message || e);
-      if (/429|quota|RESOURCE_EXHAUSTED/i.test(msg)) { log_('Проверка фото', 'Лимит Gemini, продолжу позже'); break; }
-      res = { status: '❓ Не проверено', issues: msg.slice(0, 200) };
-    }
-    sheet.getRange(row, PHOTO_COL.status, 1, 2).setValues([[res.status, res.issues ? "'" + res.issues : '']]);
-    done++;
-  }
-  return 'Проверено фото: ' + done;
+  const cols = ensurePhotoColumns_(sheet);
+  // Единый формат времени проверки для уже существующих строк (и новых).
+  sheet.getRange(2, cols.checkedAt, Math.max(sheet.getMaxRows() - 1, 1), 1)
+    .setNumberFormat('dd.MM.yyyy HH:mm');
+  const key = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+  const where = PHOTO_EXTRA_KEYS.map(k => k + '=' + columnLetter_(cols[k])).join(', ');
+  const msg = 'Колонки проверки фото: ' + where + '. Ключ Gemini: ' + (key ? 'есть' : 'НЕТ') +
+    '. Проверка идёт при загрузке фото, триггеры не нужны.';
+  log_('Проверка фото', msg);
+  Logger.log(msg);
+  return msg;
 }
 
-/** Эталоны: { 'бар 1 этаж': { what: 'что проверять', fileId } } */
+/** Буква столбца по номеру: 13 → M. */
+function columnLetter_(n) {
+  let s = '';
+  while (n > 0) {
+    const r = (n - 1) % 26;
+    s = String.fromCharCode(65 + r) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
+/**
+ * Карта столбцов листа «Фото уборки». Старые H–L фиксированы, новые
+ * M–R ищутся по названию в шапке; если create — дописываются в конец.
+ * Так повторный запуск не создаёт вторые «вердикт» и «замечания».
+ */
+function photoColumnMap_(sheet, create) {
+  const minWidth = Math.max(sheet.getLastColumn(), PHOTO_COL.fileId);
+  const headers = sheet.getRange(1, 1, 1, minWidth).getValues()[0].map(v => str_(v).toLowerCase());
+  const cols = {
+    status: PHOTO_COL.status, issues: PHOTO_COL.issues, manager: PHOTO_COL.manager,
+    deleted: PHOTO_COL.deleted, fileId: PHOTO_COL.fileId,
+  };
+  let width = minWidth;
+  PHOTO_EXTRA_HEADERS.forEach((name, i) => {
+    let idx = headers.indexOf(name.toLowerCase());
+    if (idx < 0 && create) {
+      idx = width;
+      width++;
+      sheet.getRange(1, idx + 1).setValue(name).setFontWeight('bold');
+      headers.push(name.toLowerCase());
+      log_('Проверка фото', 'Добавлена колонка ' + columnLetter_(idx + 1) + ' «' + name + '»');
+    }
+    if (idx >= 0) cols[PHOTO_EXTRA_KEYS[i]] = idx + 1;
+  });
+  return cols;
+}
+
+/** Создаёт недостающие колонки M–R и возвращает их номера. */
+function ensurePhotoColumns_(sheet) {
+  const cols = photoColumnMap_(sheet, true);
+  const missing = PHOTO_EXTRA_KEYS.filter(k => !cols[k]);
+  if (missing.length) throw new Error('Не удалось создать колонки: ' + missing.join(', '));
+  return cols;
+}
+
+/** Эталоны: { 'бар 1 этаж': { what: 'что проверять', fileId, url } } */
 function photoRefs_(ss) {
   const out = {};
   if (!ss.getSheetByName(SHEETS.refs)) return out;
   rows_(ss, SHEETS.refs).forEach(r => {
     const zone = str_(r[0]);
-    if (zone) out[zone.toLowerCase()] = { what: str_(r[1]), fileId: driveId_(r[2]) };
+    if (!zone) return;
+    out[photoZoneKey_(zone)] = { what: str_(r[1]), fileId: driveId_(r[2]), url: str_(r[2]) };
   });
   return out;
 }
 
-/** Один запрос к Gemini: эталон (если есть) + проверяемое фото → вердикт. */
-function geminiCheck_(key, zone, ref, blob) {
-  const parts = [{ text:
-    'Ты проверяешь фото уборки бара в джаз-клубе. Зона: «' + zone + '».\n' +
-    (ref && ref.what ? 'Что должно быть: ' + ref.what + '\n' : '') +
-    (ref && ref.fileId
-      ? 'Первое фото — эталон (как выглядит идеально убранная зона). Второе — фото после уборки, его и оцени.\n'
-      : 'Оцени фото после уборки.\n') +
-    'Ищи: грязную посуду, бутылки и стаканы не на местах, мусор, пятна и лужи, грязные тряпки, ' +
-    'неубранные продукты, открытые ёмкости. Не придирайся к освещению, ракурсу и мелким бликам.\n' +
-    'photo_ok = false, если зону не видно: слишком темно, размыто, снято не то или кадр слишком узкий.\n' +
-    'clean = true, только если убрано. issues — коротко по-русски, что не так и где (до 25 слов), ' +
-    'пустая строка, если всё в порядке.' }];
+function photoZoneKey_(zone) {
+  return str_(zone).toLowerCase().replace(/\s+/g, ' ');
+}
+
+function photoRefFor_(refs, zone) {
+  return (refs && refs[photoZoneKey_(zone)]) || null;
+}
+
+/**
+ * Критерии зоны из «Эталонов уборки»: абзац режем на предложения.
+ * Модель получает готовый список пунктов, а не общий текст «ищи грязь».
+ */
+function splitPhotoCriteria_(what) {
+  const s = str_(what);
+  if (!s) return [];
+  return s.split(/;\s*|[.!?]\s+/).map(x => str_(x)).filter(Boolean).slice(0, 12);
+}
+
+/** Промпт: критерии зоны + жёсткие правила + схема ответа. */
+function buildPhotoPrompt_(zone, criteria, hasRef) {
+  const list = criteria && criteria.length ? criteria : PHOTO_GENERIC_CRITERIA;
+  const lines = [
+    'Ты проверяешь фото уборки бара в джаз-клубе. Зона: «' + str_(zone) + '».',
+    hasRef
+      ? 'На изображении 1 — эталон: как выглядит убранная зона. На изображении 2 — фото после уборки. Оценивай ТОЛЬКО изображение 2.'
+      : 'На изображении — фото зоны после уборки.',
+    hasRef
+      ? 'Эталон — образец, а не шаблон для попиксельного сравнения: сравнивай состав и захламлённость, а не совпадение пикселей. Различия в свете, ракурсе, фоне, тенях и бликах нарушением не считай.'
+      : '',
+    'Что проверять (критерии зоны):',
+  ];
+  list.forEach((c, i) => lines.push((i + 1) + ') ' + c));
+  lines.push(
+    '',
+    'Правила:',
+    '1. Смотри только на то, что видно на фото. Если пункта не видно — не додумывай, ставь этому пункту level "unclear".',
+    '2. Если фото тёмное, размытое или снято не то — тоже "unclear" для пункта, а не "crit".',
+    '3. Не описывай и не оценивай людей на фото. Если человек попал в кадр — не делай выводов о нём и не упоминай его; оценивай только зону и предметы.',
+    '4. Нарушение — это грязь, мусор, еда, грязная посуда, открытые продукты, лишние вещи, неубранный инструмент.',
+    '5. Для каждого нарушения укажи, где оно: «слева на стойке», «под решёткой», «у дальнего края». Без «где» нарушение не считается.',
+    '6. level: "crit" — грязь, еда или мусор рядом с продуктами, грязная посуда, лужи на рабочей поверхности; "warn" — порядок и эстетика (пустая тара, чеки, личные вещи, коврик, коробки); "ok" — чисто; "unclear" — не видно или не уверен.',
+    '7. Верни ТОЛЬКО JSON, без текста вокруг и без markdown, по схеме:',
+    '{"verdict":"ok|warn|crit|unclear","confidence":0.0,"items":[{"criterion":"пункт","level":"ok|warn|crit|unclear","comment":"что видно и где"}]}',
+    '8. confidence — число от 0 до 1, насколько уверен в оценке. Если не уверен — ниже.',
+    '9. verdict — общий итог; сервер всё равно пересчитает его по пунктам.',
+  );
+  return lines.join('\n');
+}
+
+/**
+ * Один запрос к Gemini (с эталоном, если он задан) и разбор ответа.
+ * Возвращает {model, items, confidence} или {invalid:true, reason, model}.
+ * Бросает ошибку только при сетевой/HTTP-ошибке — её ловит checkPhoto_.
+ */
+function geminiPhotoCheck_(key, zone, ref, blob, fileId) {
+  const criteria = splitPhotoCriteria_(ref && ref.what);
+  const imageParts = [];
+  let refUsed = false;
   if (ref && ref.fileId) {
     try {
       const rb = DriveApp.getFileById(ref.fileId).getBlob();
-      parts.push({ inline_data: { mime_type: rb.getContentType(), data: Utilities.base64Encode(rb.getBytes()) } });
-    } catch (e) { /* эталон не открылся — проверяем без него */ }
+      imageParts.push({ inline_data: { mime_type: rb.getContentType(), data: Utilities.base64Encode(rb.getBytes()) } });
+      refUsed = true;
+    } catch (e) {
+      log_('Проверка фото', 'эталон не открылся: ' + e);
+    }
   }
-  parts.push({ inline_data: { mime_type: blob.getContentType(), data: Utilities.base64Encode(blob.getBytes()) } });
+  imageParts.push({ inline_data: { mime_type: blob.getContentType(), data: Utilities.base64Encode(blob.getBytes()) } });
 
-  const payload = {
-    contents: [{ parts }],
-    generationConfig: {
-      temperature: 0,
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: 'OBJECT',
-        properties: { photo_ok: { type: 'BOOLEAN' }, clean: { type: 'BOOLEAN' }, issues: { type: 'STRING' } },
-        required: ['photo_ok', 'clean', 'issues'],
+  const prompt = buildPhotoPrompt_(zone, criteria, refUsed);
+  const requestParts = [{ text: prompt }].concat(imageParts);
+  const generationConfig = {
+    temperature: 0,
+    responseMimeType: 'application/json',
+    responseSchema: {
+      type: 'OBJECT',
+      properties: {
+        verdict: { type: 'STRING', enum: ['ok', 'warn', 'crit', 'unclear'] },
+        confidence: { type: 'NUMBER' },
+        items: {
+          type: 'ARRAY',
+          items: {
+            type: 'OBJECT',
+            properties: {
+              criterion: { type: 'STRING' },
+              level: { type: 'STRING', enum: ['ok', 'warn', 'crit', 'unclear'] },
+              comment: { type: 'STRING' },
+            },
+            required: ['criterion', 'level', 'comment'],
+          },
+        },
       },
+      required: ['verdict', 'confidence', 'items'],
     },
   };
 
-  // Сначала пробуем модель, которая сработала в прошлый раз (её можно задать и вручную: свойство GEMINI_MODEL)
+  // Сначала модель, которая сработала в прошлый раз (можно задать GEMINI_MODEL),
+  // затем рабочий запас из GEMINI_MODELS.
   const props = PropertiesService.getScriptProperties();
-  const saved = props.getProperty('GEMINI_MODEL');
-  const models = saved ? [saved].concat(GEMINI_MODELS.filter(m => m !== saved)) : GEMINI_MODELS;
+  const saved = str_(props.getProperty('GEMINI_MODEL'));
+  const models = (saved ? [saved] : []).concat(GEMINI_MODELS.filter(m => m !== saved));
+
+  let answer;
+  try {
+    answer = runGeminiModels_(models, key, requestParts, generationConfig);
+  } catch (e) {
+    // UrlFetchApp не даёт задать таймаут. Если запрос не уложился — повторяем
+    // с превью Диска (~512 px по длинной стороне), как просит задача.
+    if (e && e.photoRetry && fileId) {
+      let thumb = null;
+      try { thumb = DriveApp.getFileById(fileId).getThumbnail(); } catch (e2) { thumb = null; }
+      const thumbBytes = thumb ? thumb.getBytes() : null;
+      if (!thumbBytes || !thumbBytes.length) throw e;
+      const smaller = requestParts.slice();
+      smaller[smaller.length - 1] = {
+        inline_data: {
+          mime_type: thumb.getContentType() || 'image/jpeg',
+          data: Utilities.base64Encode(thumbBytes),
+        },
+      };
+      log_('Проверка фото', 'Gemini не ответил вовремя — повтор с уменьшенным фото');
+      answer = runGeminiModels_(models, key, smaller, generationConfig);
+    } else {
+      throw e;
+    }
+  }
+
+  if (saved !== answer.model) props.setProperty('GEMINI_MODEL', answer.model);
+  const v = validatePhotoAnswer_(answer.text, criteria);
+  if (!v.ok) return { invalid: true, reason: v.reason, model: answer.model };
+  return { model: answer.model, items: v.items, confidence: v.confidence };
+}
+
+/** Перебор моделей: 404/500/503 — следующая, 429 — сразу ошибка квоты. */
+function runGeminiModels_(models, key, parts, generationConfig) {
   let lastErr = '';
   for (const model of models) {
-    const resp = UrlFetchApp.fetch(
-      'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent',
-      { method: 'post', contentType: 'application/json', headers: { 'x-goog-api-key': key },
-        payload: JSON.stringify(payload), muteHttpExceptions: true });
+    const resp = geminiRequest_(model, key, { contents: [{ parts: parts }], generationConfig: generationConfig });
     const code = resp.getResponseCode();
     const body = resp.getContentText();
-    if (code === 404) { lastErr = 'модель ' + model + ' не найдена'; continue; } // пробуем следующую
+    if (code === 404 || code === 500 || code === 503) {
+      lastErr = 'модель ' + model + ': HTTP ' + code + ' ' + body.slice(0, 120);
+      continue;
+    }
     if (code === 429) throw new Error('429 квота Gemini');
-    if (code !== 200) throw new Error('Gemini ' + code + ': ' + body.slice(0, 150));
-    const j = JSON.parse(body);
-    const text = j.candidates && j.candidates[0] && j.candidates[0].content &&
-      j.candidates[0].content.parts.map(p => p.text || '').join('');
-    if (!text) throw new Error('Gemini не ответил (возможно, фото заблокировано фильтром)');
-    if (saved !== model) props.setProperty('GEMINI_MODEL', model);
-    const v = JSON.parse(text);
-    const issues = str_(v.issues).slice(0, 300);
-    if (!v.photo_ok) return { status: '⚠ Плохое фото', issues: issues || 'Зону не видно — переснять' };
-    return v.clean ? { status: '✅ Чисто', issues } : { status: '⚠ Замечания', issues: issues || 'ИИ нашёл беспорядок' };
+    if (code !== 200) throw new Error('Gemini HTTP ' + code + ': ' + body.slice(0, 150));
+    return { model: model, text: parseGeminiAnswer_(resp) };
   }
   throw new Error(lastErr || 'Нет доступной модели Gemini');
 }
 
-/**
- * Автоудаление: фото старше 30 дней → в корзину Диска (там ещё 30 дней можно восстановить).
- * Удаляем ТОЛЬКО если «✅ Чисто» и нет замечания менеджера. Строка в таблице остаётся.
- */
-function cleanupPhotos() {
-  const sheet = ss_().getSheetByName(SHEETS.photos);
-  if (!sheet || sheet.getLastRow() < 2) return 0;
-  const border = Date.now() - PHOTO_KEEP_DAYS * 24 * 3600e3;
-  const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, PHOTO_COL.fileId).getValues();
-  let removed = 0;
-  data.forEach((r, i) => {
-    const date = r[0] instanceof Date ? r[0] : new Date(r[0]);
-    if (isNaN(date.getTime()) || date.getTime() > border) return;
-    if (str_(r[PHOTO_COL.status - 1]) !== '✅ Чисто') return;      // есть замечания или не проверено
-    if (str_(r[PHOTO_COL.manager - 1])) return;                     // менеджер оставил замечание
-    if (str_(r[PHOTO_COL.deleted - 1])) return;                     // уже удалено
-    const fileId = str_(r[PHOTO_COL.fileId - 1]);
-    if (!fileId) return;
-    const row = i + 2;
-    try { DriveApp.getFileById(fileId).setTrashed(true); } catch (e) { /* файла уже нет */ }
-    sheet.getRange(row, 4).setValue('фото удалено');
-    sheet.getRange(row, PHOTO_COL.deleted).setValue(new Date());
-    removed++;
-  });
-  if (removed) log_('Чистка фото', 'В корзину: ' + removed);
-  return removed;
+function geminiRequest_(model, key, payload) {
+  try {
+    return UrlFetchApp.fetch(PHOTO_GEMINI_BASE + '/models/' + model + ':generateContent', {
+      method: 'post',
+      contentType: 'application/json',
+      headers: { 'x-goog-api-key': key },
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true,
+    });
+  } catch (e) {
+    const err = new Error('Gemini не ответил: ' + e);
+    err.photoRetry = true; // сеть/таймаут — можно попробовать превью
+    throw err;
+  }
 }
+
+function parseGeminiAnswer_(resp) {
+  let j;
+  try { j = JSON.parse(resp.getContentText()); } catch (e) { throw new Error('Gemini вернул не JSON'); }
+  const cand = j.candidates && j.candidates[0];
+  if (!cand) {
+    const why = j.promptFeedback ? ' ' + JSON.stringify(j.promptFeedback).slice(0, 120) : '';
+    throw new Error('Gemini не вернул ответ' + why);
+  }
+  const text = ((cand.content && cand.content.parts) || []).map(p => p.text || '').join('').trim();
+  if (!text) throw new Error('Gemini вернул пустой ответ');
+  return text;
+}
+
+/** Убирает markdown-обёртку и берёт первый JSON-объект из ответа. */
+function photoJsonText_(text) {
+  let s = str_(text);
+  s = s.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+  const a = s.indexOf('{');
+  const b = s.lastIndexOf('}');
+  return a >= 0 && b > a ? s.slice(a, b + 1) : s;
+}
+
+/**
+ * Проверка ответа модели. Невалидный JSON/схема — {ok:false}, а не исключение:
+ * вызывающая сторона превратит это в вердикт unclear.
+ */
+function validatePhotoAnswer_(text, criteria) {
+  let obj;
+  try { obj = JSON.parse(photoJsonText_(text)); } catch (e) { return { ok: false, reason: 'ответ не JSON' }; }
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return { ok: false, reason: 'ответ не объект' };
+  const conf = Number(obj.confidence);
+  if (!isFinite(conf) || conf < 0 || conf > 1) return { ok: false, reason: 'confidence вне 0…1' };
+  const rawItems = Array.isArray(obj.items) ? obj.items.slice(0, PHOTO_MAX_ITEMS) : [];
+  if (!rawItems.length) return { ok: false, reason: 'нет пунктов items' };
+  const items = rawItems.map((it, i) => ({
+    criterion: str_(it && it.criterion).slice(0, 200) || (criteria && criteria[i]) || ('пункт ' + (i + 1)),
+    level: normalizePhotoLevel_(it && it.level),
+    comment: str_(it && it.comment).slice(0, 300),
+  }));
+  return { ok: true, confidence: conf, items: items };
+}
+
+function normalizePhotoLevel_(v) {
+  const s = str_(v).toLowerCase();
+  if (s === 'ok' || s === 'warn' || s === 'crit' || s === 'unclear' || s === 'na') return s;
+  if (s === 'чисто' || s === 'норма') return 'ok';
+  if (s === 'замечание' || s === 'внимание') return 'warn';
+  if (s === 'критично' || s === 'критический') return 'crit';
+  return 'unclear';
+}
+
+/**
+ * Правила вердикта — на сервере, не в модели:
+ * любой crit → crit; иначе warn → warn; иначе ok.
+ * confidence < 0.5 → unclear. Если ни один пункт не виден — тоже unclear.
+ */
+function photoVerdictLevel_(items, confidence) {
+  const conf = Number(confidence);
+  if (!isFinite(conf) || conf < PHOTO_CONFIDENCE_MIN) return 'unclear';
+  const levels = (items || []).map(i => i.level);
+  if (levels.indexOf('crit') >= 0) return 'crit';
+  if (levels.indexOf('warn') >= 0) return 'warn';
+  if (levels.indexOf('ok') >= 0) return 'ok';
+  return 'unclear';
+}
+
+/** «crit: грязная посуда на стойке; warn: пустая бутылка у края» */
+function photoNotes_(items, level) {
+  const bad = (items || []).filter(i => i.level === 'crit' || i.level === 'warn');
+  if (bad.length) {
+    return bad.map(i => i.level + ': ' + (str_(i.comment) || str_(i.criterion))).join('; ').slice(0, 1000);
+  }
+  // Если общий вердикт unclear — показываем, чего именно не видно.
+  if (level === 'unclear') {
+    const u = (items || []).filter(i => i.level === 'unclear' || i.level === 'na')[0];
+    if (u) return ('unclear: ' + (str_(u.comment) || str_(u.criterion))).slice(0, 500);
+    return 'unclear: модель не увидела критерии зоны';
+  }
+  return '';
+}
+
+/** Вердикт по уже прочитанному ответу модели (отдельно — чтобы тестировать без сети). */
+function photoFromGeminiResult_(res, ref) {
+  if (!res) return photoUnchecked_('пустой ответ Gemini', ref);
+  if (res.invalid) {
+    return {
+      level: 'unclear', confidence: '', items: [],
+      notes: 'ответ модели не разобран: ' + res.reason,
+      model: res.model || '', reference: ref && ref.url ? ref.url : 'нет',
+      checkedAt: new Date(), error: '',
+    };
+  }
+  const level = photoVerdictLevel_(res.items, res.confidence);
+  return {
+    level: level,
+    confidence: res.confidence,
+    items: res.items,
+    notes: photoNotes_(res.items, level),
+    model: res.model || '',
+    reference: ref && ref.url ? ref.url : 'нет',
+    checkedAt: new Date(),
+    error: '',
+  };
+}
+
+/** Точка входа: никогда не бросает — иначе фото потеряется из-за проверки. */
+function checkPhoto_(zone, blob, ref, fileId) {
+  const key = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+  if (!key) return photoUnchecked_('не задан ключ GEMINI_API_KEY', ref);
+  try {
+    const res = geminiPhotoCheck_(key, zone, ref, blob, fileId);
+    return photoFromGeminiResult_(res, ref);
+  } catch (e) {
+    const msg = String(e && e.message || e);
+    log_('Проверка фото', 'Gemini: ' + msg.slice(0, 300));
+    return photoUnchecked_(msg, ref);
+  }
+}
+
+function photoUnchecked_(reason, ref) {
+  const msg = str_(reason).slice(0, 300) || 'неизвестная ошибка';
+  return {
+    level: 'unchecked', confidence: '', items: [],
+    notes: 'причина: ' + msg, model: '',
+    reference: ref && ref.url ? ref.url : 'нет',
+    checkedAt: new Date(), error: msg,
+  };
+}
+
+/** Что отдать телефону: без лишних деталей, но с пунктами для карточки. */
+function photoPublic_(v) {
+  const unchecked = v.level === 'unchecked';
+  return {
+    level: unchecked ? 'unclear' : v.level,
+    verdict: unchecked ? 'не проверено' : v.level,
+    confidence: v.confidence === '' || v.confidence === null || v.confidence === undefined ? null : v.confidence,
+    notes: v.notes || '',
+    issues: v.notes || '',
+    items: v.items || [],
+    model: v.model || '',
+    checkedAt: v.checkedAt instanceof Date ? v.checkedAt.toISOString() : '',
+    reference: v.reference || '',
+    error: v.error || '',
+  };
+}
+
+/**
+ * Запись вердикта в строку листа. Старые H/I заполняем человеческим текстом,
+ * новые M–R — машинными полями. Ошибка записи не отменяет сохранение фото.
+ */
+function writePhotoVerdict_(sheet, row, v) {
+  try {
+    const cols = ensurePhotoColumns_(sheet);
+    const checkedAt = v.checkedAt instanceof Date ? v.checkedAt : new Date();
+    const notes = str_(v.notes).slice(0, 1000);
+    const verdict = v.level === 'unchecked' ? 'не проверено' : v.level;
+    const status = PHOTO_STATUS[v.level] || PHOTO_STATUS.unchecked;
+
+    sheet.getRange(row, PHOTO_COL.status).setValue(status);
+    sheet.getRange(row, PHOTO_COL.issues).setValue(text_(notes, 500));
+    sheet.getRange(row, cols.verdict).setValue(verdict);
+    sheet.getRange(row, cols.confidence).setValue(
+      v.confidence === '' || v.confidence === null || v.confidence === undefined ? '' : Number(v.confidence));
+    sheet.getRange(row, cols.notes).setValue(text_(notes, 1000));
+    sheet.getRange(row, cols.model).setValue(str_(v.model).slice(0, 80));
+    sheet.getRange(row, cols.checkedAt).setNumberFormat('dd.MM.yyyy HH:mm').setValue(checkedAt);
+
+    const refUrl = str_(v.reference);
+    if (/^https?:\/\//.test(refUrl)) {
+      sheet.getRange(row, cols.reference).setRichTextValue(
+        SpreadsheetApp.newRichTextValue().setText('эталон').setLinkUrl(refUrl).build());
+    } else {
+      sheet.getRange(row, cols.reference).setValue('нет');
+    }
+  } catch (e) {
+    log_('Проверка фото', 'вердикт не записался в лист: ' + e);
+  }
+}
+
+/** GET ?action=photoVerdict&id=… — вердикт по ID записи (для карточки и истории). */
+function getPhotoVerdict_(id) {
+  const wanted = str_(id);
+  if (!wanted) return { ok: false, error: 'Не указан ID записи' };
+  const sheet = ss_().getSheetByName(SHEETS.photos);
+  if (!sheet || sheet.getLastRow() < 2) return { ok: false, error: 'Фото не найдено' };
+  const width = Math.max(sheet.getLastColumn(), PHOTO_COL.fileId);
+  const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues();
+  for (let i = data.length - 1; i >= 0; i--) {
+    if (str_(data[i][ID_COLUMN.photo - 1]) !== wanted) continue;
+    return { ok: true, photo: photoFromRow_(sheet, data[i]) };
+  }
+  return { ok: false, error: 'Фото не найдено' };
+}
+
+/** GET ?action=photos&limit=20 — последние снимки без имён сотрудников. */
+function getPhotoHistory_(limit) {
+  const n = Math.min(Math.max(Number(limit) || 20, 1), 50);
+  const sheet = ss_().getSheetByName(SHEETS.photos);
+  if (!sheet || sheet.getLastRow() < 2) return { ok: true, photos: [] };
+  const width = Math.max(sheet.getLastColumn(), PHOTO_COL.fileId);
+  const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, width).getValues();
+  const photos = [];
+  for (let i = data.length - 1; i >= 0 && photos.length < n; i--) {
+    const r = data[i];
+    if (!str_(r[0]) || !str_(r[2])) continue;
+    photos.push(photoFromRow_(sheet, r));
+  }
+  return { ok: true, photos: photos };
+}
+
+/** Строка листа → объект для телефона. Имя сотрудника не отдаём. */
+function photoFromRow_(sheet, r) {
+  const cols = photoColumnMap_(sheet, false);
+  const raw = cols.verdict ? str_(r[cols.verdict - 1]) : '';
+  const level = photoLevelFromSheet_(raw);
+  const dated = r[0] instanceof Date ? r[0] : new Date(r[0]);
+  let checked = null;
+  if (cols.checkedAt) {
+    const cv = r[cols.checkedAt - 1];
+    checked = cv instanceof Date ? cv : (cv ? new Date(cv) : null);
+  }
+  const rawConf = cols.confidence ? r[cols.confidence - 1] : '';
+  const conf = rawConf === '' || rawConf === null || rawConf === undefined ? null : Number(rawConf);
+  const notes = cols.notes ? str_(r[cols.notes - 1]) : '';
+  return {
+    id: str_(r[ID_COLUMN.photo - 1]),
+    at: dated && !isNaN(dated.getTime()) ? dated.toISOString() : '',
+    zone: str_(r[2]),
+    level: level,
+    verdict: raw,
+    confidence: conf !== null && isFinite(conf) ? conf : null,
+    notes: notes,
+    issues: notes,
+    model: cols.model ? str_(r[cols.model - 1]) : '',
+    checkedAt: checked && !isNaN(checked.getTime()) ? checked.toISOString() : '',
+    reference: cols.reference ? str_(r[cols.reference - 1]) : '',
+  };
+}
+
+function photoLevelFromSheet_(v) {
+  const s = str_(v).toLowerCase();
+  if (s === 'ok' || s === 'warn' || s === 'crit' || s === 'unclear') return s;
+  if (s === 'не проверено' || s === 'непроверено') return 'unchecked';
+  if (s === 'плохое фото') return 'unclear';
+  return '';
+}
+
 
 
 /* =====================================================================

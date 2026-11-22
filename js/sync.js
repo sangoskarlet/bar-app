@@ -96,12 +96,17 @@ export async function syncNow() {
   let networkFailed = false;
   try {
     const queue = (await listQueue()).filter(r => r.status !== 'rejected');
-    const plain = queue.filter(r => r.type !== 'photo');
+    const plain = queue.filter(r => r.type !== 'photo' && r.type !== 'checklist');
+    const checklists = queue.filter(r => r.type === 'checklist');
     const photos = queue.filter(r => r.type === 'photo');
 
     // Обычные записи — пачками по 20
     for (let i = 0; i < plain.length; i += BATCH_SIZE) {
       await sendBatch(plain.slice(i, i + BATCH_SIZE), 30000);
+    }
+    // Чек-лист — отдельным запросом: там фото пунктов и своя идемпотентность
+    for (const c of checklists) {
+      await sendBatch([c], 120000);
     }
     // Фото — по одному (они тяжёлые), с большим таймаутом
     for (const p of photos) {
@@ -124,7 +129,20 @@ async function sendBatch(records, timeoutMs) {
   const payload = records.map(({ status, attempts, error, ...rest }) => rest);
   let res;
   try {
-    res = await apiPost({ action: 'submit', records: payload }, timeoutMs);
+    if (records.length === 1 && records[0].type === 'checklist') {
+      // У чек-листа своё действие: прогон целиком, идемпотентность по runId + пункт
+      const r = records[0];
+      res = await apiPost({
+        action: 'checklistSave', id: r.id, runId: r.runId, employee: r.name, pin: r.pin,
+        list: r.list, startedAt: r.startedAt, items: r.items,
+      }, timeoutMs);
+      // Старый/необычный ответ: считаем прогон сохранённым, чтобы не застрял в очереди
+      if (!Array.isArray(res.results)) {
+        res.results = [{ id: r.id, status: res.duplicate ? 'duplicate' : 'saved' }];
+      }
+    } else {
+      res = await apiPost({ action: 'submit', records: payload }, timeoutMs);
+    }
   } catch (e) {
     if (e instanceof ApiError) {
       // Сервер отказал всему запросу целиком (например, «таблица занята») — повторим позже
@@ -139,7 +157,9 @@ async function sendBatch(records, timeoutMs) {
     const result = byId.get(r.id);
     if (!result) continue;
     if (result.status === 'saved' || result.status === 'duplicate') {
-      const { pin, image, ...forHistory } = r; // PIN и само фото в историю не сохраняем
+      // PIN и сами фото в историю не сохраняем. У чек-листа ещё и пункты
+      // с data-URL: для истории достаточно marked/done/total.
+      const { pin, image, items, ...forHistory } = r;
       await db.put('sent', { ...forHistory, sentAt: new Date().toISOString() });
       await db.del('queue', r.id);
     } else if (result.retry || result.code === 'locked') {

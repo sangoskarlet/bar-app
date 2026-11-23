@@ -41,7 +41,8 @@ const SHEETS = {
   invCounts: 'Подсчёт',   // каждая цифра от бармена — отдельная строка
   actTpl:    'Шаблоны переработки', // какие акты бывают и их рецепты
   acts:      'Акты переработки',    // журнал актов: строка на каждое сырьё и результат
-  refs:      'Эталоны уборки',      // зона → что проверять + эталонное фото (для ИИ-проверки)
+  refs:      'Эталоны уборки',      // зона → этаж, что проверять, эталонное фото (для ИИ-проверки)
+  refPhotos: 'Эталоны — фото',      // несколько эталонных снимков на зону (для ИИ-проверки)
   questions: 'Вопросы',             // банк вопросов викторины (создаётся setupQuiz)
   disputes:  'Обжалования',         // жалобы на вопросы викторины (создаётся setupQuiz)
   duels:     'Дуэли',               // история матчей (создаётся автоматически)
@@ -194,8 +195,22 @@ function getConfig_() {
     log_('Чек-листы', 'не прочитаны: ' + String(e && e.stack || e));
   }
 
+  // Проверка фото: этажи зон и эталонные снимки. Старое поле «zones» остаётся
+  // прежним массивом строк — новые поля только добавляются, старый клиент не ломается.
+  // Миграция этажей и листа эталонов идёт здесь же и повторный вызов ничего не дублирует.
+  let photoZones = zones.map(z => ({ zone: z, floor: '' }));
+  let photoRefs = [];
+  try {
+    photoMigrate_(ss);
+    photoZones = photoZones_(ss, zones);
+    photoRefs = photoRefSummaries_(photoZones, photoRefPhotosAll_(ss));
+  } catch (e) {
+    log_('Проверка фото', 'этажи/эталоны не прочитаны: ' + String(e && e.stack || e));
+  }
+
   return {
     theme, ok: true, employees, items, reasons, zones, ttk, inventory, acts, shelfLife, factOfDay, checklists,
+    photoZones, photoRefs, photoRefLimit: PHOTO_MAX_REFS,
     directions: DIRECTIONS, units: UNITS };
 }
 
@@ -1251,7 +1266,7 @@ function savePhoto_(ss, sheet, auth, rec, id, created, received, comment) {
 
   // Дата | Сотрудник | Зона | Фото | Комментарий | Получено | ID |
   // Проверка ИИ | Что не так | Замечание менеджера | Фото удалено | ID файла
-  // M–R — структурированный вердикт (создаются при первом фото / setupPhotoCheck)
+  // M–S — структурированный вердикт (создаются при первом фото / setupPhotoCheck)
   const photoRow = addRow_(sheet, [created, auth.name, zone, 'Открыть фото', comment, received, "'" + id,
     '', '', '', '', "'" + file.getId()]);
   // Делаем текст «Открыть фото» ссылкой на файл (без формулы — так не зависит от языка таблицы)
@@ -1260,16 +1275,24 @@ function savePhoto_(ss, sheet, auth, rec, id, created, received, comment) {
 
   // Сначала фото и строка уже сохранены — дальше проверка. Любая её ошибка
   // не отменяет запись: вердикт будет «не проверено» с причиной.
+  // Эталоны: до трёх активных из листа «Эталоны — фото»; если там пусто —
+  // старая одиночная ссылка из «Эталонов уборки» (колонка C), как раньше.
   let ref = null;
-  try { ref = photoRefFor_(photoRefs_(ss), zonePlain); } catch (e) { log_('Проверка фото', 'эталоны не прочитаны: ' + e); }
+  let refList = [];
+  try {
+    ref = photoRefFor_(photoRefs_(ss), zonePlain);
+    refList = photoRefPhotosFor_(ss, zonePlain).forCheck;
+  } catch (e) { log_('Проверка фото', 'эталоны не прочитаны: ' + e); }
+  if (!refList.length && ref && ref.fileId) refList = [ref];
+  const floor = ref ? ref.floor : '';
   let verdict;
   try {
-    verdict = checkPhoto_(zonePlain, Utilities.newBlob(bytes, m[1], fileName), ref, file.getId());
+    verdict = checkPhoto_(zonePlain, Utilities.newBlob(bytes, m[1], fileName), refList, file.getId(), ref && ref.what);
   } catch (e) {
     log_('Проверка фото', 'неожиданная ошибка: ' + e);
-    verdict = photoUnchecked_(String(e && e.message || e), ref);
+    verdict = photoUnchecked_(String(e && e.message || e), refList);
   }
-  writePhotoVerdict_(sheet, photoRow, verdict);
+  writePhotoVerdict_(sheet, photoRow, verdict, floor);
   return { id, status: 'saved', fileId: file.getId(), zone: zonePlain, verdict: photoPublic_(verdict) };
 }
 
@@ -1545,7 +1568,7 @@ function setup() {
   // эталоны необязательны, а листы викторины создаёт отдельная функция setupQuiz().
   // Листы дуэли и рейтинга создаются сами при первой дуэли (ensureDuelSheets_),
   // «Сроки хранения» — при первом чтении справочника (ensureShelfLifeSheet_).
-  const auto = ['refs', 'questions', 'disputes', 'duels', 'ratings', 'quizTries',
+  const auto = ['refs', 'refPhotos', 'questions', 'disputes', 'duels', 'ratings', 'quizTries',
     'characters', 'itemCatalog', 'inventory', 'shelfLife', 'facts', 'checklists', 'checklistMarks'];
   const missing = Object.keys(SHEETS).filter(k => auto.indexOf(k) === -1)
     .map(k => SHEETS[k]).filter(n => !ss.getSheetByName(n));
@@ -1810,20 +1833,25 @@ function log_(event, details) {
  *         O «замечания»:    «crit: …; warn: …»
  *         P «модель»:       например gemini-flash-lite-latest
  *         Q «проверено_в»:  дата и время проверки
- *         R «эталон»:       ссылка на эталон или «нет»
+ *         R «эталон»:       ссылка(и) на эталон или «нет»
+ *         S «этаж»:         1 / 2 / пусто
  *    3. Триггеров нет: 5 фото в день проверяются за секунды. Расписание
  *       и автоудаление старых фото больше не используются — фото остаются
  *       доказательством для разбора.
  *
  *  Настройка (один раз):
  *    а) ⚙ Настройки проекта → Свойства скрипта → GEMINI_API_KEY = ключ.
- *    б) Выбрать функцию setupPhotoCheck и нажать «Выполнить» — она только
- *       добавляет колонки M–R и проверяет, что ключ на месте.
+ *    б) Выбрать функцию setupPhotoCheck и нажать «Выполнить» — она добавляет
+ *       колонки M–S, колонку «этаж» в «Эталоны уборки», создаёт лист
+ *       «Эталоны — фото» и проверяет, что ключ на месте.
  *
- *  Эталоны: лист «Эталоны уборки» — Зона | Что проверять | Эталонное фото.
- *  Колонка C пустая — проверяем по тексту критериев. Когда владелец
- *  положит туда ссылку на фото, сервер отправит два изображения и попросит
- *  сравнить состав и захламлённость, а не пиксели. Код менять не нужно.
+ *  Эталоны: «Эталоны уборки» — Зона | Что проверять | Эталонное фото | этаж.
+ *  Несколько снимков на зону — лист «Эталоны — фото»:
+ *    зона | порядок | ссылка_на_фото | ракурс | активен
+ *  В запрос уходят до 3 активных эталонов (первые по «порядок») + фото смены:
+ *  всего не больше 4 изображений. Если активных эталонов нет — проверяем
+ *  по тексту критериев, как раньше. Если все ссылки битые — вердикт unclear
+ *  с причиной, а не падение и не проверка «вслепую».
  *
  *  Ответ модели — строго JSON:
  *    {"verdict":"ok|warn|crit|unclear","confidence":0…1,
@@ -1834,14 +1862,15 @@ function log_(event, details) {
  * ===================================================================== */
 
 const PHOTO_COL = { status: 8, issues: 9, manager: 10, deleted: 11, fileId: 12 }; // H, I, J, K, L
-const PHOTO_EXTRA_HEADERS = ['вердикт', 'уверенность', 'замечания', 'модель', 'проверено_в', 'эталон'];
-const PHOTO_EXTRA_KEYS = ['verdict', 'confidence', 'notes', 'model', 'checkedAt', 'reference'];
+const PHOTO_EXTRA_HEADERS = ['вердикт', 'уверенность', 'замечания', 'модель', 'проверено_в', 'эталон', 'этаж'];
+const PHOTO_EXTRA_KEYS = ['verdict', 'confidence', 'notes', 'model', 'checkedAt', 'reference', 'floor'];
 const PHOTO_CONFIDENCE_MIN = 0.5;      // ниже — общий вердикт unclear
 const PHOTO_MAX_ITEMS = 30;            // больше пунктов от модели не принимаем
 const PHOTO_GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta';
-// Первая — рабочая (проверена 22.11.2026, 200 и 0,8 с на картинку).
-// Остальные — запас: 22.11.2026 отдавали 503 «высокая нагрузка», но могут ожить.
-const GEMINI_MODELS = ['gemini-flash-lite-latest', 'gemini-3.8-flash', 'gemini-3.1-flash-lite'];
+// Первая — рабочая (проверена 22.11.2026). 24.11.2026 на 3 картинках
+// gemini-3.8-flash ответил за 178 с, поэтому он теперь последний: сначала
+// пробуем лёгкие flash-lite, и только потом медленный запас.
+const GEMINI_MODELS = ['gemini-flash-lite-latest', 'gemini-3.1-flash-lite', 'gemini-3.8-flash'];
 const PHOTO_STATUS = {
   ok: '✅ Чисто', warn: '⚠ Замечания', crit: '⛔ Критично',
   unclear: '❓ Непонятно', unchecked: '❓ Не проверено',
@@ -1852,9 +1881,15 @@ const PHOTO_GENERIC_CRITERIA = [
   'Нет лишних вещей и неубранного инструмента',
   'Поверхности сухие и протёртые',
 ];
+// Новые листы/колонки эталонов. Формат «этаж»: 1 или 2 (принимаем и «1 этаж»).
+const REFS_FLOOR_HEADER = 'этаж';
+const REF_PHOTO_HEADERS = ['зона', 'порядок', 'ссылка_на_фото', 'ракурс', 'активен'];
+const PHOTO_MAX_REFS = 3;             // больше трёх эталонов в один запрос не отправляем
+const PHOTO_MAX_IMAGES = 4;           // 1 фото смены + до 3 эталонов
 
 /**
- * Запустить один раз вручную: добавляет колонки вердикта M–R и проверяет ключ.
+ * Запустить один раз вручную: добавляет колонку «этаж» в «Эталоны уборки»,
+ * создаёт лист «Эталоны — фото», колонки вердикта M–S и проверяет ключ.
  * Ничего не проверяет и не ставит триггеров — проверка идёт при загрузке фото.
  */
 function setupPhotoCheck() {
@@ -1868,8 +1903,13 @@ function setupPhotoCheck() {
     .setNumberFormat('dd.MM.yyyy HH:mm');
   const key = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
   const where = PHOTO_EXTRA_KEYS.map(k => k + '=' + columnLetter_(cols[k])).join(', ');
+  let refMsg = '';
+  try { refMsg = ' ' + setupPhotoRefs(); } catch (e) {
+    refMsg = ' Эталоны: ОШИБКА ' + e;
+    log_('Проверка фото', 'setupPhotoRefs: ' + String(e && e.stack || e));
+  }
   const msg = 'Колонки проверки фото: ' + where + '. Ключ Gemini: ' + (key ? 'есть' : 'НЕТ') +
-    '. Проверка идёт при загрузке фото, триггеры не нужны.';
+    '. Проверка идёт при загрузке фото, триггеры не нужны.' + refMsg;
   log_('Проверка фото', msg);
   Logger.log(msg);
   return msg;
@@ -1921,14 +1961,22 @@ function ensurePhotoColumns_(sheet) {
   return cols;
 }
 
-/** Эталоны: { 'бар 1 этаж': { what: 'что проверять', fileId, url } } */
+/** Эталоны: { 'бар 1 этаж': { zone, what, fileId, url, floor } } */
 function photoRefs_(ss) {
   const out = {};
-  if (!ss.getSheetByName(SHEETS.refs)) return out;
+  const sh = ss.getSheetByName(SHEETS.refs);
+  if (!sh) return out;
+  const floorCol = refsFloorColumn_(sh, false).col;
   rows_(ss, SHEETS.refs).forEach(r => {
     const zone = str_(r[0]);
     if (!zone) return;
-    out[photoZoneKey_(zone)] = { what: str_(r[1]), fileId: driveId_(r[2]), url: str_(r[2]) };
+    out[photoZoneKey_(zone)] = {
+      zone: zone,
+      what: str_(r[1]),
+      fileId: driveId_(r[2]),
+      url: str_(r[2]),
+      floor: floorCol ? photoFloorNorm_(r[floorCol - 1]) : '',
+    };
   });
   return out;
 }
@@ -1941,6 +1989,218 @@ function photoRefFor_(refs, zone) {
   return (refs && refs[photoZoneKey_(zone)]) || null;
 }
 
+/* --- этажи ---------------------------------------------------------- */
+
+/**
+ * «1», «1 этаж», «2 ЭТАЖ» → '1' / '2'. Пусто → ''.
+ * Нечисловой текст («цоколь») остаётся как есть: «Без этажа» — только пустая ячейка.
+ */
+function photoFloorNorm_(v) {
+  const s = str_(v).toLowerCase().replace(/ё/g, 'е');
+  if (!s) return '';
+  const m = /(\d+)/.exec(s);
+  if (m) return String(Number(m[1]));
+  return s.slice(0, 40);
+}
+
+/** Этаж по умолчанию: из названия («Бар 2 этаж» → 2), иначе 1. */
+function photoFloorDefault_(zone) {
+  const s = str_(zone).toLowerCase().replace(/ё/g, 'е');
+  const m = /(\d+)\s*этаж/.exec(s);
+  return m ? String(Number(m[1])) : '1';
+}
+
+/** Подпись этажа для логов: '1' → '1 этаж'. */
+function photoFloorLabel_(floor) {
+  const f = str_(floor);
+  if (!f) return 'без этажа';
+  return /^\d+$/.test(f) ? f + ' этаж' : f;
+}
+
+/**
+ * Колонка «этаж» в «Эталонах уборки» по названию шапки.
+ * create=true — если колонки нет, дописать в конец. Возвращает {col, created}.
+ */
+function refsFloorColumn_(sheet, create) {
+  const width = Math.max(sheet.getLastColumn(), 1);
+  // Пустой лист без шапки не трогаем: иначе «этаж» попадёт в колонку A.
+  if (!str_(sheet.getRange(1, 1).getValue())) return { col: 0, created: false };
+  const headers = sheet.getRange(1, 1, 1, width).getValues()[0].map(v => str_(v).toLowerCase());
+  let idx = headers.indexOf(REFS_FLOOR_HEADER);
+  if (idx < 0) idx = headers.indexOf('floor');
+  let created = false;
+  if (idx < 0 && create) {
+    idx = width;
+    created = true;
+    sheet.getRange(1, idx + 1).setValue(REFS_FLOOR_HEADER).setFontWeight('bold');
+    sheet.setColumnWidth(idx + 1, 90);
+    log_('Проверка фото', 'Добавлена колонка ' + columnLetter_(idx + 1) + ' «этаж» в «' + SHEETS.refs + '»');
+  }
+  return { col: idx >= 0 ? idx + 1 : 0, created: created };
+}
+
+/** Заполняет пустые этажи: по названию зоны, иначе 1. Возвращает число строк. */
+function fillPhotoFloors_(sheet, floorCol) {
+  const last = sheet.getLastRow();
+  if (last < 2 || !floorCol) return 0;
+  const zones = sheet.getRange(2, 1, last - 1, 1).getValues();
+  const floors = sheet.getRange(2, floorCol, last - 1, 1).getValues();
+  let filled = 0;
+  for (let i = 0; i < zones.length; i++) {
+    if (!str_(zones[i][0]) || str_(floors[i][0])) continue;
+    sheet.getRange(i + 2, floorCol).setValue(photoFloorDefault_(str_(zones[i][0])));
+    filled++;
+  }
+  if (filled) log_('Проверка фото', 'Этажи заполнены по умолчанию: ' + filled);
+  return filled;
+}
+
+/**
+ * Разово готовит данные для эталонов: колонку «этаж» и лист «Эталоны — фото».
+ * Если колонка только что создана — заполняет этажи. Повторный вызов ничего не меняет.
+ */
+function photoMigrate_(ss) {
+  const sh = ss.getSheetByName(SHEETS.refs);
+  let filled = 0;
+  if (sh) {
+    const f = refsFloorColumn_(sh, true);
+    if (f.created) filled = fillPhotoFloors_(sh, f.col);
+  }
+  ensureRefPhotosSheet_(ss);
+  return filled;
+}
+
+/** Лист «Эталоны — фото»: создаётся при первом обращении, шапка не дублируется. */
+function ensureRefPhotosSheet_(ss) {
+  let sh = ss.getSheetByName(SHEETS.refPhotos);
+  if (sh) {
+    if (!str_(sh.getRange(1, 1).getValue())) {
+      sh.getRange(1, 1, 1, REF_PHOTO_HEADERS.length).setValues([REF_PHOTO_HEADERS]).setFontWeight('bold');
+      sh.setFrozenRows(1);
+    }
+    return sh;
+  }
+  sh = ss.insertSheet(SHEETS.refPhotos);
+  sh.getRange(1, 1, 1, REF_PHOTO_HEADERS.length).setValues([REF_PHOTO_HEADERS]).setFontWeight('bold');
+  sh.setFrozenRows(1);
+  sh.setColumnWidth(1, 180);
+  sh.setColumnWidth(3, 420);
+  sh.setColumnWidth(4, 220);
+  sh.setColumnWidth(5, 80);
+  log_('Проверка фото', 'Создан лист «' + SHEETS.refPhotos + '»');
+  return sh;
+}
+
+/**
+ * Активен ли эталон. Пустая ячейка = активен: иначе владельцу пришлось бы
+ * ставить галочку в каждой строке, а забытая галочка молча отключала бы эталон.
+ */
+function refPhotoActive_(v) {
+  if (v === false) return false;
+  if (v === null || v === undefined || v === '') return true;
+  if (v === true) return true;
+  const s = str_(v).toLowerCase().replace(/ё/g, 'е');
+  return !(s === 'нет' || s === 'false' || s === '0' || s === 'no' || s === 'неактивен');
+}
+
+/**
+ * Строки листа «Эталоны — фото»: одна строка = один эталон.
+ * Пустой «порядок» уходит в конец, внутри порядок — как в таблице.
+ */
+function photoRefPhotosAll_(ss) {
+  const sh = ensureRefPhotosSheet_(ss);
+  if (sh.getLastRow() < 2) return [];
+  const width = Math.max(sh.getLastColumn(), REF_PHOTO_HEADERS.length);
+  return sh.getRange(2, 1, sh.getLastRow() - 1, width).getValues()
+    .map((r, i) => ({
+      row: i + 2,
+      zone: str_(r[0]),
+      order: num_(r[1]),
+      hasOrder: str_(r[1]) !== '',
+      url: str_(r[2]),
+      fileId: driveId_(r[2]),
+      aspect: str_(r[3]).slice(0, 120),
+      active: refPhotoActive_(r[4]),
+    }))
+    .filter(r => r.zone && (r.url || r.fileId));
+}
+
+/** Активные эталоны зоны: первые по «порядок», но не больше PHOTO_MAX_REFS. */
+function photoRefPhotosFor_(ss, zone) {
+  const key = photoZoneKey_(zone);
+  const all = photoRefPhotosAll_(ss).filter(r => photoZoneKey_(r.zone) === key);
+  const active = all.filter(r => r.active);
+  active.sort((a, b) => {
+    const ao = a.hasOrder ? a.order : 1e9;
+    const bo = b.hasOrder ? b.order : 1e9;
+    return ao - bo || a.row - b.row;
+  });
+  return {
+    forCheck: active.slice(0, PHOTO_MAX_REFS),
+    activeCount: active.length,
+    total: all.length,
+    skipped: Math.max(0, active.length - PHOTO_MAX_REFS),
+  };
+}
+
+/** Зоны с этажами для приложения: сначала «Списки»!B, затем зоны только из эталонов. */
+function photoZones_(ss, listZones) {
+  const refs = photoRefs_(ss);
+  const out = [];
+  const seen = {};
+  (listZones || []).forEach(z => {
+    const k = photoZoneKey_(z);
+    if (!k || seen[k]) return;
+    seen[k] = true;
+    out.push({ zone: z, floor: refs[k] ? refs[k].floor : '' });
+  });
+  Object.keys(refs).forEach(k => {
+    if (seen[k]) return;
+    seen[k] = true;
+    out.push({ zone: refs[k].zone, floor: refs[k].floor });
+  });
+  return out;
+}
+
+/** Сколько активных эталонов у каждой зоны (для config, без ссылок). */
+function photoRefSummaries_(zones, refRows) {
+  const counts = {};
+  (refRows || []).forEach(r => {
+    const k = photoZoneKey_(r.zone);
+    if (!counts[k]) counts[k] = { active: 0, total: 0 };
+    counts[k].total++;
+    if (r.active) counts[k].active++;
+  });
+  return (zones || []).map(z => {
+    const c = counts[photoZoneKey_(z.zone)] || { active: 0, total: 0 };
+    return { zone: z.zone, floor: z.floor, active: c.active, total: c.total };
+  });
+}
+
+/**
+ * Разово: колонка «этаж» + лист «Эталоны — фото».
+ * Можно запустить вручную из редактора Apps Script как setupPhotoCheck().
+ */
+function setupPhotoRefs() {
+  const ss = ss_();
+  const sh = ss.getSheetByName(SHEETS.refs);
+  let floorCol = 0;
+  let filled = 0;
+  if (sh) {
+    const f = refsFloorColumn_(sh, true);
+    floorCol = f.col;
+    if (f.created) filled = fillPhotoFloors_(sh, floorCol);
+  }
+  const existed = !!ss.getSheetByName(SHEETS.refPhotos);
+  ensureRefPhotosSheet_(ss);
+  const msg = 'Эталоны: лист «' + SHEETS.refPhotos + '» ' + (existed ? 'на месте' : 'создан') +
+    '; колонка «этаж» ' + (floorCol ? columnLetter_(floorCol) : 'НЕТ') +
+    (filled ? '; этажи заполнены по умолчанию: ' + filled : '') + '.';
+  Logger.log(msg);
+  log_('Проверка фото', msg);
+  return msg;
+}
+
 /**
  * Критерии зоны из «Эталонов уборки»: абзац режем на предложения.
  * Модель получает готовый список пунктов, а не общий текст «ищи грязь».
@@ -1951,16 +2211,25 @@ function splitPhotoCriteria_(what) {
   return s.split(/;\s*|[.!?]\s+/).map(x => str_(x)).filter(Boolean).slice(0, 12);
 }
 
-/** Промпт: критерии зоны + жёсткие правила + схема ответа. */
-function buildPhotoPrompt_(zone, criteria, hasRef) {
+/** Промпт: критерии зоны + жёсткие правила + схема ответа. refCount — число эталонов. */
+function buildPhotoPrompt_(zone, criteria, refCount) {
   const list = criteria && criteria.length ? criteria : PHOTO_GENERIC_CRITERIA;
+  const n = Math.max(0, Math.min(PHOTO_MAX_REFS, Number(refCount) || (refCount ? 1 : 0)));
+  const hasRef = n > 0;
+  const photoNo = n + 1;
   const lines = [
     'Ты проверяешь фото уборки бара в джаз-клубе. Зона: «' + str_(zone) + '».',
     hasRef
-      ? 'На изображении 1 — эталон: как выглядит убранная зона. На изображении 2 — фото после уборки. Оценивай ТОЛЬКО изображение 2.'
+      ? (n === 1
+        ? 'На изображении 1 — эталон: как выглядит убранная зона. На изображении 2 — фото после уборки. Оценивай ТОЛЬКО изображение 2.'
+        : 'На изображениях 1–' + n + ' — эталоны этой зоны с разных ракурсов. На изображении ' + photoNo +
+          ' — фото после уборки. Оценивай ТОЛЬКО изображение ' + photoNo + '.')
       : 'На изображении — фото зоны после уборки.',
     hasRef
-      ? 'Эталон — образец, а не шаблон для попиксельного сравнения: сравнивай состав и захламлённость, а не совпадение пикселей. Различия в свете, ракурсе, фоне, тенях и бликах нарушением не считай.'
+      ? 'Эталон — образец состава и порядка, а не шаблон для попиксельного сравнения. Ракурс, свет, фон и расстановка предметов на эталоне и на фото могут отличаться — это не нарушение.'
+      : '',
+    hasRef
+      ? 'Сравнивай по составу и порядку и оценивай признаки: чистота поверхностей, отсутствие мусора и грязной посуды, посуда убрана, контейнеры чистые, инвентарь на своих местах. Не требуй совпадения кадра с эталоном.'
       : '',
     'Что проверять (критерии зоны):',
   ];
@@ -1983,27 +2252,92 @@ function buildPhotoPrompt_(zone, criteria, hasRef) {
 }
 
 /**
- * Один запрос к Gemini (с эталоном, если он задан) и разбор ответа.
- * Возвращает {model, items, confidence} или {invalid:true, reason, model}.
+ * Приводит refs (объект или массив) к массиву эталонов, не больше PHOTO_MAX_REFS.
+ * Строки с битой ссылкой не выбрасываем здесь: их надо честно показать в причине.
+ */
+function photoRefArray_(refs) {
+  if (!refs) return [];
+  const arr = Array.isArray(refs) ? refs : [refs];
+  const limit = Math.min(PHOTO_MAX_REFS, PHOTO_MAX_IMAGES - 1);
+  return arr.filter(r => r && (r.fileId || r.url)).slice(0, limit);
+}
+
+function photoRefUrls_(refs) {
+  return photoRefArray_(refs).map(r => str_(r.url)).filter(Boolean);
+}
+
+/** Человеческая причина, почему эталоны не открылись. */
+function photoRefsFailReason_(failed) {
+  return (failed || []).map((f, i) => {
+    const label = str_(f.ref && (f.ref.aspect || f.ref.zone)) || ('эталон ' + (i + 1));
+    return label + ': ' + str_(f.error || 'файл не открылся').slice(0, 80);
+  }).join('; ').slice(0, 400);
+}
+
+/** Превью Диска (~512 px по длинной стороне) для повтора после таймаута. */
+function photoShrinkParts_(sources) {
+  const out = [];
+  for (const s of sources || []) {
+    if (!s || !s.fileId) return null;
+    let thumb = null;
+    try { thumb = DriveApp.getFileById(s.fileId).getThumbnail(); } catch (e) { thumb = null; }
+    if (!thumb) return null;
+    const bytes = thumb.getBytes();
+    if (!bytes || !bytes.length) return null;
+    out.push({
+      inline_data: {
+        mime_type: thumb.getContentType() || 'image/jpeg',
+        data: Utilities.base64Encode(bytes),
+      },
+    });
+  }
+  return out.length ? out : null;
+}
+
+/**
+ * Один запрос к Gemini: фото смены + до трёх эталонов зоны (всего до 4 картинок).
+ * Возвращает {model, items, confidence, references, elapsedMs},
+ * {invalid:true, reason, model} или {refsUnavailable:true, reason, refs}.
  * Бросает ошибку только при сетевой/HTTP-ошибке — её ловит checkPhoto_.
  */
-function geminiPhotoCheck_(key, zone, ref, blob, fileId) {
-  const criteria = splitPhotoCriteria_(ref && ref.what);
-  const imageParts = [];
-  let refUsed = false;
-  if (ref && ref.fileId) {
-    try {
-      const rb = DriveApp.getFileById(ref.fileId).getBlob();
-      imageParts.push({ inline_data: { mime_type: rb.getContentType(), data: Utilities.base64Encode(rb.getBytes()) } });
-      refUsed = true;
-    } catch (e) {
-      log_('Проверка фото', 'эталон не открылся: ' + e);
-    }
-  }
-  imageParts.push({ inline_data: { mime_type: blob.getContentType(), data: Utilities.base64Encode(blob.getBytes()) } });
+function geminiPhotoCheck_(key, zone, refs, blob, fileId, what) {
+  const refList = photoRefArray_(refs);
+  const criteria = splitPhotoCriteria_(str_(what) || (refList[0] && refList[0].what) || '');
 
-  const prompt = buildPhotoPrompt_(zone, criteria, refUsed);
-  const requestParts = [{ text: prompt }].concat(imageParts);
+  const imageParts = [];
+  const sources = [];        // параллельно imageParts: откуда картинка (для 512px-повтора)
+  const loadedRefs = [];
+  const failedRefs = [];
+  refList.forEach(r => {
+    if (!r.fileId) {
+      failedRefs.push({ ref: r, error: 'нет ссылки на файл Диска' });
+      return;
+    }
+    try {
+      const rb = DriveApp.getFileById(r.fileId).getBlob();
+      imageParts.push({ inline_data: { mime_type: rb.getContentType(), data: Utilities.base64Encode(rb.getBytes()) } });
+      sources.push({ fileId: r.fileId });
+      loadedRefs.push(r);
+    } catch (e) {
+      failedRefs.push({ ref: r, error: String(e && e.message || e) });
+      log_('Проверка фото', 'эталон не открылся (' + (r.aspect || r.zone || r.fileId) + '): ' + e);
+    }
+  });
+  if (failedRefs.length) log_('Проверка фото', 'эталонов не открылось: ' + failedRefs.length);
+  // Все эталоны зоны битые: не отправляем фото «без эталонов» молча, а честно
+  // говорим «непонятно» с причиной — владелец увидит, что ссылку надо поправить.
+  if (refList.length && !loadedRefs.length) {
+    return {
+      refsUnavailable: true,
+      reason: photoRefsFailReason_(failedRefs),
+      refs: refList,
+    };
+  }
+
+  imageParts.push({ inline_data: { mime_type: blob.getContentType(), data: Utilities.base64Encode(blob.getBytes()) } });
+  sources.push({ fileId: fileId || '' });
+
+  const requestParts = [{ text: buildPhotoPrompt_(zone, criteria, loadedRefs.length) }].concat(imageParts);
   const generationConfig = {
     temperature: 0,
     responseMimeType: 'application/json',
@@ -2035,51 +2369,68 @@ function geminiPhotoCheck_(key, zone, ref, blob, fileId) {
   const saved = str_(props.getProperty('GEMINI_MODEL'));
   const models = (saved ? [saved] : []).concat(GEMINI_MODELS.filter(m => m !== saved));
 
-  let answer;
-  try {
-    answer = runGeminiModels_(models, key, requestParts, generationConfig);
-  } catch (e) {
-    // UrlFetchApp не даёт задать таймаут. Если запрос не уложился — повторяем
-    // с превью Диска (~512 px по длинной стороне), как просит задача.
-    if (e && e.photoRetry && fileId) {
-      let thumb = null;
-      try { thumb = DriveApp.getFileById(fileId).getThumbnail(); } catch (e2) { thumb = null; }
-      const thumbBytes = thumb ? thumb.getBytes() : null;
-      if (!thumbBytes || !thumbBytes.length) throw e;
-      const smaller = requestParts.slice();
-      smaller[smaller.length - 1] = {
-        inline_data: {
-          mime_type: thumb.getContentType() || 'image/jpeg',
-          data: Utilities.base64Encode(thumbBytes),
-        },
-      };
-      log_('Проверка фото', 'Gemini не ответил вовремя — повтор с уменьшенным фото');
-      answer = runGeminiModels_(models, key, smaller, generationConfig);
-    } else {
-      throw e;
-    }
-  }
+  const started = Date.now();
+  // getSmallParts вызывается только при ошибке/таймауте: превью Диска
+  // ~512 px готовятся лениво, чтобы обычный быстрый запрос не платил за них.
+  const answer = runGeminiModels_(models, key, requestParts, generationConfig,
+    () => photoShrinkParts_(sources));
+  const elapsedMs = Date.now() - started;
 
-  if (saved !== answer.model) props.setProperty('GEMINI_MODEL', answer.model);
+  // Медленную модель не запоминаем: иначе следующий бармен будет ждать её снова.
+  if (saved !== answer.model) {
+    if (elapsedMs < 30000) props.setProperty('GEMINI_MODEL', answer.model);
+    else log_('Проверка фото', 'Модель ' + answer.model + ' ответила за ' + elapsedMs + ' мс — не запоминаем как основную');
+  }
+  log_('Проверка фото', 'Gemini ' + answer.model + ': ' + elapsedMs + ' мс, изображений ' +
+    (loadedRefs.length + 1) + (failedRefs.length ? ', эталонов не открылось: ' + failedRefs.length : '') +
+    (answer.usedSmall ? ', повтор 512 px' : ''));
+
   const v = validatePhotoAnswer_(answer.text, criteria);
-  if (!v.ok) return { invalid: true, reason: v.reason, model: answer.model };
-  return { model: answer.model, items: v.items, confidence: v.confidence };
+  if (!v.ok) {
+    return { invalid: true, reason: v.reason, model: answer.model, references: photoRefUrls_(loadedRefs), elapsedMs: elapsedMs };
+  }
+  return {
+    model: answer.model, items: v.items, confidence: v.confidence,
+    references: photoRefUrls_(loadedRefs), elapsedMs: elapsedMs,
+  };
 }
 
-/** Перебор моделей: 404/500/503 — следующая, 429 — сразу ошибка квоты. */
-function runGeminiModels_(models, key, parts, generationConfig) {
+/**
+ * Перебор моделей: 404/500/503 — следующая, 429 — сразу ошибка квоты.
+ * Если модель ответила 500/503 или сеть упала, а картинок несколько —
+ * та же модель один раз повторяется с уменьшенными до ~512 px картинками.
+ */
+function runGeminiModels_(models, key, parts, generationConfig, getSmallParts) {
   let lastErr = '';
-  for (const model of models) {
-    const resp = geminiRequest_(model, key, { contents: [{ parts: parts }], generationConfig: generationConfig });
+  let useSmall = false;
+  const switchToSmall = () => {
+    if (useSmall || typeof getSmallParts !== 'function') return false;
+    const small = getSmallParts();
+    if (!small) return false;
+    useSmall = true;
+    parts = [parts[0]].concat(small);
+    log_('Проверка фото', 'Повтор с уменьшенными до 512 px картинками: ' + small.length);
+    return true;
+  };
+  for (let i = 0; i < models.length; i++) {
+    const model = models[i];
+    let resp;
+    try {
+      resp = geminiRequest_(model, key, { contents: [{ parts: parts }], generationConfig: generationConfig });
+    } catch (e) {
+      if (e && e.photoRetry && switchToSmall()) { i--; continue; }
+      throw e;
+    }
     const code = resp.getResponseCode();
     const body = resp.getContentText();
     if (code === 404 || code === 500 || code === 503) {
       lastErr = 'модель ' + model + ': HTTP ' + code + ' ' + body.slice(0, 120);
+      if ((code === 500 || code === 503) && switchToSmall()) { i--; continue; }
       continue;
     }
     if (code === 429) throw new Error('429 квота Gemini');
     if (code !== 200) throw new Error('Gemini HTTP ' + code + ': ' + body.slice(0, 150));
-    return { model: model, text: parseGeminiAnswer_(resp) };
+    return { model: model, text: parseGeminiAnswer_(resp), usedSmall: useSmall };
   }
   throw new Error(lastErr || 'Нет доступной модели Gemini');
 }
@@ -2182,13 +2533,22 @@ function photoNotes_(items, level) {
 }
 
 /** Вердикт по уже прочитанному ответу модели (отдельно — чтобы тестировать без сети). */
-function photoFromGeminiResult_(res, ref) {
-  if (!res) return photoUnchecked_('пустой ответ Gemini', ref);
+function photoFromGeminiResult_(res, refs) {
+  if (!res) return photoUnchecked_('пустой ответ Gemini', refs);
+  const urls = Array.isArray(res.references) ? res.references : photoRefUrls_(refs);
+  if (res.refsUnavailable) {
+    return {
+      level: 'unclear', confidence: '', items: [],
+      notes: 'эталон не открылся: ' + str_(res.reason || 'файл не найден').slice(0, 300),
+      model: '', references: urls,
+      checkedAt: new Date(), error: '',
+    };
+  }
   if (res.invalid) {
     return {
       level: 'unclear', confidence: '', items: [],
       notes: 'ответ модели не разобран: ' + res.reason,
-      model: res.model || '', reference: ref && ref.url ? ref.url : 'нет',
+      model: res.model || '', references: urls,
       checkedAt: new Date(), error: '',
     };
   }
@@ -2199,32 +2559,33 @@ function photoFromGeminiResult_(res, ref) {
     items: res.items,
     notes: photoNotes_(res.items, level),
     model: res.model || '',
-    reference: ref && ref.url ? ref.url : 'нет',
+    references: urls,
     checkedAt: new Date(),
     error: '',
   };
 }
 
 /** Точка входа: никогда не бросает — иначе фото потеряется из-за проверки. */
-function checkPhoto_(zone, blob, ref, fileId) {
+function checkPhoto_(zone, blob, refs, fileId, what) {
   const key = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
-  if (!key) return photoUnchecked_('не задан ключ GEMINI_API_KEY', ref);
+  if (!key) return photoUnchecked_('не задан ключ GEMINI_API_KEY', refs);
   try {
-    const res = geminiPhotoCheck_(key, zone, ref, blob, fileId);
-    return photoFromGeminiResult_(res, ref);
+    const res = geminiPhotoCheck_(key, zone, refs, blob, fileId, what);
+    return photoFromGeminiResult_(res, res && res.refsUnavailable ? res.refs : refs);
   } catch (e) {
     const msg = String(e && e.message || e);
     log_('Проверка фото', 'Gemini: ' + msg.slice(0, 300));
-    return photoUnchecked_(msg, ref);
+    return photoUnchecked_(msg, refs);
   }
 }
 
-function photoUnchecked_(reason, ref) {
+function photoUnchecked_(reason, refs) {
   const msg = str_(reason).slice(0, 300) || 'неизвестная ошибка';
+  const urls = photoRefUrls_(refs);
   return {
     level: 'unchecked', confidence: '', items: [],
     notes: 'причина: ' + msg, model: '',
-    reference: ref && ref.url ? ref.url : 'нет',
+    references: urls, reference: urls[0] || 'нет',
     checkedAt: new Date(), error: msg,
   };
 }
@@ -2242,15 +2603,16 @@ function photoPublic_(v) {
     model: v.model || '',
     checkedAt: v.checkedAt instanceof Date ? v.checkedAt.toISOString() : '',
     reference: v.reference || '',
+    references: v.references || [],
     error: v.error || '',
   };
 }
 
 /**
  * Запись вердикта в строку листа. Старые H/I заполняем человеческим текстом,
- * новые M–R — машинными полями. Ошибка записи не отменяет сохранение фото.
+ * новые M–S — машинными полями. Ошибка записи не отменяет сохранение фото.
  */
-function writePhotoVerdict_(sheet, row, v) {
+function writePhotoVerdict_(sheet, row, v, floor) {
   try {
     const cols = ensurePhotoColumns_(sheet);
     const checkedAt = v.checkedAt instanceof Date ? v.checkedAt : new Date();
@@ -2267,13 +2629,31 @@ function writePhotoVerdict_(sheet, row, v) {
     sheet.getRange(row, cols.model).setValue(str_(v.model).slice(0, 80));
     sheet.getRange(row, cols.checkedAt).setNumberFormat('dd.MM.yyyy HH:mm').setValue(checkedAt);
 
-    const refUrl = str_(v.reference);
-    if (/^https?:\/\//.test(refUrl)) {
-      sheet.getRange(row, cols.reference).setRichTextValue(
-        SpreadsheetApp.newRichTextValue().setText('эталон').setLinkUrl(refUrl).build());
+    const urls = Array.isArray(v.references) && v.references.length
+      ? v.references.map(str_).filter(Boolean).slice(0, PHOTO_MAX_REFS)
+      : (function () {
+        const one = str_(v.reference);
+        return /^https?:\/\//.test(one) ? [one] : [];
+      })();
+    const refCell = sheet.getRange(row, cols.reference);
+    if (!urls.length) {
+      refCell.setValue('нет');
+    } else if (urls.length === 1) {
+      refCell.setRichTextValue(
+        SpreadsheetApp.newRichTextValue().setText('эталон').setLinkUrl(urls[0]).build());
     } else {
-      sheet.getRange(row, cols.reference).setValue('нет');
+      // Несколько эталонов: одна ссылка на каждый, чтобы владелец открыл нужный.
+      const labels = urls.map((u, i) => 'эталон ' + (i + 1));
+      const text = labels.join(' · ');
+      const rt = SpreadsheetApp.newRichTextValue().setText(text);
+      let at = 0;
+      labels.forEach((label, i) => {
+        rt.setLinkUrl(at, at + label.length, urls[i]);
+        at += label.length + 3; // ' · '
+      });
+      refCell.setRichTextValue(rt.build());
     }
+    if (cols.floor) sheet.getRange(row, cols.floor).setValue(str_(floor));
   } catch (e) {
     log_('Проверка фото', 'вердикт не записался в лист: ' + e);
   }
@@ -2336,6 +2716,7 @@ function photoFromRow_(sheet, r) {
     model: cols.model ? str_(r[cols.model - 1]) : '',
     checkedAt: checked && !isNaN(checked.getTime()) ? checked.toISOString() : '',
     reference: cols.reference ? str_(r[cols.reference - 1]) : '',
+    floor: cols.floor ? str_(r[cols.floor - 1]) : '',
   };
 }
 

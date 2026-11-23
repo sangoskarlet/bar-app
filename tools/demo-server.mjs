@@ -56,7 +56,25 @@ function config() {
       { name: 'Лимоны', unit: 'г', category: 'Фрукты' },
     ],
     reasons: ['Бой', 'Порча', 'Пролив'],
-    zones: ['Бар 1 этаж', 'Раковины'],
+    zones: ['Окно', 'Дверь', 'Склад', 'Бар', 'Холодильники', 'За баром'],
+    // Фото уборки: 6 утверждённых зон и этажи — как отдаёт бэкенд после 16.
+    photoZones: [
+      { zone: 'Окно', floor: '2' },
+      { zone: 'Дверь', floor: '2' },
+      { zone: 'Склад', floor: '2' },
+      { zone: 'Бар', floor: '1' },
+      { zone: 'Холодильники', floor: '1' },
+      { zone: 'За баром', floor: '1' },
+    ],
+    photoRefs: [
+      { zone: 'Окно', floor: '2', active: 0, total: 0 },
+      { zone: 'Дверь', floor: '2', active: 0, total: 0 },
+      { zone: 'Склад', floor: '2', active: 0, total: 0 },
+      { zone: 'Бар', floor: '1', active: 1, total: 1 },
+      { zone: 'Холодильники', floor: '1', active: 0, total: 0 },
+      { zone: 'За баром', floor: '1', active: 0, total: 0 },
+    ],
+    photoRefLimit: 3,
     ttk: [
       { name: 'Хуго', category: 'Игристое', glass: 'Винный', method: 'Билд', ingredients: ['Просекко 100', 'Бузина 20'], garnish: 'Мята', notes: '', photoId: '' },
     ],

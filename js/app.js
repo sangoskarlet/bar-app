@@ -116,6 +116,7 @@ function resetTo(screen, ...args) {
 }
 function render() {
   runScreenCleanups();
+  guardSection(); // выключенный раздел — на главную, даже если пришли из истории
   const [screen, args] = stack[stack.length - 1];
   app.replaceChildren(screen(...args));
   window.scrollTo(0, 0);
@@ -127,6 +128,72 @@ function header(title, { showBack = true } = {}) {
     h('h1', {}, title),
     h('span'),
   );
+}
+
+// ---------------------------------------------------------------------
+//  РАЗДЕЛЫ ПРИЛОЖЕНИЯ: включение и выключение из таблицы
+//
+//  Владелец правит лист «Настройки»: раздел_викторина = выкл и т. п.
+//  Сервер отдаёт config.features = {quiz:true, duel:false, ...}.
+//  Нет поля или нет ключа — раздел включён: нельзя случайно оставить бар
+//  без приложения. Выключенный раздел не рисуем плиткой; прямой вход
+//  (история, ?duel=КОД) возвращает на главную с сообщением.
+//
+//  Синк это не трогает: записи из очереди отправляются как раньше,
+//  выключается только вход в раздел.
+// ---------------------------------------------------------------------
+const FEATURE_DEFAULT = {
+  quiz: true, duel: true, checklists: true, acts: true, photo: true,
+  inventory: true, ttk: true, transfer: true, writeoff: true,
+};
+
+/** {quiz:true, ...}: всё, чего нет в config.features, считаем включённым. */
+function featuresMap() {
+  const src = (config && config.features) || {};
+  const out = { ...FEATURE_DEFAULT };
+  for (const key of Object.keys(out)) if (src[key] === false) out[key] = false;
+  return out;
+}
+
+function sectionOn(key) {
+  if (!key) return true;
+  return featuresMap()[key] !== false;
+}
+
+/** К какому разделу относится экран ('' — служебный, входит всегда). */
+function screenFeature(screen, args) {
+  if (!screen) return '';
+  if (screen === screenHome || screen === screenLogin || screen === screenQueue) return '';
+  if (screen === screenItemsForm) return args && args[0] === 'transfer' ? 'transfer' : 'writeoff';
+  if (screen === screenActs || screen === screenAct || screen === screenActDone ||
+      screen === screenLabel || screen === screenCloseAct) return 'acts';
+  if (screen === screenPhoto || screen === screenPhotoChecking || screen === screenPhotoSent ||
+      screen === screenPhotoVerdict || screen === screenPhotoHistory) return 'photo';
+  if (screen === screenChecklists || screen === screenChecklistRun || screen === screenChecklistDone) return 'checklists';
+  if (screen === screenTtkList || screen === screenTtkCard) return 'ttk';
+  if (screen === screenInventory || screen === screenInvItems || screen === screenInvCount ||
+      screen === screenInvCustom) return 'inventory';
+  if (screen === screenQuizStart || screen === screenQuizQuestion || screen === screenQuizResult) return 'quiz';
+  if (screen === screenDuelStart || screen === screenDuelWait || screen === screenDuelBattle ||
+      screen === screenDuelResult) return 'duel';
+  return '';
+}
+
+/**
+ * Прямой переход в выключенный раздел не открываем: на главную и сообщение.
+ * Возвращает true, если пришлось вернуть.
+ */
+function guardSection() {
+  const top = stack[stack.length - 1];
+  if (!top) return false;
+  const [screen, args] = top;
+  const key = screenFeature(screen, args);
+  if (!key || sectionOn(key)) return false;
+  stack.length = 0;
+  stack.push([screenHome, []]);
+  history.replaceState({ depth: 1 }, '');
+  toast('Раздел временно недоступен', 'bad');
+  return true;
 }
 
 // ---------------------------------------------------------------------
@@ -147,15 +214,32 @@ function applyTheme() {
   if (meta) meta.content = winter ? '#3d0712' : '#0b0b0c';
 }
 
-async function loadConfig() {
+let configLoading = null;
+/** Один запрос справочника на всех: старт, deep-link и обновление не дублируются. */
+function loadConfig() {
+  if (!configLoading) {
+    configLoading = loadConfigOnce_().finally(() => { configLoading = null; });
+  }
+  return configLoading;
+}
+
+async function loadConfigOnce_() {
   const cached = await db.get('kv', 'config');
   if (cached) config = cached;
+  const before = JSON.stringify(featuresMap());
   try {
     const fresh = await apiGet({ action: 'config' });
     config = fresh;
     applyTheme();
     await db.put('kv', fresh, 'config');
     prefetchTtkPhotos(); // в фоне докачиваем фото ТТК для офлайна
+    // Раздел выключили, пока приложение было открыто: главную перерисовываем,
+    // из выключенного раздела — на главную. Включённый экран не трогаем,
+    // чтобы не стереть введённое.
+    if (JSON.stringify(featuresMap()) !== before && stack.length) {
+      const [screen, args] = stack[stack.length - 1];
+      if (screen === screenHome || !sectionOn(screenFeature(screen, args))) render();
+    }
   } catch (e) {
     console.warn('Справочник не обновлён:', e.message);
   }
@@ -288,6 +372,28 @@ function screenHome() {
   const tile = (ico, title, sub, onclick) =>
     h('button', { class: 'tile', onclick }, icon(ico), h('span', { class: 't-name' }, title), h('span', { class: 't-sub' }, sub));
 
+  // Выключенные в таблице разделы не рисуем вовсе: ни плитки, ни серых кнопок.
+  const tiles = isAdmin()
+    ? [ // Админ: только эти плитки
+      sectionOn('transfer') ? tile('transfer', 'Перенос', 'между точками', () => go(screenItemsForm, 'transfer')) : null,
+      sectionOn('writeoff') ? tile('writeoff', 'Списание', 'бой, порча, брак', () => go(screenItemsForm, 'writeoff')) : null,
+      sectionOn('inventory') ? tile('gift', 'Gift-shop', 'инвентаризация', () => go(screenInventory)) : null,
+      sectionOn('quiz') ? tile('quiz', 'Викторина', 'вопросы смены', () => go(screenQuizStart)) : null,
+      sectionOn('duel') ? tile('duel', 'Дуэль', 'два игрока', openDuel) : null,
+    ]
+    : [
+      sectionOn('transfer') ? tile('transfer', 'Перенос', 'кухня ⇄ бар', () => go(screenItemsForm, 'transfer')) : null,
+      sectionOn('writeoff') ? tile('writeoff', 'Списание', 'бой, порча, проливы', () => go(screenItemsForm, 'writeoff')) : null,
+      sectionOn('photo') ? tile('photo', 'Фото уборки', 'зоны после смены', () => go(screenPhoto)) : null,
+      sectionOn('checklists') ? tile('checklist', 'Чек-листы', 'смены и заготовки', () => go(screenChecklists)) : null,
+      sectionOn('ttk') ? tile('ttk', 'ТТК', 'рецептуры', () => go(screenTtkList)) : null,
+      sectionOn('inventory') ? tile('inv', 'Инвентаризация', 'подсчёт остатков', () => go(screenInventory)) : null,
+      sectionOn('quiz') ? tile('quiz', 'Викторина', 'вопросы смены', () => go(screenQuizStart)) : null,
+      sectionOn('duel') ? tile('duel', 'Дуэль', 'два игрока', openDuel) : null,
+      sectionOn('acts') ? actsTile() : null,
+    ];
+  const shown = tiles.filter(Boolean);
+
   return h('main', { class: 'screen' },
     h('header', { class: 'top' }, h('span'), h('div', { class: 'logo', role: 'img', 'aria-label': 'ESSE Jazz Club' }), h('span')),
     h('div', { class: 'who' },
@@ -305,25 +411,9 @@ function screenHome() {
       }, 'Сменить'),
     ),
     factLine(config && config.factOfDay),
-    h('div', { class: 'tiles' }, isAdmin()
-      ? [ // Админ: только эти плитки
-        tile('transfer', 'Перенос', 'между точками', () => go(screenItemsForm, 'transfer')),
-        tile('writeoff', 'Списание', 'бой, порча, брак', () => go(screenItemsForm, 'writeoff')),
-        tile('gift', 'Gift-shop', 'инвентаризация', () => go(screenInventory)),
-        tile('quiz', 'Викторина', 'вопросы смены', () => go(screenQuizStart)),
-        tile('duel', 'Дуэль', 'два игрока', openDuel),
-      ]
-      : [
-        tile('transfer', 'Перенос', 'кухня ⇄ бар', () => go(screenItemsForm, 'transfer')),
-        tile('writeoff', 'Списание', 'бой, порча, проливы', () => go(screenItemsForm, 'writeoff')),
-        tile('photo', 'Фото уборки', 'зоны после смены', () => go(screenPhoto)),
-        tile('checklist', 'Чек-листы', 'смены и заготовки', () => go(screenChecklists)),
-        tile('ttk', 'ТТК', 'рецептуры', () => go(screenTtkList)),
-        tile('inv', 'Инвентаризация', 'подсчёт остатков', () => go(screenInventory)),
-        tile('quiz', 'Викторина', 'вопросы смены', () => go(screenQuizStart)),
-        tile('duel', 'Дуэль', 'два игрока', openDuel),
-        actsTile(),
-      ]),
+    shown.length
+      ? h('div', { class: 'tiles' }, shown)
+      : h('p', { class: 'hint' }, 'Все разделы выключены. Включите нужные в таблице — лист «Настройки».'),
   );
 }
 
@@ -648,7 +738,9 @@ function screenLabel() {
 /** Закрыть акт: вписать, сколько получилось. Может любой бармен. */
 function screenCloseAct(a) {
   const root = h('main', { class: 'screen' }, header('Закрыть акт'));
-  const qty = h('input', { type: 'text', inputmode: 'decimal', placeholder: '0', class: 'qty big' });
+  // Выход может быть позицией-парой (мята): тогда два поля вместо одного.
+  const closePair = makePairBlock(a.item, { big: true, unit: a.unit });
+  const qty = closePair ? closePair.input : h('input', { type: 'text', inputmode: 'decimal', placeholder: '0', class: 'qty big' });
   const info = h('p', { class: 'total' });
   const comment = h('textarea', { rows: '2', placeholder: 'Комментарий (необязательно)' });
   const saveBtn = h('button', { class: 'primary' }, '✅ Закрыть акт');
@@ -670,14 +762,15 @@ function screenCloseAct(a) {
     labelSlot.replaceChildren(labelBox.el);
   };
 
-  qty.addEventListener('input', () => {
+  const recalcInfo = () => {
     const v = parseQty(qty.value);
     if (!(v > 0) || !(a.expected > 0)) { info.textContent = ''; return; }
     const d = dev(v);
     info.textContent = Math.abs(d) < 1 ? 'Точно как ожидалось' : `${d > 0 ? '+' : ''}${fmtNum(d)}% от ожидаемого`;
     info.classList.toggle('warn', Math.abs(d) >= 15);
-  });
-  qty.addEventListener('input', syncLabel);
+  };
+  qty.addEventListener('input', () => { recalcInfo(); syncLabel(); });
+  if (closePair) closePair.otherInput.addEventListener('input', () => { recalcInfo(); syncLabel(); });
   saveBtn.addEventListener('click', async () => {
     const v = parseQty(qty.value);
     if (!(v > 0)) return toast('Введите, сколько получилось', 'bad');
@@ -688,15 +781,17 @@ function screenCloseAct(a) {
     }
     saveBtn.disabled = true;
     const madeAt = labelBox ? labelBox.madeAt : startedAt;
+    const pairNote = closePair ? closePair.summary() : '';
     await enqueue({ type: 'processingClose', name: session.name, pin: session.pin, actId: a.id, act: a.act,
-      qty: v, unit: a.unit, comment: comment.value.trim() });
+      qty: v, unit: a.unit, comment: comment.value.trim(), pair: closePair ? closePair.meta() : null });
     toast('Акт закрыт');
     stack.pop(); // экран закрытия в истории заменяем на «Акт закрыт» + этикетка
     go(screenActDone, {
       title: 'Акт закрыт',
       name: a.item || '',
       madeAt,
-      note: 'Дата производства — время начала акта: время закрытия в таблице не хранится.',
+      note: 'Дата производства — время начала акта: время закрытия в таблице не хранится.' +
+        (pairNote ? ' ' + pairNote : ''),
     });
   });
   root.append(
@@ -708,8 +803,9 @@ function screenCloseAct(a) {
     a.comment ? h('p', { class: 'muted' }, '💬 ' + a.comment) : null,
     h('p', { class: 'label' }, `Получилось: ${a.item}, ${a.unit}`),
     a.expected > 0 ? h('p', { class: 'hint left' }, `Ожидается ≈ ${fmtNum(a.expected)} ${a.unit} · ${a.basis}`) : null,
-    qty, info, labelSlot, comment, saveBtn);
-  setTimeout(() => qty.focus(), 50);
+    closePair ? closePair.el : qty,
+    info, labelSlot, comment, saveBtn);
+  setTimeout(() => (closePair ? closePair.focus() : qty.focus()), 50);
   return root;
 }
 
@@ -850,21 +946,116 @@ function openItemPicker(onPick) {
 }
 
 // =====================================================================
-//  ЭКРАН: ФОТО УБОРКИ
+//  ЭКРАН: ФОТО УБОРКИ — этаж → зоны этажа → камера
 // =====================================================================
-function screenPhoto(initialZone) {
-  const form = { zone: initialZone || '', comment: '', photos: [] }; // photos: [dataURL]
-  const root = h('main', { class: 'screen' }, header('Фото уборки'));
+//  Сервер отдаёт config.photoZones: [{zone, floor}] и config.photoRefs:
+//  [{zone, floor, active, total}]. Список зон фиксированный и все зоны
+//  размечены по этажам, поэтому группы «Без этажа» на экране нет.
+function photoZoneGroups() {
+  const src = (config && Array.isArray(config.photoZones) && config.photoZones.length)
+    ? config.photoZones
+    : ((config && config.zones) || []).map(zone => ({ zone: zone, floor: '1' }));
+  const groups = new Map();
+  src.forEach(item => {
+    const zone = String((item && item.zone) || '').trim();
+    if (!zone) return;
+    // Пустой этаж не показываем как «Без этажа»: относим зону к 1 этажу,
+    // чтобы бармен её не потерял, даже если в таблице забыли этаж.
+    const floor = String((item && item.floor) || '').trim() || '1';
+    if (!groups.has(floor)) groups.set(floor, []);
+    if (!groups.get(floor).includes(zone)) groups.get(floor).push(zone);
+  });
+  // Этажи: числа по возрастанию, потом текст.
+  const floors = [...groups.keys()];
+  floors.sort((a, b) => {
+    const na = parseInt(a, 10), nb = parseInt(b, 10);
+    const fa = isFinite(na), fb = isFinite(nb);
+    if (fa && fb && na !== nb) return na - nb;
+    if (fa !== fb) return fa ? -1 : 1;
+    return a.localeCompare(b, 'ru');
+  });
+  return { groups: groups, floors: floors };
+}
 
-  const zones = h('div', { class: 'chips' }, config.zones.map(z =>
-    h('button', {
-      class: 'chip' + (z === form.zone ? ' on' : ''),
-      onclick: (e) => {
-        form.zone = z;
-        zones.querySelectorAll('.chip').forEach(x => x.classList.remove('on'));
-        e.currentTarget.classList.add('on');
+function floorLabel(floor) {
+  const f = String(floor || '').trim();
+  if (!f) return 'Без этажа';
+  return /^\d+$/.test(f) ? f + ' этаж' : f;
+}
+
+function zonesWord(n) {
+  const d = n % 10, dd = n % 100;
+  if (d === 1 && dd !== 11) return 'зона';
+  if (d >= 2 && d <= 4 && (dd < 12 || dd > 14)) return 'зоны';
+  return 'зон';
+}
+
+function screenPhoto(initialZone) {
+  const form = { floor: null, floorPicked: false, zone: initialZone || '', comment: '', photos: [] };
+  const all = photoZoneGroups();
+
+  // «Переснять» приносит уже выбранную зону: находим её этаж и сразу
+  // показываем форму. Если зоны нет в списке — относим её к 1 этажу.
+  if (form.zone) {
+    const found = [...all.groups.entries()].find(([, zs]) => zs.includes(form.zone));
+    form.floor = found ? found[0] : '1';
+    form.floorPicked = true;
+    if (!found) {
+      if (!all.groups.has('1')) { all.groups.set('1', []); all.floors.push('1'); }
+      all.groups.get('1').push(form.zone);
+    }
+  }
+
+  const root = h('main', { class: 'screen' }, header('Фото уборки'));
+  const floorBox = h('div', { class: 'photo-floors' });
+  const zoneBox = h('div', { class: 'chips' });
+  const zoneCaption = h('p', { class: 'photo-zone-picked' });
+  const zoneStep = h('section', { class: 'photo-step', hidden: true },
+    h('p', { class: 'label' }, 'Зона этого этажа'), zoneBox);
+
+  function drawFloors() {
+    floorBox.replaceChildren(...all.floors.map(f => {
+      const count = (all.groups.get(f) || []).length;
+      const on = form.floorPicked && f === form.floor;
+      return h('button', {
+        class: 'floor-btn' + (on ? ' on' : ''),
+        type: 'button',
+        'aria-pressed': on ? 'true' : 'false',
+        onclick: () => {
+          form.floor = f;
+          form.floorPicked = true;
+          form.zone = '';
+          drawFloors();
+          drawZones();
+          formStep.hidden = true;
+        },
       },
-    }, z)));
+        h('span', { class: 'floor-name' }, floorLabel(f)),
+        h('span', { class: 'floor-sub' }, `${count} ${zonesWord(count)}`));
+    }));
+  }
+
+  function drawZones() {
+    const list = form.floorPicked ? (all.groups.get(form.floor) || []) : [];
+    zoneBox.replaceChildren(...list.map(z => {
+      const on = z === form.zone;
+      return h('button', {
+        class: 'chip' + (on ? ' on' : ''),
+        type: 'button',
+        'aria-pressed': on ? 'true' : 'false',
+        onclick: () => chooseZone(z),
+      }, z);
+    }));
+    zoneStep.hidden = !form.floorPicked;
+  }
+
+  function chooseZone(z) {
+    form.zone = z;
+    drawZones();
+    zoneCaption.replaceChildren('Зона: ', h('b', {}, z));
+    formStep.hidden = false;
+    setTimeout(() => { if (document.body.contains(formStep)) formStep.scrollIntoView({ block: 'nearest' }); }, 30);
+  }
 
   const previews = h('div', { class: 'previews' });
   function drawPreviews() {
@@ -910,15 +1101,28 @@ function screenPhoto(initialZone) {
     resetTo(screenPhotoChecking, records, form.zone);
   });
 
-  root.append(
-    h('p', { class: 'label' }, 'Зона'), zones,
+  const formStep = h('section', { class: 'photo-step photo-form', hidden: true },
     h('p', { class: 'label' }, 'Фото'),
+    zoneCaption,
     h('div', { class: 'two' },
       h('button', { class: 'secondary', onclick: () => camInput.click() }, '📷 Камера'),
       h('button', { class: 'secondary', onclick: () => galInput.click() }, '🖼 Галерея')),
-    camInput, galInput, previews, comment, saveBtn,
+    camInput, galInput, previews, comment, saveBtn);
+
+  root.append(
+    h('section', { class: 'photo-step' },
+      h('p', { class: 'label' }, 'Этаж'),
+      h('p', { class: 'muted photo-floor-hint' }, 'Сначала этаж, потом зона этого этажа.'),
+      floorBox),
+    zoneStep, formStep,
     h('button', { class: 'link photo-history-link', onclick: () => go(screenPhotoHistory) }, 'История снимков'),
   );
+
+  drawFloors();
+  if (form.floorPicked) {
+    drawZones();
+    if (form.zone) chooseZone(form.zone);
+  }
   return root;
 }
 
@@ -2108,6 +2312,183 @@ function smartRound(v) {
   return Number(v.toPrecision(2));
 }
 
+// =====================================================================
+//  ПАРЫ ПОЗИЦИЙ: мята — листья и ветки
+//
+//  Владелец добавляет строку в лист «Пары позиций» — приложение показывает
+//  у такой позиции два поля и пересчитывает одно в другое по долям.
+//  Доли приходят из таблицы уже нормализованными (сумма 1.0), например 0.6 / 0.4.
+//
+//  Что считается «своим», а что «вторым»: строка акта всегда про одну позицию
+//  (например, «Мята (листья)»). Второе поле — партнёр из пары («Мята (ветки)»).
+//  Ввод в любое поле пересчитывает другое и помечает введённое как источник —
+//  в акт уходит признак, что именно взвесили.
+//
+//  В расчёт выхода акта идёт только количество своей позиции: вторая доля
+//  (ветки) — справочная, это отход, а не результат. Прежние формулы не меняются.
+// =====================================================================
+
+/** Активная пара, в которую входит позиция (или null). */
+function pairFor(item) {
+  const key = nameKey(item);
+  if (!key) return null;
+  const list = (config && config.pairs) || [];
+  return list.find(p => nameKey(p.a) === key || nameKey(p.b) === key) || null;
+}
+
+/** «Мята (листья)» → «листья»; название без скобок возвращается как есть. */
+function pairPart(name) {
+  const m = /\(([^)]+)\)/.exec(String(name || ''));
+  return (m ? m[1] : String(name || '')).trim().toLowerCase();
+}
+
+/** «Мята (листья)» → «Мята»; используется в итоговой строке акта. */
+function pairBase(name) {
+  return String(name || '').replace(/\s*\([^)]*\)\s*$/, '').trim();
+}
+
+/** Родительный падеж для итоговой строки; незнакомое слово оставляем как есть. */
+const PAIR_GENITIVE = {
+  'листья': 'листьев', 'листьев': 'листьев',
+  'ветки': 'веток', 'веток': 'веток',
+  'стебли': 'стеблей', 'стеблей': 'стеблей',
+  'корни': 'корней', 'корней': 'корней',
+  'цедра': 'цедры', 'сок': 'сока',
+};
+function pairGenitive(part) {
+  return PAIR_GENITIVE[String(part || '').toLowerCase()] || part;
+}
+
+/**
+ * Два поля для позиции-пары. null — позиция не в паре (форма как раньше).
+ *
+ * @param {string} itemName  позиция строки акта (например, «Мята (листья)»)
+ * @param {{big?:boolean, unit?:string, onChange?:Function}} opts
+ * @returns {?{el:HTMLElement, input:HTMLInputElement, otherInput:HTMLInputElement,
+ *            inputs:HTMLInputElement[], value:Function, setOwn:Function,
+ *            meta:Function, summary:Function, focus:Function}}
+ */
+function makePairBlock(itemName, opts = {}) {
+  const pair = pairFor(itemName);
+  if (!pair) return null;
+
+  const isA = nameKey(pair.a) === nameKey(itemName);
+  const ownName = isA ? pair.a : pair.b;
+  const otherName = isA ? pair.b : pair.a;
+  const shareA = Number(pair.shareA);
+  const shareB = Number(pair.shareB);
+  const ownShare = isA ? shareA : shareB;
+  const otherShare = isA ? shareB : shareA;
+  const unit = opts.unit || 'г';
+  if (!(ownShare > 0) || !(otherShare > 0)) return null; // сервер такую пару не отдаст
+
+  const partA = pairPart(pair.a);
+  const partB = pairPart(pair.b);
+  const mkInput = () => h('input', {
+    type: 'text', inputmode: 'decimal', placeholder: '0',
+    class: 'qty' + (opts.big ? ' big' : ''),
+  });
+  const inputA = mkInput();
+  const inputB = mkInput();
+  const badgeA = h('span', { class: 'pair-badge hidden' }, 'взвешено');
+  const badgeB = h('span', { class: 'pair-badge hidden' }, 'взвешено');
+  const note = h('p', { class: 'pair-note muted' });
+  let source = ''; // 'a' | 'b' — какое поле ввели вручную
+
+  const fld = (part, input, badge) => h('div', { class: 'pair-field' },
+    h('span', { class: 'pair-cap' }, `${part}, ${unit}`),
+    h('div', { class: 'pair-line' }, input, badge));
+
+  const el = h('div', { class: 'pair-block' },
+    h('div', { class: 'pair-grid' }, fld(partA, inputA, badgeA), fld(partB, inputB, badgeB)),
+    note);
+
+  const showSource = () => {
+    badgeA.classList.toggle('hidden', source !== 'a');
+    badgeB.classList.toggle('hidden', source !== 'b');
+  };
+
+  const updateNote = () => {
+    const a = parseQty(inputA.value), b = parseQty(inputB.value);
+    const total = (isFinite(a) ? a : 0) + (isFinite(b) ? b : 0);
+    note.textContent = `Доли ${shareA} / ${shareB} · ` +
+      (total > 0 ? `всего ${fmtNum(Math.round(total))} ${unit}` : 'одно поле считается из другого');
+  };
+
+  /** Пересчёт второго поля по долям: целые граммы, округление. */
+  const syncFrom = which => {
+    source = which;
+    const from = which === 'a' ? inputA : inputB;
+    const to = which === 'a' ? inputB : inputA;
+    const fromShare = which === 'a' ? shareA : shareB;
+    const toShare = which === 'a' ? shareB : shareA;
+    if (from.value.trim() === '') {
+      to.value = '';
+    } else {
+      const v = parseQty(from.value);
+      if (isFinite(v)) to.value = String(Math.round(v * toShare / fromShare));
+    }
+    showSource();
+    updateNote();
+    if (opts.onChange) opts.onChange();
+  };
+
+  inputA.addEventListener('input', () => syncFrom('a'));
+  inputB.addEventListener('input', () => syncFrom('b'));
+
+  const primary = isA ? inputA : inputB;
+  const otherInput = isA ? inputB : inputA;
+  const ownPart = isA ? partA : partB;
+  const otherPart = isA ? partB : partA;
+
+  /** Программная подстановка (рецепт, «постоянное»): второе поле считаем сами. */
+  const setOwn = v => {
+    primary.value = v === '' || v === null || v === undefined ? '' : String(v).replace('.', ',');
+    if (primary.value === '') {
+      otherInput.value = '';
+    } else {
+      const n = parseQty(primary.value);
+      if (isFinite(n)) otherInput.value = String(Math.round(n * otherShare / ownShare));
+    }
+    source = '';
+    showSource();
+    updateNote();
+  };
+
+  const meta = () => {
+    const own = parseQty(primary.value);
+    if (!(own > 0)) return null;
+    const other = parseQty(otherInput.value);
+    const ownIsSource = source === '' || source === (isA ? 'a' : 'b');
+    return {
+      item: otherName,
+      qty: isFinite(other) ? Math.round(other) : 0,
+      source: ownIsSource ? 'own' : 'other',
+    };
+  };
+
+  /** Итоговая строка для экрана «Акт сохранён»: «мята: 120 г листьев / 80 г веток …». */
+  const summary = () => {
+    const own = parseQty(primary.value), other = parseQty(otherInput.value);
+    if (!(own > 0) || !isFinite(other)) return '';
+    const aVal = isA ? own : other;
+    const bVal = isA ? other : own;
+    const weighed = source === '' ? ownPart : (source === 'a' ? partA : partB);
+    const baseA = pairBase(pair.a), baseB = pairBase(pair.b);
+    const title = nameKey(baseA) === nameKey(baseB) ? baseA.toLowerCase() : `${baseA} / ${baseB}`.toLowerCase();
+    return `${title}: ${Math.round(aVal)} ${unit} ${pairGenitive(partA)} / ` +
+      `${Math.round(bVal)} ${unit} ${pairGenitive(partB)} ` +
+      `(по коэффициенту ${shareA}/${shareB}, взвешены ${weighed})`;
+  };
+
+  updateNote();
+  return {
+    el, input: primary, otherInput, inputs: [inputA, inputB],
+    value: () => parseQty(primary.value),
+    setOwn, meta, summary, focus: () => primary.focus(),
+  };
+}
+
 function screenActs() {
   const root = h('main', { class: 'screen' }, header('Переработка'));
   const acts = config.acts || [];
@@ -2151,7 +2532,9 @@ function screenAct(act) {
   const info = h('p', { class: 'total' });
   const comment = h('textarea', { rows: '2', placeholder: 'Комментарий (необязательно)' });
   const saveBtn = h('button', { class: 'primary' }, 'Сохранить акт');
-  const outInput = numInput(true);
+  // Позиция выхода в паре (например, «Мята (листья)») — два поля вместо одного.
+  const outPair = makePairBlock(act.output.item, { big: true, unit: act.output.unit });
+  const outInput = outPair ? outPair.input : numInput(true);
   let expectedOut = null;
 
   // Этикетка появляется, как только вписан выход: акт готов.
@@ -2173,15 +2556,19 @@ function screenAct(act) {
   // ---------- Простой акт: было → стало ----------
   if (!isRecipe) {
     const key = act.inputs[0];
-    const keyInput = numInput(true);
+    const keyPair = makePairBlock(key.item, { big: true, unit: key.unit });
+    const keyInput = keyPair ? keyPair.input : numInput(true);
     const recalc = () => {
       const k = parseQty(keyInput.value), o = parseQty(outInput.value);
       info.textContent = k > 0 && o >= 0 ? `Выход: ${fmtNum(o / k * 100)}%` : '';
     };
     keyInput.addEventListener('input', recalc);
     outInput.addEventListener('input', recalc);
-    outInput.placeholder = 'пусто = впишу позже';
+    if (keyPair) keyPair.otherInput.addEventListener('input', recalc);
+    if (outPair) outPair.otherInput.addEventListener('input', recalc);
+    if (!outPair) outInput.placeholder = 'пусто = впишу позже';
     outInput.addEventListener('input', () => setSaveLabel(saveBtn, outInput));
+    if (outPair) outPair.otherInput.addEventListener('input', () => setSaveLabel(saveBtn, outInput));
     saveBtn.addEventListener('click', async () => {
       const k = parseQty(keyInput.value);
       const later = outInput.value.trim() === '';
@@ -2190,23 +2577,24 @@ function screenAct(act) {
       if (!later && !(o > 0)) return toast('Проверьте, сколько стало', 'bad');
       saveBtn.disabled = true;
       const madeAt = labelBox ? labelBox.madeAt : new Date();
+      const pairNotes = [keyPair && keyPair.summary(), outPair && outPair.summary()].filter(Boolean);
       await enqueue({ type: 'processing', name: session.name, pin: session.pin, act: act.name, comment: comment.value.trim(),
         pending: later,
-        lines: [{ role: 'Сырьё', item: key.item, unit: key.unit, qty: k },
-                { role: 'Результат', item: act.output.item, unit: act.output.unit, qty: o }] });
+        lines: [{ role: 'Сырьё', item: key.item, unit: key.unit, qty: k, pair: keyPair ? keyPair.meta() : null },
+                { role: 'Результат', item: act.output.item, unit: act.output.unit, qty: o, pair: outPair ? outPair.meta() : null }] });
       toast(later ? 'Сохранено. Выход впишете позже в «⏳ В работе»' : 'Акт сохранён');
       if (later) return back();
       // Акт готов — сразу этикетка, чтобы не искать её потом
       stack.pop();
-      go(screenActDone, { name: act.output.item || '', madeAt });
+      go(screenActDone, { name: act.output.item || '', madeAt, note: pairNotes.join(' · ') });
     });
     setSaveLabel(saveBtn, outInput);
     root.append(
-      h('p', { class: 'label' }, `Было: ${key.item}, ${key.unit}`), keyInput,
-      h('p', { class: 'label' }, `Стало: ${act.output.item}, ${act.output.unit}`), outInput,
+      h('p', { class: 'label' }, `Было: ${key.item}, ${key.unit}`), keyPair ? keyPair.el : keyInput,
+      h('p', { class: 'label' }, `Стало: ${act.output.item}, ${act.output.unit}`), outPair ? outPair.el : outInput,
       h('p', { class: 'muted' }, 'Ещё не готово? Оставьте «стало» пустым — допишете потом.'),
       info, labelSlot, comment, saveBtn);
-    setTimeout(() => keyInput.focus(), 50);
+    setTimeout(() => (keyPair ? keyPair.focus() : keyInput.focus()), 50);
     return root;
   }
 
@@ -2215,12 +2603,17 @@ function screenAct(act) {
   // Количество в рецепте — это вес «в дело» (для чистки — чистый вес).
   const key = act.inputs.find(i => i.key) || act.inputs[0];
   const rows = act.inputs.map(i => {
-    const amount = numInput(i === key);
+    const pair = makePairBlock(i.item, { unit: i.unit });
+    const amount = pair ? pair.input : numInput(i === key);
     const raw = i.clean ? numInput(false) : null;
     amount.dataset.dirty = '';
     amount.addEventListener('input', () => { if (i !== key) amount.dataset.dirty = '1'; });
-    if (i.fixed && i.qty > 0) amount.value = String(i.qty).replace('.', ',');
-    return { i, amount, raw };
+    if (pair) pair.otherInput.addEventListener('input', () => { if (i !== key) amount.dataset.dirty = '1'; });
+    if (i.fixed && i.qty > 0) {
+      if (pair) pair.setOwn(i.qty);
+      else amount.value = String(i.qty).replace('.', ',');
+    }
+    return { i, amount, raw, pair };
   });
   const keyRow = rows.find(r => r.i === key);
 
@@ -2230,7 +2623,9 @@ function screenAct(act) {
       const f = k / key.qty;
       rows.forEach(r => {
         if (r.i === key || r.i.fixed || r.amount.dataset.dirty || !(r.i.qty > 0)) return;
-        r.amount.value = String(smartRound(r.i.qty * f)).replace('.', ',');
+        const v = smartRound(r.i.qty * f);
+        if (r.pair) r.pair.setOwn(v);
+        else r.amount.value = String(v).replace('.', ',');
       });
       // Выход не подставляем — только подсказка: его вписывают, когда заготовка готова
       if (act.output.qty > 0) { expectedOut = smartRound(act.output.qty * f); outInput.placeholder = `≈ ${String(expectedOut).replace('.', ',')} по рецепту, или пусто — позже`; }
@@ -2245,6 +2640,7 @@ function screenAct(act) {
   }
   rows.forEach(r => {
     r.amount.addEventListener('input', recalc);
+    if (r.pair) r.pair.otherInput.addEventListener('input', recalc);
     if (r.raw) { r.raw.addEventListener('input', recalc); r.pct = h('p', { class: 'muted' }); }
   });
 
@@ -2254,29 +2650,33 @@ function screenAct(act) {
       const a = r.amount.value.trim() === '' ? 0 : parseQty(r.amount.value);
       if (!(a >= 0)) return toast(`Проверьте: ${r.i.item}`, 'bad');
       if (r.i === key && !(a > 0)) return toast(`Введите: ${r.i.item}`, 'bad');
+      const pair = r.pair ? r.pair.meta() : null;
       if (r.raw) {
         const w = parseQty(r.raw.value);
         if (a > 0 && !(w > 0)) return toast(`${r.i.item}: введите вес до чистки`, 'bad');
         if (a > w) return toast(`${r.i.item}: чистый вес больше, чем до чистки`, 'bad');
-        lines.push({ role: 'Сырьё', item: r.i.item, unit: r.i.unit, qty: a > 0 ? w : 0, clean: a });
+        lines.push({ role: 'Сырьё', item: r.i.item, unit: r.i.unit, qty: a > 0 ? w : 0, clean: a, pair });
       } else {
-        lines.push({ role: 'Сырьё', item: r.i.item, unit: r.i.unit, qty: a });
+        lines.push({ role: 'Сырьё', item: r.i.item, unit: r.i.unit, qty: a, pair });
       }
     }
     const later = outInput.value.trim() === '';
     const o = later ? 0 : parseQty(outInput.value);
     if (!later && !(o > 0)) return toast('Проверьте, сколько получилось', 'bad');
-    lines.push({ role: 'Результат', item: act.output.item, unit: act.output.unit, qty: o });
+    lines.push({ role: 'Результат', item: act.output.item, unit: act.output.unit, qty: o, pair: outPair ? outPair.meta() : null });
     saveBtn.disabled = true;
     const madeAt = labelBox ? labelBox.madeAt : new Date();
+    const pairNotes = rows.map(r => r.pair && r.pair.summary()).filter(Boolean);
+    if (outPair) pairNotes.push(outPair.summary());
     await enqueue({ type: 'processing', name: session.name, pin: session.pin, act: act.name, lines, comment: comment.value.trim(),
       pending: later, expected: later ? expectedOut : null });
     toast(later ? 'Сохранено. Выход впишете позже в «⏳ В работе»' : 'Акт сохранён');
     if (later) return back();
     stack.pop();
-    go(screenActDone, { name: act.output.item || '', madeAt });
+    go(screenActDone, { name: act.output.item || '', madeAt, note: pairNotes.filter(Boolean).join(' · ') });
   });
   outInput.addEventListener('input', () => setSaveLabel(saveBtn, outInput));
+  if (outPair) outPair.otherInput.addEventListener('input', () => setSaveLabel(saveBtn, outInput));
   setSaveLabel(saveBtn, outInput);
 
   const block = (r) => {
@@ -2288,11 +2688,16 @@ function screenAct(act) {
       r.amount.placeholder = 'чистый';
       return h('div', { class: 'clean-block' + (i === key ? ' key' : '') },
         h('p', { class: 'label' }, `${i.item}${tag}`),
-        h('div', { class: 'clean-line' }, r.raw, h('span', { class: 'arrow' }, '='), r.amount, h('span', { class: 'unit' }, i.unit)),
-        h('div', { class: 'clean-caps' }, h('span', {}, 'грязный'), h('span', {}), h('span', {}, 'чистый (идёт в рецепт)'), h('span', {})),
+        r.pair
+          ? h('div', {}, h('p', { class: 'muted' }, 'Грязный вес (до чистки), ' + i.unit), r.raw)
+          : h('div', { class: 'clean-line' }, r.raw, h('span', { class: 'arrow' }, '='), r.amount, h('span', { class: 'unit' }, i.unit)),
+        r.pair ? h('p', { class: 'muted' }, 'Чистый вес — в паре:') : null,
+        r.pair ? r.pair.el : null,
+        r.pair ? null : h('div', { class: 'clean-caps' }, h('span', {}, 'грязный'), h('span', {}), h('span', {}, 'чистый (идёт в рецепт)'), h('span', {})),
         r.pct);
     }
-    if (i === key) return h('div', {}, h('p', { class: 'label' }, `${i.item}, ${i.unit}${tag}`), r.amount);
+    if (i === key) return h('div', {}, h('p', { class: 'label' }, `${i.item}, ${i.unit}${tag}`), r.pair ? r.pair.el : r.amount);
+    if (r.pair) return h('div', { class: 'pair-row' }, h('p', { class: 'label' }, `${i.item}${tag}`), r.pair.el);
     return h('div', { class: 'act-line' }, h('span', {}, i.item + (i.fixed ? ' · пост.' : '')), r.amount, h('span', { class: 'unit' }, i.unit));
   };
   const keyFirst = [keyRow, ...rows.filter(r => r !== keyRow)];
@@ -2916,6 +3321,7 @@ function startDuelPoll(duelId, onState, onError) {
 
 /** Плитка «Дуэль»: если матч уже идёт — сразу возвращаемся в него. */
 async function openDuel() {
+  if (!sectionOn('duel')) return toast('Раздел временно недоступен', 'bad');
   const saved = await db.get('kv', DUEL_ACTIVE_KEY);
   if (saved && saved.duelId) {
     try {
@@ -2956,8 +3362,13 @@ async function handleDuelEntry() {
   if (pendingDuelCode) {
     const code = pendingDuelCode;
     pendingDuelCode = '';
+    // Справочник мог лежать в кэше: перед входом по ссылке берём свежие флаги.
+    await loadConfig();
+    if (!sectionOn('duel')) { toast('Раздел временно недоступен', 'bad'); return; }
     return joinDuelByCode(code);
   }
+  // Дуэль выключена: незакрытый матч не восстанавливаем и не мешаем работать.
+  if (!sectionOn('duel')) return;
   return restoreDuelIfAny();
 }
 

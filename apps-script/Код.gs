@@ -41,7 +41,8 @@ const SHEETS = {
   invCounts: 'Подсчёт',   // каждая цифра от бармена — отдельная строка
   actTpl:    'Шаблоны переработки', // какие акты бывают и их рецепты
   acts:      'Акты переработки',    // журнал актов: строка на каждое сырьё и результат
-  refs:      'Эталоны уборки',      // зона → что проверять + эталонное фото (для ИИ-проверки)
+  refs:      'Эталоны уборки',      // зона → этаж, что проверять, эталонное фото (для ИИ-проверки)
+  refPhotos: 'Эталоны — фото',      // несколько эталонных снимков на зону (для ИИ-проверки)
   questions: 'Вопросы',             // банк вопросов викторины (создаётся setupQuiz)
   disputes:  'Обжалования',         // жалобы на вопросы викторины (создаётся setupQuiz)
   duels:     'Дуэли',               // история матчей (создаётся автоматически)
@@ -54,6 +55,8 @@ const SHEETS = {
   facts:     'Факты',               // факт дня на главном экране (создаётся автоматически)
   checklists: 'Чек-листы',          // списки пунктов, которые правит владелец (создаётся автоматически)
   checklistMarks: 'Чек-листы — отметки', // история прохождений (создаётся автоматически)
+  settings:  'Настройки',           // разделы приложения вкл/выкл (создаётся автоматически)
+  pairs:     'Пары позиций',        // позиции, которые взвешивают вместе: мята — листья и ветки
 };
 
 // В каком столбце листа лежит ID записи (считаем с 1: A=1, B=2 ...).
@@ -194,8 +197,42 @@ function getConfig_() {
     log_('Чек-листы', 'не прочитаны: ' + String(e && e.stack || e));
   }
 
+  // Проверка фото: этажи зон и эталонные снимки. Старое поле «zones» остаётся
+  // прежним массивом строк — новые поля только добавляются, старый клиент не ломается.
+  // Миграция этажей и листа эталонов идёт здесь же и повторный вызов ничего не дублирует.
+  let photoZones = zones.map(z => ({ zone: z, floor: '' }));
+  let photoRefs = [];
+  try {
+    photoMigrate_(ss);
+    photoZones = photoZones_(ss, zones);
+    photoRefs = photoRefSummaries_(photoZones, photoRefPhotosAll_(ss));
+  } catch (e) {
+    log_('Проверка фото', 'этажи/эталоны не прочитаны: ' + String(e && e.stack || e));
+  }
+
+  // Флаги разделов: лист «Настройки». Нет листа, нет ключа или ошибка чтения —
+  // раздел включён. Иначе опечатка в таблице могла бы оставить бар без приложения.
+  let features = featuresDefault_();
+  try {
+    features = features_(ss);
+  } catch (e) {
+    log_('Настройки', 'не прочитаны, все разделы включены: ' + String(e && e.stack || e));
+  }
+
+  // Пары позиций (мята: листья и ветки). Ошибка чтения не ломает config —
+  // приложение просто покажет одно поле, как раньше.
+  let pairs = [];
+  try {
+    pairs = pairs_(ss);
+  } catch (e) {
+    log_('Пары позиций', 'не прочитаны: ' + String(e && e.stack || e));
+  }
+
   return {
     theme, ok: true, employees, items, reasons, zones, ttk, inventory, acts, shelfLife, factOfDay, checklists,
+    photoZones, photoRefs, photoRefLimit: PHOTO_MAX_REFS,
+    features,
+    pairs,
     directions: DIRECTIONS, units: UNITS };
 }
 
@@ -251,6 +288,401 @@ function inventoryItems_(ss) {
       density: num_(r[6]),
     }));
 }
+
+/* =====================================================================
+ *  ФЛАГИ РАЗДЕЛОВ — что показывать в приложении
+ * =====================================================================
+ *
+ *  Лист «Настройки» (создаётся автоматически при первом чтении config):
+ *    ключ | значение | комментарий
+ *
+ *  Значение: «вкл» / «выкл» (регистр не важен). Пусто = «вкл».
+ *  Нет листа или нет ключа — раздел ВКЛЮЧЁН: опечатка в таблице не должна
+ *  оставить бар без приложения. Неизвестное значение тоже считается
+ *  включённым, а в «Лог» пишется предупреждение.
+ *
+ *  Флаги — только про вход в раздел. Очередь отправляется как раньше:
+ *  записи, уже сохранённые на телефоне (викторина, чек-листы и т. п.),
+ *  уходят на сервер независимо от флагов. Сервер записи не отклоняет.
+ * ===================================================================== */
+
+const SETTINGS_HEADERS = ['ключ', 'значение', 'комментарий'];
+
+/** Ключи таблицы → поля config.features. Порядок = порядок строк в листе. */
+const FEATURE_KEYS = [
+  { code: 'quiz',       key: 'раздел_викторина',     note: 'Викторина — вопросы смены' },
+  { code: 'duel',       key: 'раздел_дуэль',         note: 'Дуэль — игра на двоих' },
+  { code: 'checklists', key: 'раздел_чеклисты',      note: 'Чек-листы — смены и заготовки' },
+  { code: 'acts',       key: 'раздел_акты',          note: 'Переработка — акты и этикетки' },
+  { code: 'photo',      key: 'раздел_фото',          note: 'Фото уборки — зоны после смены' },
+  { code: 'inventory',  key: 'раздел_инвентаризация', note: 'Инвентаризация — подсчёт остатков' },
+  { code: 'ttk',        key: 'раздел_ттк',           note: 'ТТК — рецептуры' },
+  { code: 'transfer',   key: 'раздел_перенос',       note: 'Перенос — кухня ⇄ бар' },
+  { code: 'writeoff',   key: 'раздел_списание',      note: 'Списание — бой, порча, проливы' },
+];
+
+/** Все разделы включены — ответ по умолчанию, если лист не прочитался. */
+function featuresDefault_() {
+  const out = {};
+  FEATURE_KEYS.forEach(function (f) { out[f.code] = true; });
+  return out;
+}
+
+/**
+ * «вкл» → true, «выкл» → false, пусто / непонятное → true.
+ * Сравниваем по началу слова: «выкл.», «ВЫКЛ», «off», «нет» тоже поймутся.
+ */
+function featureOn_(v) {
+  const s = str_(v).toLowerCase().replace(/[\s.]+$/g, '');
+  if (!s) return true;
+  if (/^(выкл|off|нет|no|false|0)/.test(s)) return false;
+  if (/^(вкл|on|да|yes|true|1)/.test(s)) return true;
+  return true;
+}
+
+/** Колонки ищутся по названиям в шапке — порядок можно менять. */
+function settingsHeader_(sh) {
+  const width = Math.max(sh.getLastColumn(), SETTINGS_HEADERS.length);
+  const head = sh.getRange(1, 1, 1, width).getValues()[0].map(str_);
+  return {
+    key: head.indexOf(SETTINGS_HEADERS[0]),
+    value: head.indexOf(SETTINGS_HEADERS[1]),
+  };
+}
+
+/**
+ * Лист «Настройки»: создаёт и один раз заполняет девятью ключами.
+ * Существующий лист не перезаписывает — значения владельца остаются.
+ */
+function ensureSettingsSheet_(ss) {
+  let sh = ss.getSheetByName(SHEETS.settings);
+  if (sh) return sh;
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) return null;
+  try {
+    sh = ss.getSheetByName(SHEETS.settings);
+    if (sh) return sh;
+    sh = ss.insertSheet(SHEETS.settings);
+    sh.getRange(1, 1, 1, SETTINGS_HEADERS.length).setValues([SETTINGS_HEADERS]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+    sh.setColumnWidth(1, 240);
+    sh.setColumnWidth(2, 110);
+    sh.setColumnWidth(3, 380);
+    const rows = FEATURE_KEYS.map(function (f) { return [text_(f.key, 80), 'вкл', text_(f.note, 200)]; });
+    sh.getRange(2, 1, rows.length, SETTINGS_HEADERS.length).setValues(rows);
+    // Выпадающий список, чтобы не приходилось угадывать написание; вписать своё всё равно можно.
+    sh.getRange(2, 2, Math.max(rows.length, 50), 1)
+      .setDataValidation(SpreadsheetApp.newDataValidation()
+        .requireValueInList(['вкл', 'выкл'], true).build());
+    log_('Настройки', 'создан лист «' + SHEETS.settings + '», ключей: ' + FEATURE_KEYS.length);
+    return sh;
+  } catch (e) {
+    sh = ss.getSheetByName(SHEETS.settings);
+    if (sh) return sh;
+    throw e;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Значения из «Настроек»: { 'раздел_викторина': 'выкл', ... }. */
+function settingsValues_(ss) {
+  const sh = ensureSettingsSheet_(ss);
+  if (!sh) return {};
+  const h = settingsHeader_(sh);
+  if (h.value < 0) return {};
+  const keyCol = h.key < 0 ? 0 : h.key;
+  const out = {};
+  rows_(ss, SHEETS.settings).forEach(function (r) {
+    const k = str_(r[keyCol]);
+    if (k) out[k] = r[h.value];
+  });
+  return out;
+}
+
+/** {quiz:true, duel:false, ...} — всегда все девять ключей. */
+function features_(ss) {
+  const values = settingsValues_(ss);
+  const out = {};
+  FEATURE_KEYS.forEach(function (f) {
+    const raw = str_(values[f.key]);
+    out[f.code] = featureOn_(raw);
+    // Значение не распознали — раздел оставили включённым, но след в «Логе» нужен.
+    if (raw && !/^(вкл|выкл|on|off|да|нет|yes|no|true|false|1|0)/i.test(raw)) {
+      log_('Настройки', 'непонятное значение у «' + f.key + '»: «' + raw + '» — считаю «вкл»');
+    }
+  });
+  return out;
+}
+
+/** Ручной запуск из редактора: создать лист «Настройки» и заполнить ключами. */
+function setupSettings() {
+  const sh = ensureSettingsSheet_(ss_());
+  log_('Настройки', 'setupSettings: ' + (sh ? 'лист готов' : 'лист не создан'));
+}
+
+
+/* =====================================================================
+ *  ПАРЫ ПОЗИЦИЙ — что взвешивают вместе (мята: листья и ветки)
+ * =====================================================================
+ *
+ *  Лист «Пары позиций» (создаётся автоматически при первом чтении config):
+ *    позиция_A | позиция_B | доля_A | доля_B | активен | комментарий
+ *
+ *  Доли — от общей массы: A + B = 1.0. Пример для мяты: 0.6 / 0.4.
+ *  Это стартовое значение, владелец поправит его по факту взвешивания.
+ *  Если сумма не равна 1.0, сервер НЕ падает: нормализует доли и пишет
+ *  предупреждение в «Лог». Приложение получает уже нормализованные доли.
+ *
+ *  В форме акта позиция из активной пары показывается двумя полями
+ *  («листья, г» / «ветки, г»), и ввод в любое поле пересчитывает второе.
+ *  В акт пишутся оба значения и то, какое поле взвешено вручную:
+ *  «Акты переработки», новые колонки Q–V (см. ACT_PAIR_HEADERS).
+ *
+ *  На расчёт выхода акта пара НЕ влияет: в «Сырьё»/«Результат» идёт
+ *  количество позиции своей строки (например, листья), вторая доля —
+ *  справочная (ветки — отход). Это сохраняет прежние формулы выхода.
+ * ===================================================================== */
+
+const PAIR_HEADERS = ['позиция_A', 'позиция_B', 'доля_A', 'доля_B', 'активен', 'комментарий'];
+
+/** Первое заполнение: мята. Дальше владелец добавляет строки сам, код не нужен. */
+const PAIR_SEED = [
+  { a: 'Мята (листья)', b: 'Мята (ветки)', shareA: 0.6, shareB: 0.4,
+    note: 'стартовое значение 0.6 / 0.4 — поправьте по факту взвешивания' },
+];
+
+const ACT_PAIR_HEADERS = ['пара_позиция', 'пара_кол-во', 'доля_A', 'доля_B', 'взвешено', 'всего, г'];
+
+/** Пустая галочка = пара включена; «нет»/«выкл»/0 — выключена. */
+function pairActive_(v) {
+  if (v === true) return true;
+  if (v === false) return false;
+  const s = str_(v).toLowerCase().replace(/[\s.]+$/g, '');
+  if (!s) return true;
+  return !/^(нет|выкл|off|no|false|0)/.test(s);
+}
+
+/** Сравнение названий позиций: регистр, «ё», лишние пробелы. */
+function sameName_(a, b) {
+  const k = function (v) { return str_(v).toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ').trim(); };
+  return !!k(a) && k(a) === k(b);
+}
+
+/** Колонки ищутся по названиям в шапке — порядок можно менять. */
+function pairsHeader_(sh) {
+  const width = Math.max(sh.getLastColumn(), PAIR_HEADERS.length);
+  const head = sh.getRange(1, 1, 1, width).getValues()[0].map(str_);
+  return {
+    a: head.indexOf(PAIR_HEADERS[0]),
+    b: head.indexOf(PAIR_HEADERS[1]),
+    shareA: head.indexOf(PAIR_HEADERS[2]),
+    shareB: head.indexOf(PAIR_HEADERS[3]),
+    active: head.indexOf(PAIR_HEADERS[4]),
+    note: head.indexOf(PAIR_HEADERS[5]),
+  };
+}
+
+/** Лист «Пары позиций»: создаёт и один раз заполняет парой для мяты. */
+function ensurePairsSheet_(ss) {
+  let sh = ss.getSheetByName(SHEETS.pairs);
+  if (sh) return sh;
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) return null;
+  try {
+    sh = ss.getSheetByName(SHEETS.pairs);
+    if (sh) return sh;
+    sh = ss.insertSheet(SHEETS.pairs);
+    sh.getRange(1, 1, 1, PAIR_HEADERS.length).setValues([PAIR_HEADERS]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+    sh.setColumnWidth(1, 220);
+    sh.setColumnWidth(2, 220);
+    sh.setColumnWidth(3, 80);
+    sh.setColumnWidth(4, 80);
+    sh.setColumnWidth(5, 80);
+    sh.setColumnWidth(6, 420);
+    seedPairs_(sh);
+    log_('Пары позиций', 'создан лист «' + SHEETS.pairs + '», пар: ' + PAIR_SEED.length);
+    return sh;
+  } catch (e) {
+    sh = ss.getSheetByName(SHEETS.pairs);
+    if (sh) return sh;
+    throw e;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Пишет стартовую пару для мяты и ставит галочку «активен». */
+function seedPairs_(sh) {
+  const rows = PAIR_SEED.map(function (p) {
+    return [text_(p.a, 120), text_(p.b, 120), p.shareA, p.shareB, true, text_(p.note, 300)];
+  });
+  sh.getRange(2, 1, rows.length, PAIR_HEADERS.length).setValues(rows);
+  sh.getRange(2, 5, rows.length, 1)
+    .setDataValidation(SpreadsheetApp.newDataValidation().requireCheckbox().build());
+}
+
+/**
+ * Активные пары с нормализованными долями:
+ * [{ a, b, shareA, shareB, comment }].
+ * Неверные строки (пусто, одинаковые позиции, доля ≤ 0) пропускаются с записью в «Лог».
+ */
+function pairs_(ss) {
+  const sh = ensurePairsSheet_(ss);
+  if (!sh) return [];
+  const h = pairsHeader_(sh);
+  if (h.a < 0 || h.b < 0 || h.shareA < 0 || h.shareB < 0) return [];
+
+  const out = [];
+  const seen = {};
+  rows_(ss, SHEETS.pairs).forEach(function (r) {
+    const a = str_(r[h.a]);
+    const b = str_(r[h.b]);
+    if (!a || !b) return;
+    if (sameName_(a, b)) {
+      log_('Пары позиций', 'пропущена пара с одинаковыми позициями: ' + a);
+      return;
+    }
+    if (!pairActive_(h.active >= 0 ? r[h.active] : true)) return;
+    let sa = num_(r[h.shareA]);
+    let sb = num_(r[h.shareB]);
+    if (!(sa > 0) || !(sb > 0)) {
+      log_('Пары позиций', 'пропущена пара без долей: ' + a + ' / ' + b);
+      return;
+    }
+    const sum = sa + sb;
+    if (Math.abs(sum - 1) > 0.001) {
+      const origSum = sum;
+      sa = sa / sum;
+      sb = sb / sum;
+      log_('Пары позиций', 'сумма долей ' + Math.round(origSum * 1000) / 1000 + ' у «' + a + ' / ' + b +
+        '» — доли нормализованы: ' + Math.round(sa * 1000) / 1000 + ' / ' + Math.round(sb * 1000) / 1000);
+    }
+    // Одна позиция — одна пара: первая активная строка выигрывает, остальные в «Лог».
+    const ka = str_(a).toLowerCase();
+    const kb = str_(b).toLowerCase();
+    if (seen[ka] || seen[kb]) {
+      log_('Пары позиций', 'пропущена вторая пара для той же позиции: ' + a + ' / ' + b);
+      return;
+    }
+    seen[ka] = true;
+    seen[kb] = true;
+    out.push({
+      a: a, b: b,
+      shareA: Math.round(sa * 1000) / 1000,
+      shareB: Math.round(sb * 1000) / 1000,
+      comment: h.note >= 0 ? str_(r[h.note]) : '',
+    });
+  });
+  return out;
+}
+
+/** Сторона пары для позиции: { name, share, isA } или null. */
+function pairSide_(pair, name) {
+  if (sameName_(pair.a, name)) return { name: pair.a, share: pair.shareA, isA: true };
+  if (sameName_(pair.b, name)) return { name: pair.b, share: pair.shareB, isA: false };
+  return null;
+}
+
+/**
+ * Данные пары из строки акта. Возвращает null, если пары нет, она выключена
+ * или данные неверные — тогда строка сохраняется как обычная, без пары.
+ *
+ * line.pair = { item: '<вторая позиция>', qty: <граммы>, source: 'own'|'other' }.
+ * source = 'own' — взвесили позицию этой строки, второе значение считаем;
+ * source = 'other' — взвесили вторую позицию, количество строки пересчитываем.
+ */
+function actPairForLine_(pairs, line, baseQty) {
+  const p = line && line.pair;
+  if (!p || typeof p !== 'object') return null;
+  const item = str_(line.item);
+  const partner = str_(p.item);
+  if (!item || !partner) return null;
+
+  const pair = (pairs || []).find(function (x) {
+    return (sameName_(x.a, item) && sameName_(x.b, partner)) ||
+           (sameName_(x.b, item) && sameName_(x.a, partner));
+  });
+  if (!pair) {
+    log_('Пары позиций', 'в акте нет активной пары «' + item + '» / «' + partner + '» — строка без пары');
+    return null;
+  }
+  const side = pairSide_(pair, item);
+  const other = pairSide_(pair, partner);
+  if (!side || !other) return null;
+
+  const source = str_(p.source) === 'other' ? 'other' : 'own';
+  let ownQty = Math.round(Number(baseQty) || 0);
+  let partnerQty = 0;
+  if (source === 'other') {
+    const weighed = Number(p.qty);
+    if (!(weighed >= 0 && weighed < 1000000)) return null;
+    partnerQty = Math.round(weighed);
+    ownQty = Math.round(partnerQty * side.share / other.share);
+  } else {
+    partnerQty = Math.round(ownQty * other.share / side.share);
+  }
+  if (!(ownQty >= 0) || !(partnerQty >= 0) || ownQty + partnerQty <= 0) return null;
+
+  return {
+    item: other.name,             // вторая позиция (например, «Мята (ветки)»)
+    qty: partnerQty,              // её граммы
+    shareA: pair.shareA,
+    shareB: pair.shareB,
+    weighed: source === 'own' ? side.name : other.name,
+    total: ownQty + partnerQty,
+    ownQty: ownQty,
+  };
+}
+
+/** Колонки пары в «Актах переработки»: { 'пара_позиция': 17, ... } (1 = A). */
+function actPairColumns_(sheet) {
+  const width = Math.max(sheet.getLastColumn(), 16);
+  const head = sheet.getRange(1, 1, 1, width).getValues()[0].map(str_);
+  const idx = {};
+  ACT_PAIR_HEADERS.forEach(function (name) { idx[name] = head.indexOf(name) + 1; }); // 0 → «нет»
+  return idx;
+}
+
+/**
+ * Дописывает колонки Q–V в «Акты переработки», если их нет.
+ * Существующие A–P не трогает, порядок и формулы не меняет.
+ */
+function ensureActPairColumns_(sheet) {
+  let idx = actPairColumns_(sheet);
+  if (idx[ACT_PAIR_HEADERS[0]] > 0) return idx;
+
+  const width = Math.max(sheet.getLastColumn(), 16);
+  const head = sheet.getRange(1, 1, 1, width).getValues()[0].map(str_);
+  let last = 0;
+  head.forEach(function (v, i) { if (str_(v)) last = i + 1; });
+  const start = Math.max(last, 16) + 1;
+  sheet.getRange(1, start, 1, ACT_PAIR_HEADERS.length)
+    .setValues([ACT_PAIR_HEADERS]).setFontWeight('bold');
+  for (let i = 0; i < ACT_PAIR_HEADERS.length; i++) sheet.setColumnWidth(start + i, i === 0 ? 160 : 100);
+  log_('Пары позиций', 'в «' + SHEETS.acts + '» добавлены колонки ' + start + '–' + (start + ACT_PAIR_HEADERS.length - 1));
+  return actPairColumns_(sheet);
+}
+
+/** Значения Q–V для строки акта (пустые, если пары нет). */
+function actPairRow_(pair) {
+  if (!pair) return ['', '', '', '', '', ''];
+  return [text_(pair.item, 120), pair.qty, pair.shareA, pair.shareB, text_(pair.weighed, 120), pair.total];
+}
+
+/** Ручной запуск из редактора: создать «Пары позиций» и колонки Q–V в актах. */
+function setupPairs() {
+  const ss = ss_();
+  const sh = ensurePairsSheet_(ss);
+  const acts = ss.getSheetByName(SHEETS.acts);
+  if (acts) ensureActPairColumns_(acts);
+  log_('Пары позиций', 'setupPairs: ' + (sh ? 'лист готов' : 'лист не создан') +
+    (acts ? ', колонки акта готовы' : ', листа актов нет'));
+}
+
 
 /* =====================================================================
  *  СРОКИ ХРАНЕНИЯ — справочник для этикетки 30×20
@@ -1251,7 +1683,7 @@ function savePhoto_(ss, sheet, auth, rec, id, created, received, comment) {
 
   // Дата | Сотрудник | Зона | Фото | Комментарий | Получено | ID |
   // Проверка ИИ | Что не так | Замечание менеджера | Фото удалено | ID файла
-  // M–R — структурированный вердикт (создаются при первом фото / setupPhotoCheck)
+  // M–S — структурированный вердикт (создаются при первом фото / setupPhotoCheck)
   const photoRow = addRow_(sheet, [created, auth.name, zone, 'Открыть фото', comment, received, "'" + id,
     '', '', '', '', "'" + file.getId()]);
   // Делаем текст «Открыть фото» ссылкой на файл (без формулы — так не зависит от языка таблицы)
@@ -1260,16 +1692,24 @@ function savePhoto_(ss, sheet, auth, rec, id, created, received, comment) {
 
   // Сначала фото и строка уже сохранены — дальше проверка. Любая её ошибка
   // не отменяет запись: вердикт будет «не проверено» с причиной.
+  // Эталоны: до трёх активных из листа «Эталоны — фото»; если там пусто —
+  // старая одиночная ссылка из «Эталонов уборки» (колонка C), как раньше.
   let ref = null;
-  try { ref = photoRefFor_(photoRefs_(ss), zonePlain); } catch (e) { log_('Проверка фото', 'эталоны не прочитаны: ' + e); }
+  let refList = [];
+  try {
+    ref = photoRefFor_(photoRefs_(ss), zonePlain);
+    refList = photoRefPhotosFor_(ss, zonePlain).forCheck;
+  } catch (e) { log_('Проверка фото', 'эталоны не прочитаны: ' + e); }
+  if (!refList.length && ref && ref.fileId) refList = [ref];
+  const floor = ref ? ref.floor : '';
   let verdict;
   try {
-    verdict = checkPhoto_(zonePlain, Utilities.newBlob(bytes, m[1], fileName), ref, file.getId());
+    verdict = checkPhoto_(zonePlain, Utilities.newBlob(bytes, m[1], fileName), refList, file.getId(), ref && ref.what);
   } catch (e) {
     log_('Проверка фото', 'неожиданная ошибка: ' + e);
-    verdict = photoUnchecked_(String(e && e.message || e), ref);
+    verdict = photoUnchecked_(String(e && e.message || e), refList);
   }
-  writePhotoVerdict_(sheet, photoRow, verdict);
+  writePhotoVerdict_(sheet, photoRow, verdict, floor);
   return { id, status: 'saved', fileId: file.getId(), zone: zonePlain, verdict: photoPublic_(verdict) };
 }
 
@@ -1362,31 +1802,53 @@ function saveInventory_(ss, sheet, auth, rec, id, created, received, comment) {
 
 /**
  * АКТ ПЕРЕРАБОТКИ.
- * Приходит: act (название шаблона) и lines: [{ role: 'Сырьё'|'Результат', item, unit, qty }].
+ * Приходит: act (название шаблона) и lines: [{ role: 'Сырьё'|'Результат', item, unit, qty, pair? }].
  * Пишем по строке на каждую позицию: так в «Своде переработки» легко сложить расход и приход.
  * Позиции и единицы обязаны совпадать с шаблоном — бармен не может «придумать» сырьё.
+ *
+ * Пара (мята: листья/ветки) — только справочные колонки Q–V. В «Кол-во» идёт
+ * количество своей позиции (листья), вторая доля (ветки) в сумму расхода и в
+ * выход НЕ входит: ветки — отход, а не результат. Формулы выхода не меняются.
  */
 function saveProcessing_(ss, sheet, auth, rec, id, created, received, comment) {
   const tpl = actTemplates_(ss).find(a => a.name === str_(rec.act));
   if (!tpl) return { id, status: 'error', error: 'Нет такого акта: ' + rec.act };
   const lines = Array.isArray(rec.lines) ? rec.lines : [];
   const allowed = tpl.inputs.map(i => 'Сырьё|' + i.item + '|' + i.unit).concat(['Результат|' + tpl.output.item + '|' + tpl.output.unit]);
+  const pairList = pairs_(ss); // один раз на запрос
+  const prepared = [];
   let inQty = 0, outQty = 0, keyQty = 0;
+  let hasPair = false;
+
   for (const l of lines) {
     const k = str_(l.role) + '|' + str_(l.item) + '|' + str_(l.unit);
     if (allowed.indexOf(k) === -1) return { id, status: 'error', error: 'Позиция не из шаблона: ' + l.item };
-    const q = Number(l.qty);
+    let q = Number(l.qty);
     if (!(q >= 0 && q < 1000000)) return { id, status: 'error', error: 'Некорректное количество: ' + l.item };
+
     const tplLine = tpl.inputs.find(i => i.item === str_(l.item));
-    if (l.role === 'Сырьё' && tplLine && tplLine.clean) {
-      const c = Number(l.clean);
-      if (!(c > 0)) return { id, status: 'error', error: 'Не указан чистый вес: ' + l.item };
-      if (c > q) return { id, status: 'error', error: 'Чистый вес больше грязного: ' + l.item };
+    const isClean = l.role === 'Сырьё' && tplLine && tplLine.clean;
+    let clean = Number(l.clean);
+
+    // Пара: сервер сам пересчитывает вторую долю, клиенту на слово не верим.
+    // База пересчёта — то, что реально взвесили: чистый вес, если сырьё чистили.
+    const base = isClean ? clean : q;
+    const pair = actPairForLine_(pairList, l, base);
+    if (pair) {
+      hasPair = true;
+      if (isClean) clean = pair.ownQty; else q = pair.ownQty;
+    }
+
+    if (isClean) {
+      if (!(clean > 0)) return { id, status: 'error', error: 'Не указан чистый вес: ' + l.item };
+      if (clean > q) return { id, status: 'error', error: 'Чистый вес больше грязного: ' + l.item };
     }
     if (l.role === 'Результат') outQty += q; else inQty += q;
     const keyLine = tpl.inputs.find(i => i.key);
     if (l.role === 'Сырьё' && keyLine && l.item === keyLine.item) keyQty = q;
+    prepared.push({ l, q, clean: isClean ? clean : 0, pair });
   }
+
   // pending = «выход запишем позже»: кордиал ещё варится, фреш ещё жмут
   const pending = rec.pending === true;
   if (!(inQty > 0)) return { id, status: 'error', error: 'Не указано сырьё' };
@@ -1395,28 +1857,40 @@ function saveProcessing_(ss, sheet, auth, rec, id, created, received, comment) {
 
   // Выход в % считаем для простых актов (было → стало): 100 г мяты → 70 г листьев = 70%
   const yieldPct = tpl.type === 'простой' && keyQty > 0 && outQty > 0 ? Math.round(outQty / keyQty * 1000) / 10 : '';
+  // Колонки пары добавляем один раз и только если в акте правда есть пара.
+  const pairCols = hasPair ? ensureActPairColumns_(sheet) : null;
+
   // Сырьё с очисткой: в «Кол-во» пишем грязный вес (он списывается),
   // в «Чистый вес» — после чистки, в «Выход, %» — процент чистого от грязного.
-  lines.filter(l => Number(l.qty) > 0 || l.role === 'Результат').forEach((l, i) => {
-    const c = Number(l.clean);
+  prepared.filter(p => p.q > 0 || p.l.role === 'Результат').forEach((p, i) => {
+    const l = p.l;
+    const c = p.clean;
     const hasClean = l.role === 'Сырьё' && c > 0;
-    const pct = l.role === 'Результат' ? yieldPct : (hasClean ? Math.round(c / Number(l.qty) * 1000) / 10 : '');
+    const pct = l.role === 'Результат' ? yieldPct : (hasClean ? Math.round(c / p.q * 1000) / 10 : '');
     const isOut = l.role === 'Результат';
     // M Статус | N Закрыл | O Когда закрыт — только у строки «Результат»
     const status = !isOut ? ['', '', ''] : pending ? ['⏳ В работе', '', ''] : ['✅ Закрыт', auth.name, received];
-    addRow_(sheet, [created, auth.name, "'" + tpl.name, l.role, "'" + str_(l.item), isOut && pending ? '' : Number(l.qty),
+    const row = addRow_(sheet, [created, auth.name, "'" + tpl.name, l.role, "'" + str_(l.item), isOut && pending ? '' : p.q,
       str_(l.unit), pct, i === 0 ? comment : '', received, "'" + id, hasClean ? c : ''].concat(status));
+    // Q–V: вторая позиция пары, её граммы, доли, что взвешено и общая масса.
+    // Пишем по названиям колонок, а не по номеру: владелец может их переставить.
+    if (pairCols) {
+      const vals = actPairRow_(p.pair);
+      ACT_PAIR_HEADERS.forEach(function (name, k) {
+        if (pairCols[name] > 0) sheet.getRange(row, pairCols[name]).setValue(vals[k]);
+      });
+    }
   });
   return { id, status: 'saved' };
 }
 
 /**
  * Закрытие акта, где выход записали позже. Закрыть может ЛЮБОЙ бармен.
- * rec: { actId, qty, comment }
+ * rec: { actId, qty, comment, pair? } — pair, если у результата есть пара.
  */
 function closeProcessing_(ss, sheet, auth, rec, id, received) {
   const actId = str_(rec.actId);
-  const qty = Number(rec.qty);
+  let qty = Number(rec.qty);
   if (!(qty > 0 && qty < 1000000)) return { id, status: 'error', error: 'Некорректный выход' };
   const last = sheet.getLastRow();
   const data = last < 2 ? [] : sheet.getRange(2, 1, last - 1, 16).getValues();
@@ -1429,6 +1903,11 @@ function closeProcessing_(ss, sheet, auth, rec, id, received) {
   }
   // Выход в % — для простых актов: стало / было
   const tpl = actTemplates_(ss).find(a => a.name === str_(r[2]));
+  // Пара у результата: количество листьев остаётся в F, ветки — в Q–V.
+  const pair = rec.pair && typeof rec.pair === 'object' && tpl
+    ? actPairForLine_(pairs_(ss), { item: tpl.output.item, pair: rec.pair }, qty)
+    : null;
+  if (pair) qty = pair.ownQty;
   let pct = '';
   if (tpl && tpl.type === 'простой') {
     const raw = data.find(x => str_(x[10]) === actId && str_(x[3]) === 'Сырьё');
@@ -1441,6 +1920,13 @@ function closeProcessing_(ss, sheet, auth, rec, id, received) {
   sheet.getRange(row, 8).setValue(pct);
   if (note) sheet.getRange(row, 9).setValue("'" + (oldComment ? oldComment + ' | ' : '') + 'При закрытии: ' + note);
   sheet.getRange(row, 13, 1, 4).setValues([['✅ Закрыт', auth.name, received, "'" + id]]);
+  if (pair) {
+    const cols = ensureActPairColumns_(sheet);
+    const vals = actPairRow_(pair);
+    ACT_PAIR_HEADERS.forEach(function (name, i) {
+      if (cols[name] > 0) sheet.getRange(row, cols[name]).setValue(vals[i]);
+    });
+  }
   return { id, status: 'saved' };
 }
 
@@ -1545,7 +2031,7 @@ function setup() {
   // эталоны необязательны, а листы викторины создаёт отдельная функция setupQuiz().
   // Листы дуэли и рейтинга создаются сами при первой дуэли (ensureDuelSheets_),
   // «Сроки хранения» — при первом чтении справочника (ensureShelfLifeSheet_).
-  const auto = ['refs', 'questions', 'disputes', 'duels', 'ratings', 'quizTries',
+  const auto = ['refs', 'refPhotos', 'questions', 'disputes', 'duels', 'ratings', 'quizTries',
     'characters', 'itemCatalog', 'inventory', 'shelfLife', 'facts', 'checklists', 'checklistMarks'];
   const missing = Object.keys(SHEETS).filter(k => auto.indexOf(k) === -1)
     .map(k => SHEETS[k]).filter(n => !ss.getSheetByName(n));
@@ -1810,20 +2296,25 @@ function log_(event, details) {
  *         O «замечания»:    «crit: …; warn: …»
  *         P «модель»:       например gemini-flash-lite-latest
  *         Q «проверено_в»:  дата и время проверки
- *         R «эталон»:       ссылка на эталон или «нет»
+ *         R «эталон»:       ссылка(и) на эталон или «нет»
+ *         S «этаж»:         1 / 2 / пусто
  *    3. Триггеров нет: 5 фото в день проверяются за секунды. Расписание
  *       и автоудаление старых фото больше не используются — фото остаются
  *       доказательством для разбора.
  *
  *  Настройка (один раз):
  *    а) ⚙ Настройки проекта → Свойства скрипта → GEMINI_API_KEY = ключ.
- *    б) Выбрать функцию setupPhotoCheck и нажать «Выполнить» — она только
- *       добавляет колонки M–R и проверяет, что ключ на месте.
+ *    б) Выбрать функцию setupPhotoCheck и нажать «Выполнить» — она добавляет
+ *       колонки M–S, колонку «этаж» в «Эталоны уборки», создаёт лист
+ *       «Эталоны — фото» и проверяет, что ключ на месте.
  *
- *  Эталоны: лист «Эталоны уборки» — Зона | Что проверять | Эталонное фото.
- *  Колонка C пустая — проверяем по тексту критериев. Когда владелец
- *  положит туда ссылку на фото, сервер отправит два изображения и попросит
- *  сравнить состав и захламлённость, а не пиксели. Код менять не нужно.
+ *  Эталоны: «Эталоны уборки» — Зона | Что проверять | Эталонное фото | этаж.
+ *  Несколько снимков на зону — лист «Эталоны — фото»:
+ *    зона | порядок | ссылка_на_фото | ракурс | активен
+ *  В запрос уходят до 3 активных эталонов (первые по «порядок») + фото смены:
+ *  всего не больше 4 изображений. Если активных эталонов нет — проверяем
+ *  по тексту критериев, как раньше. Если все ссылки битые — вердикт unclear
+ *  с причиной, а не падение и не проверка «вслепую».
  *
  *  Ответ модели — строго JSON:
  *    {"verdict":"ok|warn|crit|unclear","confidence":0…1,
@@ -1834,14 +2325,15 @@ function log_(event, details) {
  * ===================================================================== */
 
 const PHOTO_COL = { status: 8, issues: 9, manager: 10, deleted: 11, fileId: 12 }; // H, I, J, K, L
-const PHOTO_EXTRA_HEADERS = ['вердикт', 'уверенность', 'замечания', 'модель', 'проверено_в', 'эталон'];
-const PHOTO_EXTRA_KEYS = ['verdict', 'confidence', 'notes', 'model', 'checkedAt', 'reference'];
+const PHOTO_EXTRA_HEADERS = ['вердикт', 'уверенность', 'замечания', 'модель', 'проверено_в', 'эталон', 'этаж'];
+const PHOTO_EXTRA_KEYS = ['verdict', 'confidence', 'notes', 'model', 'checkedAt', 'reference', 'floor'];
 const PHOTO_CONFIDENCE_MIN = 0.5;      // ниже — общий вердикт unclear
 const PHOTO_MAX_ITEMS = 30;            // больше пунктов от модели не принимаем
 const PHOTO_GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta';
-// Первая — рабочая (проверена 22.11.2026, 200 и 0,8 с на картинку).
-// Остальные — запас: 22.11.2026 отдавали 503 «высокая нагрузка», но могут ожить.
-const GEMINI_MODELS = ['gemini-flash-lite-latest', 'gemini-3.8-flash', 'gemini-3.1-flash-lite'];
+// Первая — рабочая (проверена 22.11.2026). 24.11.2026 на 3 картинках
+// gemini-3.8-flash ответил за 178 с, поэтому он теперь последний: сначала
+// пробуем лёгкие flash-lite, и только потом медленный запас.
+const GEMINI_MODELS = ['gemini-flash-lite-latest', 'gemini-3.1-flash-lite', 'gemini-3.8-flash'];
 const PHOTO_STATUS = {
   ok: '✅ Чисто', warn: '⚠ Замечания', crit: '⛔ Критично',
   unclear: '❓ Непонятно', unchecked: '❓ Не проверено',
@@ -1852,9 +2344,15 @@ const PHOTO_GENERIC_CRITERIA = [
   'Нет лишних вещей и неубранного инструмента',
   'Поверхности сухие и протёртые',
 ];
+// Новые листы/колонки эталонов. Формат «этаж»: 1 или 2 (принимаем и «1 этаж»).
+const REFS_FLOOR_HEADER = 'этаж';
+const REF_PHOTO_HEADERS = ['зона', 'порядок', 'ссылка_на_фото', 'ракурс', 'активен'];
+const PHOTO_MAX_REFS = 3;             // больше трёх эталонов в один запрос не отправляем
+const PHOTO_MAX_IMAGES = 4;           // 1 фото смены + до 3 эталонов
 
 /**
- * Запустить один раз вручную: добавляет колонки вердикта M–R и проверяет ключ.
+ * Запустить один раз вручную: добавляет колонку «этаж» в «Эталоны уборки»,
+ * создаёт лист «Эталоны — фото», колонки вердикта M–S и проверяет ключ.
  * Ничего не проверяет и не ставит триггеров — проверка идёт при загрузке фото.
  */
 function setupPhotoCheck() {
@@ -1868,8 +2366,13 @@ function setupPhotoCheck() {
     .setNumberFormat('dd.MM.yyyy HH:mm');
   const key = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
   const where = PHOTO_EXTRA_KEYS.map(k => k + '=' + columnLetter_(cols[k])).join(', ');
+  let refMsg = '';
+  try { refMsg = ' ' + setupPhotoRefs(); } catch (e) {
+    refMsg = ' Эталоны: ОШИБКА ' + e;
+    log_('Проверка фото', 'setupPhotoRefs: ' + String(e && e.stack || e));
+  }
   const msg = 'Колонки проверки фото: ' + where + '. Ключ Gemini: ' + (key ? 'есть' : 'НЕТ') +
-    '. Проверка идёт при загрузке фото, триггеры не нужны.';
+    '. Проверка идёт при загрузке фото, триггеры не нужны.' + refMsg;
   log_('Проверка фото', msg);
   Logger.log(msg);
   return msg;
@@ -1921,14 +2424,23 @@ function ensurePhotoColumns_(sheet) {
   return cols;
 }
 
-/** Эталоны: { 'бар 1 этаж': { what: 'что проверять', fileId, url } } */
+/** Эталоны: { 'бар': { zone, what, fileId, url, floor } } */
 function photoRefs_(ss) {
   const out = {};
-  if (!ss.getSheetByName(SHEETS.refs)) return out;
+  const sh = ss.getSheetByName(SHEETS.refs);
+  if (!sh) return out;
+  const cols = refsColumnMap_(sh);
+  if (!cols.zone) return out;
   rows_(ss, SHEETS.refs).forEach(r => {
-    const zone = str_(r[0]);
+    const zone = str_(r[cols.zone - 1]);
     if (!zone) return;
-    out[photoZoneKey_(zone)] = { what: str_(r[1]), fileId: driveId_(r[2]), url: str_(r[2]) };
+    out[photoZoneKey_(zone)] = {
+      zone: zone,
+      what: cols.what ? str_(r[cols.what - 1]) : '',
+      fileId: cols.photo ? driveId_(r[cols.photo - 1]) : '',
+      url: cols.photo ? str_(r[cols.photo - 1]) : '',
+      floor: cols.floor ? photoFloorNorm_(r[cols.floor - 1]) : '',
+    };
   });
   return out;
 }
@@ -1941,26 +2453,267 @@ function photoRefFor_(refs, zone) {
   return (refs && refs[photoZoneKey_(zone)]) || null;
 }
 
+/* --- колонки и этажи «Эталонов уборки» ----------------------------- */
+
+// Как узнать колонки по шапке. Так код понимает и старую схему
+// «Зона | Что проверять | Эталонное фото | этаж», и новую
+// «этаж | зона | критерии | эталонное_фото».
+const REFS_COLUMN_KEYS = {
+  floor: ['этаж', 'floor'],
+  zone: ['зона'],
+  what: ['критерии', 'что проверять'],
+  photo: ['эталонное_фото', 'эталонное фото', 'ссылка_на_фото'],
+};
+
+/** Номер колонки (с 1) по названию шапки; 0 — колонки нет. */
+function refsColumnMap_(sheet) {
+  const width = Math.max(sheet.getLastColumn(), 1);
+  const headers = sheet.getRange(1, 1, 1, width).getValues()[0]
+    .map(v => str_(v).toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' '));
+  const cols = { floor: 0, zone: 0, what: 0, photo: 0 };
+  Object.keys(cols).forEach(key => {
+    const words = REFS_COLUMN_KEYS[key];
+    const idx = headers.findIndex(h => h && words.some(w => h.indexOf(w) >= 0));
+    if (idx >= 0) cols[key] = idx + 1;
+  });
+  // Совсем старая шапка без узнаваемых названий — читаем как раньше.
+  if (!cols.zone && !cols.what && !cols.photo) {
+    cols.zone = 1;
+    cols.what = 2;
+    cols.photo = 3;
+  }
+  return cols;
+}
+
 /**
- * Критерии зоны из «Эталонов уборки»: абзац режем на предложения.
- * Модель получает готовый список пунктов, а не общий текст «ищи грязь».
+ * «1», «1 этаж», «2 ЭТАЖ» → '1' / '2'. Пусто → ''.
+ * Нечисловой текст («цоколь») остаётся как есть.
+ */
+function photoFloorNorm_(v) {
+  const s = str_(v).toLowerCase().replace(/ё/g, 'е');
+  if (!s) return '';
+  const m = /(\d+)/.exec(s);
+  if (m) return String(Number(m[1]));
+  return s.slice(0, 40);
+}
+
+/** Этаж по умолчанию: из названия («Бар 2 этаж» → 2), иначе 1. */
+function photoFloorDefault_(zone) {
+  const s = str_(zone).toLowerCase().replace(/ё/g, 'е');
+  const m = /(\d+)\s*этаж/.exec(s);
+  return m ? String(Number(m[1])) : '1';
+}
+
+/** Подпись этажа для логов: '1' → '1 этаж'. */
+function photoFloorLabel_(floor) {
+  const f = str_(floor);
+  if (!f) return 'без этажа';
+  return /^\d+$/.test(f) ? f + ' этаж' : f;
+}
+
+/** Заполняет пустые этажи: по названию зоны, иначе 1. Возвращает число строк. */
+function fillPhotoFloors_(sheet, cols) {
+  const last = sheet.getLastRow();
+  if (last < 2 || !cols.floor || !cols.zone) return 0;
+  const zones = sheet.getRange(2, cols.zone, last - 1, 1).getValues();
+  const floors = sheet.getRange(2, cols.floor, last - 1, 1).getValues();
+  let filled = 0;
+  for (let i = 0; i < zones.length; i++) {
+    if (!str_(zones[i][0]) || str_(floors[i][0])) continue;
+    sheet.getRange(i + 2, cols.floor).setValue(photoFloorDefault_(str_(zones[i][0])));
+    filled++;
+  }
+  if (filled) log_('Проверка фото', 'Этажи заполнены по умолчанию: ' + filled);
+  return filled;
+}
+
+/**
+ * Разово готовит данные для эталонов: колонку «этаж» и лист «Эталоны — фото».
+ * Для новой схемы колонка «этаж» уже первая — ничего не меняет.
+ * Для старой (без этажа) — дописывает в конец и заполняет 1/2.
+ */
+function photoMigrate_(ss) {
+  const sh = ss.getSheetByName(SHEETS.refs);
+  let filled = 0;
+  if (sh && str_(sh.getRange(1, 1).getValue())) {
+    let cols = refsColumnMap_(sh);
+    if (!cols.floor) {
+      const width = Math.max(sh.getLastColumn(), 1);
+      sh.getRange(1, width + 1).setValue(REFS_FLOOR_HEADER).setFontWeight('bold');
+      sh.setColumnWidth(width + 1, 90);
+      cols = refsColumnMap_(sh);
+      if (cols.floor) filled = fillPhotoFloors_(sh, cols);
+      log_('Проверка фото', 'Добавлена колонка ' + columnLetter_(width + 1) + ' «этаж» в «' + SHEETS.refs + '»');
+    }
+  }
+  ensureRefPhotosSheet_(ss);
+  return filled;
+}
+
+/** Лист «Эталоны — фото»: создаётся при первом обращении, шапка не дублируется. */
+function ensureRefPhotosSheet_(ss) {
+  let sh = ss.getSheetByName(SHEETS.refPhotos);
+  if (sh) {
+    if (!str_(sh.getRange(1, 1).getValue())) {
+      sh.getRange(1, 1, 1, REF_PHOTO_HEADERS.length).setValues([REF_PHOTO_HEADERS]).setFontWeight('bold');
+      sh.setFrozenRows(1);
+    }
+    return sh;
+  }
+  sh = ss.insertSheet(SHEETS.refPhotos);
+  sh.getRange(1, 1, 1, REF_PHOTO_HEADERS.length).setValues([REF_PHOTO_HEADERS]).setFontWeight('bold');
+  sh.setFrozenRows(1);
+  sh.setColumnWidth(1, 180);
+  sh.setColumnWidth(3, 420);
+  sh.setColumnWidth(4, 220);
+  sh.setColumnWidth(5, 80);
+  log_('Проверка фото', 'Создан лист «' + SHEETS.refPhotos + '»');
+  return sh;
+}
+
+/**
+ * Активен ли эталон. Пустая ячейка = активен: иначе владельцу пришлось бы
+ * ставить галочку в каждой строке, а забытая галочка молча отключала бы эталон.
+ */
+function refPhotoActive_(v) {
+  if (v === false) return false;
+  if (v === null || v === undefined || v === '') return true;
+  if (v === true) return true;
+  const s = str_(v).toLowerCase().replace(/ё/g, 'е');
+  return !(s === 'нет' || s === 'false' || s === '0' || s === 'no' || s === 'неактивен');
+}
+
+/**
+ * Строки листа «Эталоны — фото»: одна строка = один эталон.
+ * Пустой «порядок» уходит в конец, внутри порядок — как в таблице.
+ */
+function photoRefPhotosAll_(ss) {
+  const sh = ensureRefPhotosSheet_(ss);
+  if (sh.getLastRow() < 2) return [];
+  const width = Math.max(sh.getLastColumn(), REF_PHOTO_HEADERS.length);
+  return sh.getRange(2, 1, sh.getLastRow() - 1, width).getValues()
+    .map((r, i) => ({
+      row: i + 2,
+      zone: str_(r[0]),
+      order: num_(r[1]),
+      hasOrder: str_(r[1]) !== '',
+      url: str_(r[2]),
+      fileId: driveId_(r[2]),
+      aspect: str_(r[3]).slice(0, 120),
+      active: refPhotoActive_(r[4]),
+    }))
+    .filter(r => r.zone && (r.url || r.fileId));
+}
+
+/** Активные эталоны зоны: первые по «порядок», но не больше PHOTO_MAX_REFS. */
+function photoRefPhotosFor_(ss, zone) {
+  const key = photoZoneKey_(zone);
+  const all = photoRefPhotosAll_(ss).filter(r => photoZoneKey_(r.zone) === key);
+  const active = all.filter(r => r.active);
+  active.sort((a, b) => {
+    const ao = a.hasOrder ? a.order : 1e9;
+    const bo = b.hasOrder ? b.order : 1e9;
+    return ao - bo || a.row - b.row;
+  });
+  return {
+    forCheck: active.slice(0, PHOTO_MAX_REFS),
+    activeCount: active.length,
+    total: all.length,
+    skipped: Math.max(0, active.length - PHOTO_MAX_REFS),
+  };
+}
+
+/** Зоны с этажами для приложения: сначала «Списки»!B, затем зоны только из эталонов. */
+function photoZones_(ss, listZones) {
+  const refs = photoRefs_(ss);
+  const out = [];
+  const seen = {};
+  (listZones || []).forEach(z => {
+    const k = photoZoneKey_(z);
+    if (!k || seen[k]) return;
+    seen[k] = true;
+    out.push({ zone: z, floor: refs[k] ? refs[k].floor : '' });
+  });
+  Object.keys(refs).forEach(k => {
+    if (seen[k]) return;
+    seen[k] = true;
+    out.push({ zone: refs[k].zone, floor: refs[k].floor });
+  });
+  return out;
+}
+
+/** Сколько активных эталонов у каждой зоны (для config, без ссылок). */
+function photoRefSummaries_(zones, refRows) {
+  const counts = {};
+  (refRows || []).forEach(r => {
+    const k = photoZoneKey_(r.zone);
+    if (!counts[k]) counts[k] = { active: 0, total: 0 };
+    counts[k].total++;
+    if (r.active) counts[k].active++;
+  });
+  return (zones || []).map(z => {
+    const c = counts[photoZoneKey_(z.zone)] || { active: 0, total: 0 };
+    return { zone: z.zone, floor: z.floor, active: c.active, total: c.total };
+  });
+}
+
+/**
+ * Разово: колонка «этаж» + лист «Эталоны — фото».
+ * Можно запустить вручную из редактора Apps Script как setupPhotoCheck().
+ */
+function setupPhotoRefs() {
+  const ss = ss_();
+  const existed = !!ss.getSheetByName(SHEETS.refPhotos);
+  const filled = photoMigrate_(ss);
+  const sh = ss.getSheetByName(SHEETS.refs);
+  const cols = sh ? refsColumnMap_(sh) : { floor: 0 };
+  const msg = 'Эталоны: лист «' + SHEETS.refPhotos + '» ' + (existed ? 'на месте' : 'создан') +
+    '; колонка «этаж» ' + (cols.floor ? columnLetter_(cols.floor) : 'НЕТ') +
+    (filled ? '; этажи заполнены по умолчанию: ' + filled : '') + '.';
+  Logger.log(msg);
+  log_('Проверка фото', msg);
+  return msg;
+}
+
+/**
+ * Критерии зоны из «Эталонов уборки»: одна строка — один пункт.
+ * Сначала снимаем маркеры «1.», «2)», «—», «•», потом режем строку по «;»
+ * и концам предложений. Так работает и старый абзац, и новый список.
  */
 function splitPhotoCriteria_(what) {
   const s = str_(what);
   if (!s) return [];
-  return s.split(/;\s*|[.!?]\s+/).map(x => str_(x)).filter(Boolean).slice(0, 12);
+  const out = [];
+  s.replace(/\r/g, '').split('\n').forEach(line => {
+    const clean = line.replace(/^\s*(?:[-–—•*]|\d+[.)])\s*/, '').trim();
+    if (!clean) return;
+    clean.split(/;\s*|[.!?]\s+/).forEach(part => {
+      const item = str_(part).replace(/[.;!?]+$/, '').trim();
+      if (item) out.push(item);
+    });
+  });
+  return out.slice(0, 12);
 }
 
-/** Промпт: критерии зоны + жёсткие правила + схема ответа. */
-function buildPhotoPrompt_(zone, criteria, hasRef) {
+/** Промпт: критерии зоны + жёсткие правила + схема ответа. refCount — число эталонов. */
+function buildPhotoPrompt_(zone, criteria, refCount) {
   const list = criteria && criteria.length ? criteria : PHOTO_GENERIC_CRITERIA;
+  const n = Math.max(0, Math.min(PHOTO_MAX_REFS, Number(refCount) || (refCount ? 1 : 0)));
+  const hasRef = n > 0;
+  const photoNo = n + 1;
   const lines = [
     'Ты проверяешь фото уборки бара в джаз-клубе. Зона: «' + str_(zone) + '».',
     hasRef
-      ? 'На изображении 1 — эталон: как выглядит убранная зона. На изображении 2 — фото после уборки. Оценивай ТОЛЬКО изображение 2.'
+      ? (n === 1
+        ? 'На изображении 1 — эталон: как выглядит убранная зона. На изображении 2 — фото после уборки. Оценивай ТОЛЬКО изображение 2.'
+        : 'На изображениях 1–' + n + ' — эталоны этой зоны с разных ракурсов. На изображении ' + photoNo +
+          ' — фото после уборки. Оценивай ТОЛЬКО изображение ' + photoNo + '.')
       : 'На изображении — фото зоны после уборки.',
     hasRef
-      ? 'Эталон — образец, а не шаблон для попиксельного сравнения: сравнивай состав и захламлённость, а не совпадение пикселей. Различия в свете, ракурсе, фоне, тенях и бликах нарушением не считай.'
+      ? 'Эталон — образец состава и порядка, а не шаблон для попиксельного сравнения. Ракурс, свет, фон и расстановка предметов на эталоне и на фото могут отличаться — это не нарушение.'
+      : '',
+    hasRef
+      ? 'Сравнивай по составу и порядку и оценивай признаки: чистота поверхностей, отсутствие мусора и грязной посуды, посуда убрана, контейнеры чистые, инвентарь на своих местах. Не требуй совпадения кадра с эталоном.'
       : '',
     'Что проверять (критерии зоны):',
   ];
@@ -1983,27 +2736,92 @@ function buildPhotoPrompt_(zone, criteria, hasRef) {
 }
 
 /**
- * Один запрос к Gemini (с эталоном, если он задан) и разбор ответа.
- * Возвращает {model, items, confidence} или {invalid:true, reason, model}.
+ * Приводит refs (объект или массив) к массиву эталонов, не больше PHOTO_MAX_REFS.
+ * Строки с битой ссылкой не выбрасываем здесь: их надо честно показать в причине.
+ */
+function photoRefArray_(refs) {
+  if (!refs) return [];
+  const arr = Array.isArray(refs) ? refs : [refs];
+  const limit = Math.min(PHOTO_MAX_REFS, PHOTO_MAX_IMAGES - 1);
+  return arr.filter(r => r && (r.fileId || r.url)).slice(0, limit);
+}
+
+function photoRefUrls_(refs) {
+  return photoRefArray_(refs).map(r => str_(r.url)).filter(Boolean);
+}
+
+/** Человеческая причина, почему эталоны не открылись. */
+function photoRefsFailReason_(failed) {
+  return (failed || []).map((f, i) => {
+    const label = str_(f.ref && (f.ref.aspect || f.ref.zone)) || ('эталон ' + (i + 1));
+    return label + ': ' + str_(f.error || 'файл не открылся').slice(0, 80);
+  }).join('; ').slice(0, 400);
+}
+
+/** Превью Диска (~512 px по длинной стороне) для повтора после таймаута. */
+function photoShrinkParts_(sources) {
+  const out = [];
+  for (const s of sources || []) {
+    if (!s || !s.fileId) return null;
+    let thumb = null;
+    try { thumb = DriveApp.getFileById(s.fileId).getThumbnail(); } catch (e) { thumb = null; }
+    if (!thumb) return null;
+    const bytes = thumb.getBytes();
+    if (!bytes || !bytes.length) return null;
+    out.push({
+      inline_data: {
+        mime_type: thumb.getContentType() || 'image/jpeg',
+        data: Utilities.base64Encode(bytes),
+      },
+    });
+  }
+  return out.length ? out : null;
+}
+
+/**
+ * Один запрос к Gemini: фото смены + до трёх эталонов зоны (всего до 4 картинок).
+ * Возвращает {model, items, confidence, references, elapsedMs},
+ * {invalid:true, reason, model} или {refsUnavailable:true, reason, refs}.
  * Бросает ошибку только при сетевой/HTTP-ошибке — её ловит checkPhoto_.
  */
-function geminiPhotoCheck_(key, zone, ref, blob, fileId) {
-  const criteria = splitPhotoCriteria_(ref && ref.what);
-  const imageParts = [];
-  let refUsed = false;
-  if (ref && ref.fileId) {
-    try {
-      const rb = DriveApp.getFileById(ref.fileId).getBlob();
-      imageParts.push({ inline_data: { mime_type: rb.getContentType(), data: Utilities.base64Encode(rb.getBytes()) } });
-      refUsed = true;
-    } catch (e) {
-      log_('Проверка фото', 'эталон не открылся: ' + e);
-    }
-  }
-  imageParts.push({ inline_data: { mime_type: blob.getContentType(), data: Utilities.base64Encode(blob.getBytes()) } });
+function geminiPhotoCheck_(key, zone, refs, blob, fileId, what) {
+  const refList = photoRefArray_(refs);
+  const criteria = splitPhotoCriteria_(str_(what) || (refList[0] && refList[0].what) || '');
 
-  const prompt = buildPhotoPrompt_(zone, criteria, refUsed);
-  const requestParts = [{ text: prompt }].concat(imageParts);
+  const imageParts = [];
+  const sources = [];        // параллельно imageParts: откуда картинка (для 512px-повтора)
+  const loadedRefs = [];
+  const failedRefs = [];
+  refList.forEach(r => {
+    if (!r.fileId) {
+      failedRefs.push({ ref: r, error: 'нет ссылки на файл Диска' });
+      return;
+    }
+    try {
+      const rb = DriveApp.getFileById(r.fileId).getBlob();
+      imageParts.push({ inline_data: { mime_type: rb.getContentType(), data: Utilities.base64Encode(rb.getBytes()) } });
+      sources.push({ fileId: r.fileId });
+      loadedRefs.push(r);
+    } catch (e) {
+      failedRefs.push({ ref: r, error: String(e && e.message || e) });
+      log_('Проверка фото', 'эталон не открылся (' + (r.aspect || r.zone || r.fileId) + '): ' + e);
+    }
+  });
+  if (failedRefs.length) log_('Проверка фото', 'эталонов не открылось: ' + failedRefs.length);
+  // Все эталоны зоны битые: не отправляем фото «без эталонов» молча, а честно
+  // говорим «непонятно» с причиной — владелец увидит, что ссылку надо поправить.
+  if (refList.length && !loadedRefs.length) {
+    return {
+      refsUnavailable: true,
+      reason: photoRefsFailReason_(failedRefs),
+      refs: refList,
+    };
+  }
+
+  imageParts.push({ inline_data: { mime_type: blob.getContentType(), data: Utilities.base64Encode(blob.getBytes()) } });
+  sources.push({ fileId: fileId || '' });
+
+  const requestParts = [{ text: buildPhotoPrompt_(zone, criteria, loadedRefs.length) }].concat(imageParts);
   const generationConfig = {
     temperature: 0,
     responseMimeType: 'application/json',
@@ -2035,51 +2853,68 @@ function geminiPhotoCheck_(key, zone, ref, blob, fileId) {
   const saved = str_(props.getProperty('GEMINI_MODEL'));
   const models = (saved ? [saved] : []).concat(GEMINI_MODELS.filter(m => m !== saved));
 
-  let answer;
-  try {
-    answer = runGeminiModels_(models, key, requestParts, generationConfig);
-  } catch (e) {
-    // UrlFetchApp не даёт задать таймаут. Если запрос не уложился — повторяем
-    // с превью Диска (~512 px по длинной стороне), как просит задача.
-    if (e && e.photoRetry && fileId) {
-      let thumb = null;
-      try { thumb = DriveApp.getFileById(fileId).getThumbnail(); } catch (e2) { thumb = null; }
-      const thumbBytes = thumb ? thumb.getBytes() : null;
-      if (!thumbBytes || !thumbBytes.length) throw e;
-      const smaller = requestParts.slice();
-      smaller[smaller.length - 1] = {
-        inline_data: {
-          mime_type: thumb.getContentType() || 'image/jpeg',
-          data: Utilities.base64Encode(thumbBytes),
-        },
-      };
-      log_('Проверка фото', 'Gemini не ответил вовремя — повтор с уменьшенным фото');
-      answer = runGeminiModels_(models, key, smaller, generationConfig);
-    } else {
-      throw e;
-    }
-  }
+  const started = Date.now();
+  // getSmallParts вызывается только при ошибке/таймауте: превью Диска
+  // ~512 px готовятся лениво, чтобы обычный быстрый запрос не платил за них.
+  const answer = runGeminiModels_(models, key, requestParts, generationConfig,
+    () => photoShrinkParts_(sources));
+  const elapsedMs = Date.now() - started;
 
-  if (saved !== answer.model) props.setProperty('GEMINI_MODEL', answer.model);
+  // Медленную модель не запоминаем: иначе следующий бармен будет ждать её снова.
+  if (saved !== answer.model) {
+    if (elapsedMs < 30000) props.setProperty('GEMINI_MODEL', answer.model);
+    else log_('Проверка фото', 'Модель ' + answer.model + ' ответила за ' + elapsedMs + ' мс — не запоминаем как основную');
+  }
+  log_('Проверка фото', 'Gemini ' + answer.model + ': ' + elapsedMs + ' мс, изображений ' +
+    (loadedRefs.length + 1) + (failedRefs.length ? ', эталонов не открылось: ' + failedRefs.length : '') +
+    (answer.usedSmall ? ', повтор 512 px' : ''));
+
   const v = validatePhotoAnswer_(answer.text, criteria);
-  if (!v.ok) return { invalid: true, reason: v.reason, model: answer.model };
-  return { model: answer.model, items: v.items, confidence: v.confidence };
+  if (!v.ok) {
+    return { invalid: true, reason: v.reason, model: answer.model, references: photoRefUrls_(loadedRefs), elapsedMs: elapsedMs };
+  }
+  return {
+    model: answer.model, items: v.items, confidence: v.confidence,
+    references: photoRefUrls_(loadedRefs), elapsedMs: elapsedMs,
+  };
 }
 
-/** Перебор моделей: 404/500/503 — следующая, 429 — сразу ошибка квоты. */
-function runGeminiModels_(models, key, parts, generationConfig) {
+/**
+ * Перебор моделей: 404/500/503 — следующая, 429 — сразу ошибка квоты.
+ * Если модель ответила 500/503 или сеть упала, а картинок несколько —
+ * та же модель один раз повторяется с уменьшенными до ~512 px картинками.
+ */
+function runGeminiModels_(models, key, parts, generationConfig, getSmallParts) {
   let lastErr = '';
-  for (const model of models) {
-    const resp = geminiRequest_(model, key, { contents: [{ parts: parts }], generationConfig: generationConfig });
+  let useSmall = false;
+  const switchToSmall = () => {
+    if (useSmall || typeof getSmallParts !== 'function') return false;
+    const small = getSmallParts();
+    if (!small) return false;
+    useSmall = true;
+    parts = [parts[0]].concat(small);
+    log_('Проверка фото', 'Повтор с уменьшенными до 512 px картинками: ' + small.length);
+    return true;
+  };
+  for (let i = 0; i < models.length; i++) {
+    const model = models[i];
+    let resp;
+    try {
+      resp = geminiRequest_(model, key, { contents: [{ parts: parts }], generationConfig: generationConfig });
+    } catch (e) {
+      if (e && e.photoRetry && switchToSmall()) { i--; continue; }
+      throw e;
+    }
     const code = resp.getResponseCode();
     const body = resp.getContentText();
     if (code === 404 || code === 500 || code === 503) {
       lastErr = 'модель ' + model + ': HTTP ' + code + ' ' + body.slice(0, 120);
+      if ((code === 500 || code === 503) && switchToSmall()) { i--; continue; }
       continue;
     }
     if (code === 429) throw new Error('429 квота Gemini');
     if (code !== 200) throw new Error('Gemini HTTP ' + code + ': ' + body.slice(0, 150));
-    return { model: model, text: parseGeminiAnswer_(resp) };
+    return { model: model, text: parseGeminiAnswer_(resp), usedSmall: useSmall };
   }
   throw new Error(lastErr || 'Нет доступной модели Gemini');
 }
@@ -2182,13 +3017,22 @@ function photoNotes_(items, level) {
 }
 
 /** Вердикт по уже прочитанному ответу модели (отдельно — чтобы тестировать без сети). */
-function photoFromGeminiResult_(res, ref) {
-  if (!res) return photoUnchecked_('пустой ответ Gemini', ref);
+function photoFromGeminiResult_(res, refs) {
+  if (!res) return photoUnchecked_('пустой ответ Gemini', refs);
+  const urls = Array.isArray(res.references) ? res.references : photoRefUrls_(refs);
+  if (res.refsUnavailable) {
+    return {
+      level: 'unclear', confidence: '', items: [],
+      notes: 'эталон не открылся: ' + str_(res.reason || 'файл не найден').slice(0, 300),
+      model: '', references: urls,
+      checkedAt: new Date(), error: '',
+    };
+  }
   if (res.invalid) {
     return {
       level: 'unclear', confidence: '', items: [],
       notes: 'ответ модели не разобран: ' + res.reason,
-      model: res.model || '', reference: ref && ref.url ? ref.url : 'нет',
+      model: res.model || '', references: urls,
       checkedAt: new Date(), error: '',
     };
   }
@@ -2199,32 +3043,33 @@ function photoFromGeminiResult_(res, ref) {
     items: res.items,
     notes: photoNotes_(res.items, level),
     model: res.model || '',
-    reference: ref && ref.url ? ref.url : 'нет',
+    references: urls,
     checkedAt: new Date(),
     error: '',
   };
 }
 
 /** Точка входа: никогда не бросает — иначе фото потеряется из-за проверки. */
-function checkPhoto_(zone, blob, ref, fileId) {
+function checkPhoto_(zone, blob, refs, fileId, what) {
   const key = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
-  if (!key) return photoUnchecked_('не задан ключ GEMINI_API_KEY', ref);
+  if (!key) return photoUnchecked_('не задан ключ GEMINI_API_KEY', refs);
   try {
-    const res = geminiPhotoCheck_(key, zone, ref, blob, fileId);
-    return photoFromGeminiResult_(res, ref);
+    const res = geminiPhotoCheck_(key, zone, refs, blob, fileId, what);
+    return photoFromGeminiResult_(res, res && res.refsUnavailable ? res.refs : refs);
   } catch (e) {
     const msg = String(e && e.message || e);
     log_('Проверка фото', 'Gemini: ' + msg.slice(0, 300));
-    return photoUnchecked_(msg, ref);
+    return photoUnchecked_(msg, refs);
   }
 }
 
-function photoUnchecked_(reason, ref) {
+function photoUnchecked_(reason, refs) {
   const msg = str_(reason).slice(0, 300) || 'неизвестная ошибка';
+  const urls = photoRefUrls_(refs);
   return {
     level: 'unchecked', confidence: '', items: [],
     notes: 'причина: ' + msg, model: '',
-    reference: ref && ref.url ? ref.url : 'нет',
+    references: urls, reference: urls[0] || 'нет',
     checkedAt: new Date(), error: msg,
   };
 }
@@ -2242,15 +3087,16 @@ function photoPublic_(v) {
     model: v.model || '',
     checkedAt: v.checkedAt instanceof Date ? v.checkedAt.toISOString() : '',
     reference: v.reference || '',
+    references: v.references || [],
     error: v.error || '',
   };
 }
 
 /**
  * Запись вердикта в строку листа. Старые H/I заполняем человеческим текстом,
- * новые M–R — машинными полями. Ошибка записи не отменяет сохранение фото.
+ * новые M–S — машинными полями. Ошибка записи не отменяет сохранение фото.
  */
-function writePhotoVerdict_(sheet, row, v) {
+function writePhotoVerdict_(sheet, row, v, floor) {
   try {
     const cols = ensurePhotoColumns_(sheet);
     const checkedAt = v.checkedAt instanceof Date ? v.checkedAt : new Date();
@@ -2267,13 +3113,31 @@ function writePhotoVerdict_(sheet, row, v) {
     sheet.getRange(row, cols.model).setValue(str_(v.model).slice(0, 80));
     sheet.getRange(row, cols.checkedAt).setNumberFormat('dd.MM.yyyy HH:mm').setValue(checkedAt);
 
-    const refUrl = str_(v.reference);
-    if (/^https?:\/\//.test(refUrl)) {
-      sheet.getRange(row, cols.reference).setRichTextValue(
-        SpreadsheetApp.newRichTextValue().setText('эталон').setLinkUrl(refUrl).build());
+    const urls = Array.isArray(v.references) && v.references.length
+      ? v.references.map(str_).filter(Boolean).slice(0, PHOTO_MAX_REFS)
+      : (function () {
+        const one = str_(v.reference);
+        return /^https?:\/\//.test(one) ? [one] : [];
+      })();
+    const refCell = sheet.getRange(row, cols.reference);
+    if (!urls.length) {
+      refCell.setValue('нет');
+    } else if (urls.length === 1) {
+      refCell.setRichTextValue(
+        SpreadsheetApp.newRichTextValue().setText('эталон').setLinkUrl(urls[0]).build());
     } else {
-      sheet.getRange(row, cols.reference).setValue('нет');
+      // Несколько эталонов: одна ссылка на каждый, чтобы владелец открыл нужный.
+      const labels = urls.map((u, i) => 'эталон ' + (i + 1));
+      const text = labels.join(' · ');
+      const rt = SpreadsheetApp.newRichTextValue().setText(text);
+      let at = 0;
+      labels.forEach((label, i) => {
+        rt.setLinkUrl(at, at + label.length, urls[i]);
+        at += label.length + 3; // ' · '
+      });
+      refCell.setRichTextValue(rt.build());
     }
+    if (cols.floor) sheet.getRange(row, cols.floor).setValue(str_(floor));
   } catch (e) {
     log_('Проверка фото', 'вердикт не записался в лист: ' + e);
   }
@@ -2336,6 +3200,7 @@ function photoFromRow_(sheet, r) {
     model: cols.model ? str_(r[cols.model - 1]) : '',
     checkedAt: checked && !isNaN(checked.getTime()) ? checked.toISOString() : '',
     reference: cols.reference ? str_(r[cols.reference - 1]) : '',
+    floor: cols.floor ? str_(r[cols.floor - 1]) : '',
   };
 }
 

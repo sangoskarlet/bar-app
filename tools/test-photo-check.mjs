@@ -59,6 +59,10 @@ class FakeSheet {
   getMaxRows() { return Math.max(this.cells.length, 10); }
   getMaxColumns() { return Math.max(this.cols, 20); }
   getRange(row, col, numRows = 1, numCols = 1) { return new FakeRange(this, row, col, numRows, numCols); }
+  setColumnWidth() { return this; }
+  setFrozenRows() { return this; }
+  insertRowsAfter() { return this; }
+  deleteRows() { return this; }
   get(row, col) {
     const r = this.cells[row - 1];
     return r && r[col - 1] !== undefined ? r[col - 1] : '';
@@ -73,7 +77,8 @@ class FakeSheet {
 
 const PHOTO_HEADERS = ['Дата', 'Сотрудник', 'Зона', 'Фото', 'Комментарий', 'Получено', 'ID записи',
   'Проверка ИИ', 'Что не так', 'Замечание менеджера', 'Фото удалено', 'ID файла'];
-const PHOTO_FULL_HEADERS = PHOTO_HEADERS.concat(['вердикт', 'уверенность', 'замечания', 'модель', 'проверено_в', 'эталон']);
+const PHOTO_FULL_HEADERS = PHOTO_HEADERS.concat(['вердикт', 'уверенность', 'замечания', 'модель', 'проверено_в', 'эталон', 'этаж']);
+const REF_PHOTO_HEADERS = ['зона', 'порядок', 'ссылка_на_фото', 'ракурс', 'активен'];
 
 const props = new Map([
   ['GEMINI_API_KEY', 'test-key'],
@@ -84,6 +89,7 @@ const state = {
   driveFiles: new Map(),
   photoSheet: null,
   refsSheet: null,
+  refPhotosSheet: null,
   log: [],
 };
 
@@ -136,17 +142,28 @@ const sandbox = {
       getSheetByName: (name) => {
         if (name === 'Фото уборки') return state.photoSheet;
         if (name === 'Эталоны уборки') return state.refsSheet;
+        if (name === 'Эталоны — фото') return state.refPhotosSheet;
         if (name === 'Лог') return null;
         return null;
+      },
+      insertSheet: (name) => {
+        const sh = new FakeSheet([]);
+        if (name === 'Эталоны — фото') state.refPhotosSheet = sh;
+        return sh;
       },
     }),
     newRichTextValue: () => {
       const obj = {
         text: '',
         url: '',
+        links: [],
         setText(t) { this.text = t; return this; },
-        setLinkUrl(u) { this.url = u; return this; },
-        build() { return { text: this.text, url: this.url }; },
+        setLinkUrl(a, b, c) {
+          if (b === undefined) this.url = a;
+          else this.links.push([a, b, c]);
+          return this;
+        },
+        build() { return { text: this.text, url: this.url, links: this.links }; },
       };
       return obj;
     },
@@ -196,11 +213,23 @@ test('промпт: зона, критерии, только JSON, запрет 
   assert.doesNotMatch(p, /изображении 1/);
 });
 
-test('промпт с эталоном просит сравнить состав, а не пиксели', () => {
+test('промпт с эталоном просит сравнить состав и порядок, а не пиксели', () => {
   const p = sandbox.buildPhotoPrompt_('Бар 1 этаж', ['Стойка сухая'], true);
   assert.match(p, /изображении 1 — эталон/);
   assert.match(p, /попиксельного/);
-  assert.match(p, /состав и захламлённость/);
+  assert.match(p, /состава и порядка|по составу и порядку/);
+  assert.match(p, /Ракурс, свет, фон/);
+  assert.match(p, /контейнеры чистые/);
+  assert.match(p, /инвентарь на своих местах/);
+});
+
+test('промпт с тремя эталонами: изображения 1–3, фото 4, признаки', () => {
+  const p = sandbox.buildPhotoPrompt_('Бар 1 этаж', ['Стойка сухая'], 3);
+  assert.match(p, /изображениях 1–3 — эталоны/);
+  assert.match(p, /изображении 4 — фото после уборки/);
+  assert.match(p, /Оценивай ТОЛЬКО изображение 4/);
+  assert.match(p, /чистота поверхностей/);
+  assert.match(p, /Не требуй совпадения кадра/);
 });
 
 // ---------- 2. Разбор ответа ----------
@@ -297,6 +326,8 @@ test('не проверено → телефон получает unclear + пр
 
 // ---------- 4. Запрос к Gemini (мок) ----------
 const BLOB = sandbox.Utilities.newBlob([1, 2, 3, 4], 'image/jpeg', 'x.jpg');
+const refLink = id => 'https://drive.google.com/file/d/' + id + '/view';
+const RID = n => 'ref' + String(n).padStart(21, '0');
 
 test('запрос: одна картинка, схема ответа, рабочая модель', () => {
   state.fetchCalls = [];
@@ -342,8 +373,50 @@ test('503 → следующая модель; найденная сохраня
   }));
   props.delete('GEMINI_MODEL');
   const res = sandbox.geminiPhotoCheck_('k', 'Бар 1 этаж', null, BLOB, null);
-  assert.equal(res.model, 'gemini-3.8-flash');
-  assert.equal(props.get('GEMINI_MODEL'), 'gemini-3.8-flash');
+  assert.equal(res.model, 'gemini-3.1-flash-lite');
+  assert.equal(props.get('GEMINI_MODEL'), 'gemini-3.1-flash-lite');
+});
+
+test('503 с 3 эталонами → та же модель повторяется с 512 px, без смены модели', () => {
+  state.fetchCalls = [];
+  [1, 2, 3].forEach(n => state.driveFiles.set(RID(n), { bytes: [n], mime: 'image/jpeg', thumb: [10 + n] }));
+  state.driveFiles.set('photo1', { bytes: [1, 2], thumb: [6], mime: 'image/jpeg' });
+  state.fetchHandler = (url, opt, n) => (n === 1 ? apiResponse(503, 'high demand') : geminiOk({
+    verdict: 'ok', confidence: 0.8,
+    items: [{ criterion: 'Стойка', level: 'ok', comment: 'сухо' }],
+  }));
+  const refs = [1, 2, 3].map(n => ({
+    zone: 'Бар 1 этаж', fileId: RID(n), url: refLink(RID(n)), aspect: 'р' + n, what: 'Стойка сухая',
+  }));
+  props.delete('GEMINI_MODEL');
+  const res = sandbox.geminiPhotoCheck_('k', 'Бар 1 этаж', refs, BLOB, 'photo1');
+  assert.equal(res.model, 'gemini-flash-lite-latest');
+  assert.equal(state.fetchCalls.length, 2);
+  assert.match(state.fetchCalls[0].url, /gemini-flash-lite-latest:generateContent$/);
+  assert.match(state.fetchCalls[1].url, /gemini-flash-lite-latest:generateContent$/);
+  const smaller = JSON.parse(state.fetchCalls[1].options.payload).contents[0].parts;
+  assert.equal(smaller.length, 5);
+  assert.deepEqual(
+    smaller.slice(1).map(p => Buffer.from(p.inline_data.data, 'base64').toString('hex')),
+    ['0b', '0c', '0d', '06'],
+  );
+});
+
+test('медленный ответ (>30 с) не запоминается как основная модель', () => {
+  state.fetchCalls = [];
+  props.delete('GEMINI_MODEL');
+  vm.runInContext('globalThis.__realNow = Date.now; globalThis.__t = 1000000; Date.now = () => (globalThis.__t += 31000);', sandbox);
+  try {
+    state.fetchHandler = () => geminiOk({
+      verdict: 'ok', confidence: 0.8,
+      items: [{ criterion: 'Стойка', level: 'ok', comment: 'сухо' }],
+    });
+    const res = sandbox.geminiPhotoCheck_('k', 'Бар 1 этаж', null, BLOB, null);
+    assert.equal(res.model, 'gemini-flash-lite-latest');
+    assert.equal(props.get('GEMINI_MODEL'), undefined);
+  } finally {
+    vm.runInContext('Date.now = globalThis.__realNow;', sandbox);
+  }
 });
 
 test('429 → ошибка квоты, без перебора', () => {
@@ -387,22 +460,190 @@ test('невалидный JSON от Gemini → invalid, а не исключе�
   assert.match(res.reason, /не JSON/);
 });
 
+// ---------- 4a. Этажи ----------
+const ss = () => sandbox.SpreadsheetApp.openById('x');
+
+test('этажи: число, «2 этаж», пусто; по умолчанию 1', () => {
+  assert.equal(sandbox.photoFloorNorm_('1'), '1');
+  assert.equal(sandbox.photoFloorNorm_('2 этаж'), '2');
+  assert.equal(sandbox.photoFloorNorm_('2 ЭТАЖ'), '2');
+  assert.equal(sandbox.photoFloorNorm_(''), '');
+  assert.equal(sandbox.photoFloorNorm_('цоколь'), 'цоколь');
+  assert.equal(sandbox.photoFloorDefault_('Бар 2 этаж'), '2');
+  assert.equal(sandbox.photoFloorDefault_('Склад'), '1');
+  assert.equal(sandbox.photoFloorLabel_('2'), '2 этаж');
+  assert.equal(sandbox.photoFloorLabel_(''), 'без этажа');
+});
+
+test('миграция: колонка «этаж» добавляется и заполняется, лист эталонов создаётся', () => {
+  state.refsSheet = new FakeSheet(
+    ['Зона (как в «Списки», столбец B)', 'Что проверять (ИИ читает это описание)', 'Эталонное фото (ссылка на Google Диск)'],
+    [['Бар 1 этаж', 'x', ''], ['Бар 2 этаж', 'x', ''], ['Склад', 'x', '']],
+  );
+  state.refPhotosSheet = null;
+  const filled = sandbox.photoMigrate_(ss());
+  assert.equal(filled, 3);
+  assert.equal(state.refsSheet.get(1, 4), 'этаж');
+  assert.equal(state.refsSheet.get(2, 4), '1');
+  assert.equal(state.refsSheet.get(3, 4), '2');
+  assert.equal(state.refsSheet.get(4, 4), '1');
+  assert.ok(state.refPhotosSheet);
+  assert.equal(state.refPhotosSheet.get(1, 1), 'зона');
+  assert.equal(state.refPhotosSheet.get(1, 5), 'активен');
+  // Повторный запуск колонку не дублирует и этажи не переписывает.
+  state.refsSheet.set(2, 4, '9');
+  sandbox.photoMigrate_(ss());
+  assert.equal(state.refsSheet.get(1, 4), 'этаж');
+  assert.equal(state.refsSheet.get(2, 4), '9');
+});
+
+// ---------- 4b. Эталоны — фото ----------
+test('эталоны — фото: неактивный не берётся, порядок, максимум 3', () => {
+  state.refPhotosSheet = new FakeSheet(REF_PHOTO_HEADERS, [
+    ['Бар 1 этаж', 30, refLink(RID(3)), 'общий вид', true],
+    ['Бар 1 этаж', 10, refLink(RID(1)), 'со стороны входа', true],
+    ['Бар 1 этаж', 5, refLink(RID(9)), 'старый ракурс', false],
+    ['Бар 1 этаж', 20, refLink(RID(2)), 'стойка крупно', true],
+    ['Бар 1 этаж', 40, refLink(RID(4)), 'дальний край', true],
+    ['Кофемашина', 1, refLink(RID(8)), 'спереди', true],
+  ]);
+  const res = sandbox.photoRefPhotosFor_(ss(), 'бар 1 ЭТАЖ');
+  assert.equal(res.total, 5);
+  assert.equal(res.activeCount, 4);
+  assert.equal(res.forCheck.length, 3);
+  assert.deepEqual(res.forCheck.map(r => r.fileId), [RID(1), RID(2), RID(3)]);
+  assert.equal(res.skipped, 1);
+  // Пустой «активен» = активен, «нет» = выключен.
+  assert.equal(sandbox.refPhotoActive_(''), true);
+  assert.equal(sandbox.refPhotoActive_(true), true);
+  assert.equal(sandbox.refPhotoActive_(false), false);
+  assert.equal(sandbox.refPhotoActive_('нет'), false);
+});
+
+test('зоны с этажами: из «Списков» + зоны только из эталонов', () => {
+  state.refsSheet = new FakeSheet(['Зона', 'Что проверять', 'Эталонное фото', 'этаж'], [
+    ['Бар 1 этаж', 'x', '', '1'],
+    ['Бар 2 этаж', 'x', '', '2'],
+    ['Склад', 'x', '', ''],
+    ['Только в эталонах', 'x', '', '3'],
+  ]);
+  state.refPhotosSheet = new FakeSheet(REF_PHOTO_HEADERS, [
+    ['Бар 1 этаж', 1, refLink(RID(1)), 'вход', true],
+    ['Бар 1 этаж', 2, refLink(RID(2)), 'стойка', false],
+    ['Только в эталонах', 1, refLink(RID(3)), 'полки', true],
+  ]);
+  const zones = sandbox.photoZones_(ss(), ['Бар 1 этаж', 'Бар 2 этаж', 'Кофемашина', 'Склад']);
+  assert.deepEqual(JSON.parse(JSON.stringify(zones)), [
+    { zone: 'Бар 1 этаж', floor: '1' },
+    { zone: 'Бар 2 этаж', floor: '2' },
+    { zone: 'Кофемашина', floor: '' },
+    { zone: 'Склад', floor: '' },
+    { zone: 'Только в эталонах', floor: '3' },
+  ]);
+  const sum = sandbox.photoRefSummaries_(zones, sandbox.photoRefPhotosAll_(ss()));
+  const bar = sum.find(x => x.zone === 'Бар 1 этаж');
+  assert.deepEqual({ floor: bar.floor, active: bar.active, total: bar.total }, { floor: '1', active: 1, total: 2 });
+  assert.equal(sum.find(x => x.zone === 'Кофемашина').total, 0);
+});
+
+// ---------- 4c. Несколько эталонов в запросе ----------
+test('4 изображения: 1 фото + 3 эталона, эталоны первыми, фото последним', () => {
+  state.fetchCalls = [];
+  [1, 2, 3].forEach(n => state.driveFiles.set(RID(n), { bytes: [n], mime: 'image/jpeg' }));
+  state.fetchHandler = () => geminiOk({
+    verdict: 'ok', confidence: 0.9,
+    items: [{ criterion: 'Стойка', level: 'ok', comment: 'сухо' }],
+  });
+  const refs = [1, 2, 3].map(n => ({
+    zone: 'Бар 1 этаж', order: n, fileId: RID(n), url: refLink(RID(n)),
+    aspect: 'ракурс ' + n, what: 'Стойка сухая и пустая',
+  }));
+  props.delete('GEMINI_MODEL');
+  const res = sandbox.geminiPhotoCheck_('k', 'Бар 1 этаж', refs, BLOB, 'photo1');
+  assert.equal(res.references.length, 3);
+  const parts = JSON.parse(state.fetchCalls[0].options.payload).contents[0].parts;
+  assert.equal(parts.length, 5); // текст + 3 эталона + фото
+  assert.match(parts[0].text, /изображениях 1–3 — эталоны/);
+  assert.equal(parts[4].inline_data.data, Buffer.from([1, 2, 3, 4]).toString('base64'));
+});
+
+test('все ссылки на эталоны битые → unclear с причиной, без падения', () => {
+  state.fetchCalls = [];
+  const refs = [{
+    zone: 'Склад', fileId: 'missing00000000000000001', url: refLink('missing00000000000000001'),
+    aspect: 'полки', what: 'Полки чистые',
+  }];
+  const res = sandbox.geminiPhotoCheck_('k', 'Склад', refs, BLOB, null);
+  assert.equal(res.refsUnavailable, true);
+  assert.match(res.reason, /полки/);
+  assert.equal(state.fetchCalls.length, 0);
+  const v = sandbox.photoFromGeminiResult_(res, refs);
+  assert.equal(v.level, 'unclear');
+  assert.match(v.notes, /эталон не открылся/);
+});
+
+test('часть эталонов битая → отправляются оставшиеся', () => {
+  state.fetchCalls = [];
+  state.driveFiles.set(RID(1), { bytes: [9], mime: 'image/png' });
+  state.fetchHandler = () => geminiOk({
+    verdict: 'warn', confidence: 0.8,
+    items: [{ criterion: 'Полки', level: 'warn', comment: 'коробка' }],
+  });
+  const refs = [
+    { zone: 'Склад', fileId: 'broken000000000000000001', url: refLink('broken000000000000000001'), aspect: 'битая', what: 'Полки чистые' },
+    { zone: 'Склад', fileId: RID(1), url: refLink(RID(1)), aspect: 'рабочая', what: 'Полки чистые' },
+  ];
+  props.delete('GEMINI_MODEL');
+  const res = sandbox.geminiPhotoCheck_('k', 'Склад', refs, BLOB, null);
+  assert.equal(res.invalid, undefined);
+  const parts = JSON.parse(state.fetchCalls[0].options.payload).contents[0].parts;
+  assert.equal(parts.length, 3); // текст + один живой эталон + фото
+  assert.match(parts[0].text, /изображении 1 — эталон/);
+});
+
+test('таймаут с 3 эталонами → повтор всеми превью 512px (4 картинки)', () => {
+  state.fetchCalls = [];
+  [1, 2, 3].forEach(n => state.driveFiles.set(RID(n), { bytes: [n], mime: 'image/jpeg', thumb: [10 + n] }));
+  state.driveFiles.set('photo1', { bytes: [1, 2], thumb: [6], mime: 'image/jpeg' });
+  state.fetchHandler = (url, opt, n) => {
+    if (n === 1) throw new Error('Timeout');
+    return geminiOk({
+      verdict: 'ok', confidence: 0.85,
+      items: [{ criterion: 'Стойка', level: 'ok', comment: 'сухо' }],
+    });
+  };
+  const refs = [1, 2, 3].map(n => ({
+    zone: 'Бар 1 этаж', fileId: RID(n), url: refLink(RID(n)), aspect: 'р' + n, what: 'Стойка сухая',
+  }));
+  props.delete('GEMINI_MODEL');
+  const res = sandbox.geminiPhotoCheck_('k', 'Бар 1 этаж', refs, BLOB, 'photo1');
+  assert.equal(res.model, 'gemini-flash-lite-latest');
+  const smaller = JSON.parse(state.fetchCalls[1].options.payload).contents[0].parts;
+  assert.equal(smaller.length, 5);
+  assert.deepEqual(
+    smaller.slice(1).map(p => Buffer.from(p.inline_data.data, 'base64').toString('hex')),
+    ['0b', '0c', '0d', '06'],
+  );
+});
+
 // ---------- 5. Лист: колонки, запись, чтение ----------
-test('колонки M–R создаются один раз и не дублируются', () => {
+test('колонки M–S создаются один раз и не дублируются', () => {
   const sheet = new FakeSheet(PHOTO_HEADERS);
   const cols = sandbox.ensurePhotoColumns_(sheet);
   assert.deepEqual(
-    [cols.verdict, cols.confidence, cols.notes, cols.model, cols.checkedAt, cols.reference],
-    [13, 14, 15, 16, 17, 18],
+    [cols.verdict, cols.confidence, cols.notes, cols.model, cols.checkedAt, cols.reference, cols.floor],
+    [13, 14, 15, 16, 17, 18, 19],
   );
   assert.equal(sheet.get(1, 13), 'вердикт');
   assert.equal(sheet.get(1, 18), 'эталон');
+  assert.equal(sheet.get(1, 19), 'этаж');
   const again = sandbox.ensurePhotoColumns_(sheet);
   assert.equal(again.verdict, 13);
-  assert.equal(sheet.getLastColumn(), 18);
+  assert.equal(again.floor, 19);
+  assert.equal(sheet.getLastColumn(), 19);
 });
 
-test('вердикт пишется в H/I и M–R', () => {
+test('вердикт пишется в H/I и M–S, этаж — в S', () => {
   const sheet = new FakeSheet(PHOTO_HEADERS, [[
     new Date('2026-11-22T20:40:00Z'), 'Тест', 'Бар 1 этаж', 'Открыть фото', '', new Date(), "'id-1",
     '', '', '', '', 'file-1',
@@ -412,9 +653,9 @@ test('вердикт пишется в H/I и M–R', () => {
     notes: 'warn: пустая бутылка слева',
     model: 'gemini-flash-lite-latest',
     checkedAt: new Date('2026-11-22T20:41:00Z'),
-    reference: 'нет', error: '', items: [],
+    reference: 'нет', references: [], error: '', items: [],
   };
-  sandbox.writePhotoVerdict_(sheet, 2, v);
+  sandbox.writePhotoVerdict_(sheet, 2, v, '2');
   assert.equal(sheet.get(2, 8), '⚠ Замечания');
   assert.equal(String(sheet.get(2, 9)).replace(/^'/, ''), 'warn: пустая бутылка слева');
   assert.equal(sheet.get(2, 13), 'warn');
@@ -423,6 +664,18 @@ test('вердикт пишется в H/I и M–R', () => {
   assert.equal(sheet.get(2, 16), 'gemini-flash-lite-latest');
   assert.equal(typeof sheet.get(2, 17).getTime, 'function');
   assert.equal(sheet.get(2, 18), 'нет');
+  assert.equal(sheet.get(2, 19), '2');
+});
+
+test('несколько эталонов: в R ссылки «эталон 1 · эталон 2», в S этаж', () => {
+  const sheet = new FakeSheet(PHOTO_HEADERS, [[new Date(), 'Тест', 'Бар 1 этаж', '', '', new Date(), "'id-3", '', '', '', '', 'file-3']]);
+  sandbox.writePhotoVerdict_(sheet, 2, {
+    level: 'ok', confidence: 0.9, notes: '', model: 'm', checkedAt: new Date(),
+    references: ['https://drive.google.com/file/d/r1/view', 'https://drive.google.com/file/d/r2/view'],
+    error: '', items: [],
+  }, '1');
+  assert.equal(sheet.get(2, 18), 'эталон 1 · эталон 2');
+  assert.equal(sheet.get(2, 19), '1');
 });
 
 test('не проверено пишется в колонку вердикта и в причину', () => {
@@ -460,16 +713,17 @@ test('вердикт по ID находится; чужой ID → ошибка'
   assert.equal(sandbox.getPhotoVerdict_('nope').ok, false);
 });
 
-test('эталоны читаются по зоне; ссылка сохраняется', () => {
+test('эталоны читаются по зоне; этаж и ссылка сохраняются', () => {
   state.refsSheet = new FakeSheet(
-    ['Зона (как в «Списки», столбец B)', 'Что проверять (ИИ читает это описание)', 'Эталонное фото (ссылка на Google Диск)'],
-    [['Бар 1 этаж', 'Стойка сухая. Коврики чистые.', 'https://drive.google.com/file/d/ABC123456789012345678/view']],
+    ['Зона (как в «Списки», столбец B)', 'Что проверять (ИИ читает это описание)', 'Эталонное фото (ссылка на Google Диск)', 'этаж'],
+    [['Бар 1 этаж', 'Стойка сухая. Коврики чистые.', 'https://drive.google.com/file/d/ABC123456789012345678/view', '2 этаж']],
   );
   const refs = sandbox.photoRefs_({ getSheetByName: (n) => (n === 'Эталоны уборки' ? state.refsSheet : null) });
   const ref = sandbox.photoRefFor_(refs, 'бар 1 ЭТАЖ');
   assert.ok(ref);
   assert.equal(ref.what, 'Стойка сухая. Коврики чистые.');
   assert.equal(ref.fileId, 'ABC123456789012345678');
+  assert.equal(ref.floor, '2');
   assert.match(ref.url, /ABC123456789012345678/);
 });
 

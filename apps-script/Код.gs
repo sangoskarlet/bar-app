@@ -1961,21 +1961,22 @@ function ensurePhotoColumns_(sheet) {
   return cols;
 }
 
-/** Эталоны: { 'бар 1 этаж': { zone, what, fileId, url, floor } } */
+/** Эталоны: { 'бар': { zone, what, fileId, url, floor } } */
 function photoRefs_(ss) {
   const out = {};
   const sh = ss.getSheetByName(SHEETS.refs);
   if (!sh) return out;
-  const floorCol = refsFloorColumn_(sh, false).col;
+  const cols = refsColumnMap_(sh);
+  if (!cols.zone) return out;
   rows_(ss, SHEETS.refs).forEach(r => {
-    const zone = str_(r[0]);
+    const zone = str_(r[cols.zone - 1]);
     if (!zone) return;
     out[photoZoneKey_(zone)] = {
       zone: zone,
-      what: str_(r[1]),
-      fileId: driveId_(r[2]),
-      url: str_(r[2]),
-      floor: floorCol ? photoFloorNorm_(r[floorCol - 1]) : '',
+      what: cols.what ? str_(r[cols.what - 1]) : '',
+      fileId: cols.photo ? driveId_(r[cols.photo - 1]) : '',
+      url: cols.photo ? str_(r[cols.photo - 1]) : '',
+      floor: cols.floor ? photoFloorNorm_(r[cols.floor - 1]) : '',
     };
   });
   return out;
@@ -1989,11 +1990,41 @@ function photoRefFor_(refs, zone) {
   return (refs && refs[photoZoneKey_(zone)]) || null;
 }
 
-/* --- этажи ---------------------------------------------------------- */
+/* --- колонки и этажи «Эталонов уборки» ----------------------------- */
+
+// Как узнать колонки по шапке. Так код понимает и старую схему
+// «Зона | Что проверять | Эталонное фото | этаж», и новую
+// «этаж | зона | критерии | эталонное_фото».
+const REFS_COLUMN_KEYS = {
+  floor: ['этаж', 'floor'],
+  zone: ['зона'],
+  what: ['критерии', 'что проверять'],
+  photo: ['эталонное_фото', 'эталонное фото', 'ссылка_на_фото'],
+};
+
+/** Номер колонки (с 1) по названию шапки; 0 — колонки нет. */
+function refsColumnMap_(sheet) {
+  const width = Math.max(sheet.getLastColumn(), 1);
+  const headers = sheet.getRange(1, 1, 1, width).getValues()[0]
+    .map(v => str_(v).toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' '));
+  const cols = { floor: 0, zone: 0, what: 0, photo: 0 };
+  Object.keys(cols).forEach(key => {
+    const words = REFS_COLUMN_KEYS[key];
+    const idx = headers.findIndex(h => h && words.some(w => h.indexOf(w) >= 0));
+    if (idx >= 0) cols[key] = idx + 1;
+  });
+  // Совсем старая шапка без узнаваемых названий — читаем как раньше.
+  if (!cols.zone && !cols.what && !cols.photo) {
+    cols.zone = 1;
+    cols.what = 2;
+    cols.photo = 3;
+  }
+  return cols;
+}
 
 /**
  * «1», «1 этаж», «2 ЭТАЖ» → '1' / '2'. Пусто → ''.
- * Нечисловой текст («цоколь») остаётся как есть: «Без этажа» — только пустая ячейка.
+ * Нечисловой текст («цоколь») остаётся как есть.
  */
 function photoFloorNorm_(v) {
   const s = str_(v).toLowerCase().replace(/ё/g, 'е');
@@ -2017,38 +2048,16 @@ function photoFloorLabel_(floor) {
   return /^\d+$/.test(f) ? f + ' этаж' : f;
 }
 
-/**
- * Колонка «этаж» в «Эталонах уборки» по названию шапки.
- * create=true — если колонки нет, дописать в конец. Возвращает {col, created}.
- */
-function refsFloorColumn_(sheet, create) {
-  const width = Math.max(sheet.getLastColumn(), 1);
-  // Пустой лист без шапки не трогаем: иначе «этаж» попадёт в колонку A.
-  if (!str_(sheet.getRange(1, 1).getValue())) return { col: 0, created: false };
-  const headers = sheet.getRange(1, 1, 1, width).getValues()[0].map(v => str_(v).toLowerCase());
-  let idx = headers.indexOf(REFS_FLOOR_HEADER);
-  if (idx < 0) idx = headers.indexOf('floor');
-  let created = false;
-  if (idx < 0 && create) {
-    idx = width;
-    created = true;
-    sheet.getRange(1, idx + 1).setValue(REFS_FLOOR_HEADER).setFontWeight('bold');
-    sheet.setColumnWidth(idx + 1, 90);
-    log_('Проверка фото', 'Добавлена колонка ' + columnLetter_(idx + 1) + ' «этаж» в «' + SHEETS.refs + '»');
-  }
-  return { col: idx >= 0 ? idx + 1 : 0, created: created };
-}
-
 /** Заполняет пустые этажи: по названию зоны, иначе 1. Возвращает число строк. */
-function fillPhotoFloors_(sheet, floorCol) {
+function fillPhotoFloors_(sheet, cols) {
   const last = sheet.getLastRow();
-  if (last < 2 || !floorCol) return 0;
-  const zones = sheet.getRange(2, 1, last - 1, 1).getValues();
-  const floors = sheet.getRange(2, floorCol, last - 1, 1).getValues();
+  if (last < 2 || !cols.floor || !cols.zone) return 0;
+  const zones = sheet.getRange(2, cols.zone, last - 1, 1).getValues();
+  const floors = sheet.getRange(2, cols.floor, last - 1, 1).getValues();
   let filled = 0;
   for (let i = 0; i < zones.length; i++) {
     if (!str_(zones[i][0]) || str_(floors[i][0])) continue;
-    sheet.getRange(i + 2, floorCol).setValue(photoFloorDefault_(str_(zones[i][0])));
+    sheet.getRange(i + 2, cols.floor).setValue(photoFloorDefault_(str_(zones[i][0])));
     filled++;
   }
   if (filled) log_('Проверка фото', 'Этажи заполнены по умолчанию: ' + filled);
@@ -2057,14 +2066,22 @@ function fillPhotoFloors_(sheet, floorCol) {
 
 /**
  * Разово готовит данные для эталонов: колонку «этаж» и лист «Эталоны — фото».
- * Если колонка только что создана — заполняет этажи. Повторный вызов ничего не меняет.
+ * Для новой схемы колонка «этаж» уже первая — ничего не меняет.
+ * Для старой (без этажа) — дописывает в конец и заполняет 1/2.
  */
 function photoMigrate_(ss) {
   const sh = ss.getSheetByName(SHEETS.refs);
   let filled = 0;
-  if (sh) {
-    const f = refsFloorColumn_(sh, true);
-    if (f.created) filled = fillPhotoFloors_(sh, f.col);
+  if (sh && str_(sh.getRange(1, 1).getValue())) {
+    let cols = refsColumnMap_(sh);
+    if (!cols.floor) {
+      const width = Math.max(sh.getLastColumn(), 1);
+      sh.getRange(1, width + 1).setValue(REFS_FLOOR_HEADER).setFontWeight('bold');
+      sh.setColumnWidth(width + 1, 90);
+      cols = refsColumnMap_(sh);
+      if (cols.floor) filled = fillPhotoFloors_(sh, cols);
+      log_('Проверка фото', 'Добавлена колонка ' + columnLetter_(width + 1) + ' «этаж» в «' + SHEETS.refs + '»');
+    }
   }
   ensureRefPhotosSheet_(ss);
   return filled;
@@ -2183,18 +2200,12 @@ function photoRefSummaries_(zones, refRows) {
  */
 function setupPhotoRefs() {
   const ss = ss_();
-  const sh = ss.getSheetByName(SHEETS.refs);
-  let floorCol = 0;
-  let filled = 0;
-  if (sh) {
-    const f = refsFloorColumn_(sh, true);
-    floorCol = f.col;
-    if (f.created) filled = fillPhotoFloors_(sh, floorCol);
-  }
   const existed = !!ss.getSheetByName(SHEETS.refPhotos);
-  ensureRefPhotosSheet_(ss);
+  const filled = photoMigrate_(ss);
+  const sh = ss.getSheetByName(SHEETS.refs);
+  const cols = sh ? refsColumnMap_(sh) : { floor: 0 };
   const msg = 'Эталоны: лист «' + SHEETS.refPhotos + '» ' + (existed ? 'на месте' : 'создан') +
-    '; колонка «этаж» ' + (floorCol ? columnLetter_(floorCol) : 'НЕТ') +
+    '; колонка «этаж» ' + (cols.floor ? columnLetter_(cols.floor) : 'НЕТ') +
     (filled ? '; этажи заполнены по умолчанию: ' + filled : '') + '.';
   Logger.log(msg);
   log_('Проверка фото', msg);
@@ -2202,13 +2213,23 @@ function setupPhotoRefs() {
 }
 
 /**
- * Критерии зоны из «Эталонов уборки»: абзац режем на предложения.
- * Модель получает готовый список пунктов, а не общий текст «ищи грязь».
+ * Критерии зоны из «Эталонов уборки»: одна строка — один пункт.
+ * Сначала снимаем маркеры «1.», «2)», «—», «•», потом режем строку по «;»
+ * и концам предложений. Так работает и старый абзац, и новый список.
  */
 function splitPhotoCriteria_(what) {
   const s = str_(what);
   if (!s) return [];
-  return s.split(/;\s*|[.!?]\s+/).map(x => str_(x)).filter(Boolean).slice(0, 12);
+  const out = [];
+  s.replace(/\r/g, '').split('\n').forEach(line => {
+    const clean = line.replace(/^\s*(?:[-–—•*]|\d+[.)])\s*/, '').trim();
+    if (!clean) return;
+    clean.split(/;\s*|[.!?]\s+/).forEach(part => {
+      const item = str_(part).replace(/[.;!?]+$/, '').trim();
+      if (item) out.push(item);
+    });
+  });
+  return out.slice(0, 12);
 }
 
 /** Промпт: критерии зоны + жёсткие правила + схема ответа. refCount — число эталонов. */

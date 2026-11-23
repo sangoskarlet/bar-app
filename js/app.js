@@ -850,21 +850,116 @@ function openItemPicker(onPick) {
 }
 
 // =====================================================================
-//  ЭКРАН: ФОТО УБОРКИ
+//  ЭКРАН: ФОТО УБОРКИ — этаж → зоны этажа → камера
 // =====================================================================
-function screenPhoto(initialZone) {
-  const form = { zone: initialZone || '', comment: '', photos: [] }; // photos: [dataURL]
-  const root = h('main', { class: 'screen' }, header('Фото уборки'));
+//  Сервер отдаёт config.photoZones: [{zone, floor}] и config.photoRefs:
+//  [{zone, floor, active, total}]. Если телефон работает со старым кэшем
+//  без photoZones — все зоны попадут в группу «Без этажа», ничего не пропадёт.
+function photoZoneGroups() {
+  const src = (config && Array.isArray(config.photoZones) && config.photoZones.length)
+    ? config.photoZones
+    : ((config && config.zones) || []).map(zone => ({ zone: zone, floor: '' }));
+  const groups = new Map();
+  src.forEach(item => {
+    const zone = String((item && item.zone) || '').trim();
+    if (!zone) return;
+    const floor = String((item && item.floor) || '').trim();
+    if (!groups.has(floor)) groups.set(floor, []);
+    if (!groups.get(floor).includes(zone)) groups.get(floor).push(zone);
+  });
+  // Этажи: числа по возрастанию, потом текст, «Без этажа» — всегда последней.
+  const floors = [...groups.keys()].filter(Boolean);
+  floors.sort((a, b) => {
+    const na = parseInt(a, 10), nb = parseInt(b, 10);
+    const fa = isFinite(na), fb = isFinite(nb);
+    if (fa && fb && na !== nb) return na - nb;
+    if (fa !== fb) return fa ? -1 : 1;
+    return a.localeCompare(b, 'ru');
+  });
+  if (groups.has('')) floors.push('');
+  return { groups: groups, floors: floors };
+}
 
-  const zones = h('div', { class: 'chips' }, config.zones.map(z =>
-    h('button', {
-      class: 'chip' + (z === form.zone ? ' on' : ''),
-      onclick: (e) => {
-        form.zone = z;
-        zones.querySelectorAll('.chip').forEach(x => x.classList.remove('on'));
-        e.currentTarget.classList.add('on');
+function floorLabel(floor) {
+  const f = String(floor || '').trim();
+  if (!f) return 'Без этажа';
+  return /^\d+$/.test(f) ? f + ' этаж' : f;
+}
+
+function zonesWord(n) {
+  const d = n % 10, dd = n % 100;
+  if (d === 1 && dd !== 11) return 'зона';
+  if (d >= 2 && d <= 4 && (dd < 12 || dd > 14)) return 'зоны';
+  return 'зон';
+}
+
+function screenPhoto(initialZone) {
+  const form = { floor: null, floorPicked: false, zone: initialZone || '', comment: '', photos: [] };
+  const all = photoZoneGroups();
+
+  // «Переснять» приносит уже выбранную зону: находим её этаж и сразу
+  // показываем форму. Если зоны нет в списке — кладём её в «Без этажа».
+  if (form.zone) {
+    const found = [...all.groups.entries()].find(([, zs]) => zs.includes(form.zone));
+    form.floor = found ? found[0] : '';
+    form.floorPicked = true;
+    if (!found) {
+      if (!all.groups.has('')) all.groups.set('', []);
+      all.groups.get('').push(form.zone);
+      if (!all.floors.includes('')) all.floors.push('');
+    }
+  }
+
+  const root = h('main', { class: 'screen' }, header('Фото уборки'));
+  const floorBox = h('div', { class: 'photo-floors' });
+  const zoneBox = h('div', { class: 'chips' });
+  const zoneCaption = h('p', { class: 'photo-zone-picked' });
+  const zoneStep = h('section', { class: 'photo-step', hidden: true },
+    h('p', { class: 'label' }, 'Зона этого этажа'), zoneBox);
+
+  function drawFloors() {
+    floorBox.replaceChildren(...all.floors.map(f => {
+      const count = (all.groups.get(f) || []).length;
+      const on = form.floorPicked && f === form.floor;
+      return h('button', {
+        class: 'floor-btn' + (on ? ' on' : ''),
+        type: 'button',
+        'aria-pressed': on ? 'true' : 'false',
+        onclick: () => {
+          form.floor = f;
+          form.floorPicked = true;
+          form.zone = '';
+          drawFloors();
+          drawZones();
+          formStep.hidden = true;
+        },
       },
-    }, z)));
+        h('span', { class: 'floor-name' }, floorLabel(f)),
+        h('span', { class: 'floor-sub' }, `${count} ${zonesWord(count)}`));
+    }));
+  }
+
+  function drawZones() {
+    const list = form.floorPicked ? (all.groups.get(form.floor) || []) : [];
+    zoneBox.replaceChildren(...list.map(z => {
+      const on = z === form.zone;
+      return h('button', {
+        class: 'chip' + (on ? ' on' : ''),
+        type: 'button',
+        'aria-pressed': on ? 'true' : 'false',
+        onclick: () => chooseZone(z),
+      }, z);
+    }));
+    zoneStep.hidden = !form.floorPicked;
+  }
+
+  function chooseZone(z) {
+    form.zone = z;
+    drawZones();
+    zoneCaption.replaceChildren('Зона: ', h('b', {}, z));
+    formStep.hidden = false;
+    setTimeout(() => { if (document.body.contains(formStep)) formStep.scrollIntoView({ block: 'nearest' }); }, 30);
+  }
 
   const previews = h('div', { class: 'previews' });
   function drawPreviews() {
@@ -910,15 +1005,28 @@ function screenPhoto(initialZone) {
     resetTo(screenPhotoChecking, records, form.zone);
   });
 
-  root.append(
-    h('p', { class: 'label' }, 'Зона'), zones,
+  const formStep = h('section', { class: 'photo-step photo-form', hidden: true },
     h('p', { class: 'label' }, 'Фото'),
+    zoneCaption,
     h('div', { class: 'two' },
       h('button', { class: 'secondary', onclick: () => camInput.click() }, '📷 Камера'),
       h('button', { class: 'secondary', onclick: () => galInput.click() }, '🖼 Галерея')),
-    camInput, galInput, previews, comment, saveBtn,
+    camInput, galInput, previews, comment, saveBtn);
+
+  root.append(
+    h('section', { class: 'photo-step' },
+      h('p', { class: 'label' }, 'Этаж'),
+      h('p', { class: 'muted photo-floor-hint' }, 'Сначала этаж, потом зона этого этажа.'),
+      floorBox),
+    zoneStep, formStep,
     h('button', { class: 'link photo-history-link', onclick: () => go(screenPhotoHistory) }, 'История снимков'),
   );
+
+  drawFloors();
+  if (form.floorPicked) {
+    drawZones();
+    if (form.zone) chooseZone(form.zone);
+  }
   return root;
 }
 

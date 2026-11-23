@@ -116,6 +116,7 @@ function resetTo(screen, ...args) {
 }
 function render() {
   runScreenCleanups();
+  guardSection(); // выключенный раздел — на главную, даже если пришли из истории
   const [screen, args] = stack[stack.length - 1];
   app.replaceChildren(screen(...args));
   window.scrollTo(0, 0);
@@ -127,6 +128,72 @@ function header(title, { showBack = true } = {}) {
     h('h1', {}, title),
     h('span'),
   );
+}
+
+// ---------------------------------------------------------------------
+//  РАЗДЕЛЫ ПРИЛОЖЕНИЯ: включение и выключение из таблицы
+//
+//  Владелец правит лист «Настройки»: раздел_викторина = выкл и т. п.
+//  Сервер отдаёт config.features = {quiz:true, duel:false, ...}.
+//  Нет поля или нет ключа — раздел включён: нельзя случайно оставить бар
+//  без приложения. Выключенный раздел не рисуем плиткой; прямой вход
+//  (история, ?duel=КОД) возвращает на главную с сообщением.
+//
+//  Синк это не трогает: записи из очереди отправляются как раньше,
+//  выключается только вход в раздел.
+// ---------------------------------------------------------------------
+const FEATURE_DEFAULT = {
+  quiz: true, duel: true, checklists: true, acts: true, photo: true,
+  inventory: true, ttk: true, transfer: true, writeoff: true,
+};
+
+/** {quiz:true, ...}: всё, чего нет в config.features, считаем включённым. */
+function featuresMap() {
+  const src = (config && config.features) || {};
+  const out = { ...FEATURE_DEFAULT };
+  for (const key of Object.keys(out)) if (src[key] === false) out[key] = false;
+  return out;
+}
+
+function sectionOn(key) {
+  if (!key) return true;
+  return featuresMap()[key] !== false;
+}
+
+/** К какому разделу относится экран ('' — служебный, входит всегда). */
+function screenFeature(screen, args) {
+  if (!screen) return '';
+  if (screen === screenHome || screen === screenLogin || screen === screenQueue) return '';
+  if (screen === screenItemsForm) return args && args[0] === 'transfer' ? 'transfer' : 'writeoff';
+  if (screen === screenActs || screen === screenAct || screen === screenActDone ||
+      screen === screenLabel || screen === screenCloseAct) return 'acts';
+  if (screen === screenPhoto || screen === screenPhotoChecking || screen === screenPhotoSent ||
+      screen === screenPhotoVerdict || screen === screenPhotoHistory) return 'photo';
+  if (screen === screenChecklists || screen === screenChecklistRun || screen === screenChecklistDone) return 'checklists';
+  if (screen === screenTtkList || screen === screenTtkCard) return 'ttk';
+  if (screen === screenInventory || screen === screenInvItems || screen === screenInvCount ||
+      screen === screenInvCustom) return 'inventory';
+  if (screen === screenQuizStart || screen === screenQuizQuestion || screen === screenQuizResult) return 'quiz';
+  if (screen === screenDuelStart || screen === screenDuelWait || screen === screenDuelBattle ||
+      screen === screenDuelResult) return 'duel';
+  return '';
+}
+
+/**
+ * Прямой переход в выключенный раздел не открываем: на главную и сообщение.
+ * Возвращает true, если пришлось вернуть.
+ */
+function guardSection() {
+  const top = stack[stack.length - 1];
+  if (!top) return false;
+  const [screen, args] = top;
+  const key = screenFeature(screen, args);
+  if (!key || sectionOn(key)) return false;
+  stack.length = 0;
+  stack.push([screenHome, []]);
+  history.replaceState({ depth: 1 }, '');
+  toast('Раздел временно недоступен', 'bad');
+  return true;
 }
 
 // ---------------------------------------------------------------------
@@ -147,15 +214,32 @@ function applyTheme() {
   if (meta) meta.content = winter ? '#3d0712' : '#0b0b0c';
 }
 
-async function loadConfig() {
+let configLoading = null;
+/** Один запрос справочника на всех: старт, deep-link и обновление не дублируются. */
+function loadConfig() {
+  if (!configLoading) {
+    configLoading = loadConfigOnce_().finally(() => { configLoading = null; });
+  }
+  return configLoading;
+}
+
+async function loadConfigOnce_() {
   const cached = await db.get('kv', 'config');
   if (cached) config = cached;
+  const before = JSON.stringify(featuresMap());
   try {
     const fresh = await apiGet({ action: 'config' });
     config = fresh;
     applyTheme();
     await db.put('kv', fresh, 'config');
     prefetchTtkPhotos(); // в фоне докачиваем фото ТТК для офлайна
+    // Раздел выключили, пока приложение было открыто: главную перерисовываем,
+    // из выключенного раздела — на главную. Включённый экран не трогаем,
+    // чтобы не стереть введённое.
+    if (JSON.stringify(featuresMap()) !== before && stack.length) {
+      const [screen, args] = stack[stack.length - 1];
+      if (screen === screenHome || !sectionOn(screenFeature(screen, args))) render();
+    }
   } catch (e) {
     console.warn('Справочник не обновлён:', e.message);
   }
@@ -288,6 +372,28 @@ function screenHome() {
   const tile = (ico, title, sub, onclick) =>
     h('button', { class: 'tile', onclick }, icon(ico), h('span', { class: 't-name' }, title), h('span', { class: 't-sub' }, sub));
 
+  // Выключенные в таблице разделы не рисуем вовсе: ни плитки, ни серых кнопок.
+  const tiles = isAdmin()
+    ? [ // Админ: только эти плитки
+      sectionOn('transfer') ? tile('transfer', 'Перенос', 'между точками', () => go(screenItemsForm, 'transfer')) : null,
+      sectionOn('writeoff') ? tile('writeoff', 'Списание', 'бой, порча, брак', () => go(screenItemsForm, 'writeoff')) : null,
+      sectionOn('inventory') ? tile('gift', 'Gift-shop', 'инвентаризация', () => go(screenInventory)) : null,
+      sectionOn('quiz') ? tile('quiz', 'Викторина', 'вопросы смены', () => go(screenQuizStart)) : null,
+      sectionOn('duel') ? tile('duel', 'Дуэль', 'два игрока', openDuel) : null,
+    ]
+    : [
+      sectionOn('transfer') ? tile('transfer', 'Перенос', 'кухня ⇄ бар', () => go(screenItemsForm, 'transfer')) : null,
+      sectionOn('writeoff') ? tile('writeoff', 'Списание', 'бой, порча, проливы', () => go(screenItemsForm, 'writeoff')) : null,
+      sectionOn('photo') ? tile('photo', 'Фото уборки', 'зоны после смены', () => go(screenPhoto)) : null,
+      sectionOn('checklists') ? tile('checklist', 'Чек-листы', 'смены и заготовки', () => go(screenChecklists)) : null,
+      sectionOn('ttk') ? tile('ttk', 'ТТК', 'рецептуры', () => go(screenTtkList)) : null,
+      sectionOn('inventory') ? tile('inv', 'Инвентаризация', 'подсчёт остатков', () => go(screenInventory)) : null,
+      sectionOn('quiz') ? tile('quiz', 'Викторина', 'вопросы смены', () => go(screenQuizStart)) : null,
+      sectionOn('duel') ? tile('duel', 'Дуэль', 'два игрока', openDuel) : null,
+      sectionOn('acts') ? actsTile() : null,
+    ];
+  const shown = tiles.filter(Boolean);
+
   return h('main', { class: 'screen' },
     h('header', { class: 'top' }, h('span'), h('div', { class: 'logo', role: 'img', 'aria-label': 'ESSE Jazz Club' }), h('span')),
     h('div', { class: 'who' },
@@ -305,25 +411,9 @@ function screenHome() {
       }, 'Сменить'),
     ),
     factLine(config && config.factOfDay),
-    h('div', { class: 'tiles' }, isAdmin()
-      ? [ // Админ: только эти плитки
-        tile('transfer', 'Перенос', 'между точками', () => go(screenItemsForm, 'transfer')),
-        tile('writeoff', 'Списание', 'бой, порча, брак', () => go(screenItemsForm, 'writeoff')),
-        tile('gift', 'Gift-shop', 'инвентаризация', () => go(screenInventory)),
-        tile('quiz', 'Викторина', 'вопросы смены', () => go(screenQuizStart)),
-        tile('duel', 'Дуэль', 'два игрока', openDuel),
-      ]
-      : [
-        tile('transfer', 'Перенос', 'кухня ⇄ бар', () => go(screenItemsForm, 'transfer')),
-        tile('writeoff', 'Списание', 'бой, порча, проливы', () => go(screenItemsForm, 'writeoff')),
-        tile('photo', 'Фото уборки', 'зоны после смены', () => go(screenPhoto)),
-        tile('checklist', 'Чек-листы', 'смены и заготовки', () => go(screenChecklists)),
-        tile('ttk', 'ТТК', 'рецептуры', () => go(screenTtkList)),
-        tile('inv', 'Инвентаризация', 'подсчёт остатков', () => go(screenInventory)),
-        tile('quiz', 'Викторина', 'вопросы смены', () => go(screenQuizStart)),
-        tile('duel', 'Дуэль', 'два игрока', openDuel),
-        actsTile(),
-      ]),
+    shown.length
+      ? h('div', { class: 'tiles' }, shown)
+      : h('p', { class: 'hint' }, 'Все разделы выключены. Включите нужные в таблице — лист «Настройки».'),
   );
 }
 
@@ -2916,6 +3006,7 @@ function startDuelPoll(duelId, onState, onError) {
 
 /** Плитка «Дуэль»: если матч уже идёт — сразу возвращаемся в него. */
 async function openDuel() {
+  if (!sectionOn('duel')) return toast('Раздел временно недоступен', 'bad');
   const saved = await db.get('kv', DUEL_ACTIVE_KEY);
   if (saved && saved.duelId) {
     try {
@@ -2956,8 +3047,13 @@ async function handleDuelEntry() {
   if (pendingDuelCode) {
     const code = pendingDuelCode;
     pendingDuelCode = '';
+    // Справочник мог лежать в кэше: перед входом по ссылке берём свежие флаги.
+    await loadConfig();
+    if (!sectionOn('duel')) { toast('Раздел временно недоступен', 'bad'); return; }
     return joinDuelByCode(code);
   }
+  // Дуэль выключена: незакрытый матч не восстанавливаем и не мешаем работать.
+  if (!sectionOn('duel')) return;
   return restoreDuelIfAny();
 }
 

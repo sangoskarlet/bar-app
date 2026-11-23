@@ -54,6 +54,7 @@ const SHEETS = {
   facts:     'Факты',               // факт дня на главном экране (создаётся автоматически)
   checklists: 'Чек-листы',          // списки пунктов, которые правит владелец (создаётся автоматически)
   checklistMarks: 'Чек-листы — отметки', // история прохождений (создаётся автоматически)
+  settings:  'Настройки',           // разделы приложения вкл/выкл (создаётся автоматически)
 };
 
 // В каком столбце листа лежит ID записи (считаем с 1: A=1, B=2 ...).
@@ -194,8 +195,18 @@ function getConfig_() {
     log_('Чек-листы', 'не прочитаны: ' + String(e && e.stack || e));
   }
 
+  // Флаги разделов: лист «Настройки». Нет листа, нет ключа или ошибка чтения —
+  // раздел включён. Иначе опечатка в таблице могла бы оставить бар без приложения.
+  let features = featuresDefault_();
+  try {
+    features = features_(ss);
+  } catch (e) {
+    log_('Настройки', 'не прочитаны, все разделы включены: ' + String(e && e.stack || e));
+  }
+
   return {
     theme, ok: true, employees, items, reasons, zones, ttk, inventory, acts, shelfLife, factOfDay, checklists,
+    features,
     directions: DIRECTIONS, units: UNITS };
 }
 
@@ -251,6 +262,140 @@ function inventoryItems_(ss) {
       density: num_(r[6]),
     }));
 }
+
+/* =====================================================================
+ *  ФЛАГИ РАЗДЕЛОВ — что показывать в приложении
+ * =====================================================================
+ *
+ *  Лист «Настройки» (создаётся автоматически при первом чтении config):
+ *    ключ | значение | комментарий
+ *
+ *  Значение: «вкл» / «выкл» (регистр не важен). Пусто = «вкл».
+ *  Нет листа или нет ключа — раздел ВКЛЮЧЁН: опечатка в таблице не должна
+ *  оставить бар без приложения. Неизвестное значение тоже считается
+ *  включённым, а в «Лог» пишется предупреждение.
+ *
+ *  Флаги — только про вход в раздел. Очередь отправляется как раньше:
+ *  записи, уже сохранённые на телефоне (викторина, чек-листы и т. п.),
+ *  уходят на сервер независимо от флагов. Сервер записи не отклоняет.
+ * ===================================================================== */
+
+const SETTINGS_HEADERS = ['ключ', 'значение', 'комментарий'];
+
+/** Ключи таблицы → поля config.features. Порядок = порядок строк в листе. */
+const FEATURE_KEYS = [
+  { code: 'quiz',       key: 'раздел_викторина',     note: 'Викторина — вопросы смены' },
+  { code: 'duel',       key: 'раздел_дуэль',         note: 'Дуэль — игра на двоих' },
+  { code: 'checklists', key: 'раздел_чеклисты',      note: 'Чек-листы — смены и заготовки' },
+  { code: 'acts',       key: 'раздел_акты',          note: 'Переработка — акты и этикетки' },
+  { code: 'photo',      key: 'раздел_фото',          note: 'Фото уборки — зоны после смены' },
+  { code: 'inventory',  key: 'раздел_инвентаризация', note: 'Инвентаризация — подсчёт остатков' },
+  { code: 'ttk',        key: 'раздел_ттк',           note: 'ТТК — рецептуры' },
+  { code: 'transfer',   key: 'раздел_перенос',       note: 'Перенос — кухня ⇄ бар' },
+  { code: 'writeoff',   key: 'раздел_списание',      note: 'Списание — бой, порча, проливы' },
+];
+
+/** Все разделы включены — ответ по умолчанию, если лист не прочитался. */
+function featuresDefault_() {
+  const out = {};
+  FEATURE_KEYS.forEach(function (f) { out[f.code] = true; });
+  return out;
+}
+
+/**
+ * «вкл» → true, «выкл» → false, пусто / непонятное → true.
+ * Сравниваем по началу слова: «выкл.», «ВЫКЛ», «off», «нет» тоже поймутся.
+ */
+function featureOn_(v) {
+  const s = str_(v).toLowerCase().replace(/[\s.]+$/g, '');
+  if (!s) return true;
+  if (/^(выкл|off|нет|no|false|0)/.test(s)) return false;
+  if (/^(вкл|on|да|yes|true|1)/.test(s)) return true;
+  return true;
+}
+
+/** Колонки ищутся по названиям в шапке — порядок можно менять. */
+function settingsHeader_(sh) {
+  const width = Math.max(sh.getLastColumn(), SETTINGS_HEADERS.length);
+  const head = sh.getRange(1, 1, 1, width).getValues()[0].map(str_);
+  return {
+    key: head.indexOf(SETTINGS_HEADERS[0]),
+    value: head.indexOf(SETTINGS_HEADERS[1]),
+  };
+}
+
+/**
+ * Лист «Настройки»: создаёт и один раз заполняет девятью ключами.
+ * Существующий лист не перезаписывает — значения владельца остаются.
+ */
+function ensureSettingsSheet_(ss) {
+  let sh = ss.getSheetByName(SHEETS.settings);
+  if (sh) return sh;
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) return null;
+  try {
+    sh = ss.getSheetByName(SHEETS.settings);
+    if (sh) return sh;
+    sh = ss.insertSheet(SHEETS.settings);
+    sh.getRange(1, 1, 1, SETTINGS_HEADERS.length).setValues([SETTINGS_HEADERS]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+    sh.setColumnWidth(1, 240);
+    sh.setColumnWidth(2, 110);
+    sh.setColumnWidth(3, 380);
+    const rows = FEATURE_KEYS.map(function (f) { return [text_(f.key, 80), 'вкл', text_(f.note, 200)]; });
+    sh.getRange(2, 1, rows.length, SETTINGS_HEADERS.length).setValues(rows);
+    // Выпадающий список, чтобы не приходилось угадывать написание; вписать своё всё равно можно.
+    sh.getRange(2, 2, Math.max(rows.length, 50), 1)
+      .setDataValidation(SpreadsheetApp.newDataValidation()
+        .requireValueInList(['вкл', 'выкл'], true).build());
+    log_('Настройки', 'создан лист «' + SHEETS.settings + '», ключей: ' + FEATURE_KEYS.length);
+    return sh;
+  } catch (e) {
+    sh = ss.getSheetByName(SHEETS.settings);
+    if (sh) return sh;
+    throw e;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Значения из «Настроек»: { 'раздел_викторина': 'выкл', ... }. */
+function settingsValues_(ss) {
+  const sh = ensureSettingsSheet_(ss);
+  if (!sh) return {};
+  const h = settingsHeader_(sh);
+  if (h.value < 0) return {};
+  const keyCol = h.key < 0 ? 0 : h.key;
+  const out = {};
+  rows_(ss, SHEETS.settings).forEach(function (r) {
+    const k = str_(r[keyCol]);
+    if (k) out[k] = r[h.value];
+  });
+  return out;
+}
+
+/** {quiz:true, duel:false, ...} — всегда все девять ключей. */
+function features_(ss) {
+  const values = settingsValues_(ss);
+  const out = {};
+  FEATURE_KEYS.forEach(function (f) {
+    const raw = str_(values[f.key]);
+    out[f.code] = featureOn_(raw);
+    // Значение не распознали — раздел оставили включённым, но след в «Логе» нужен.
+    if (raw && !/^(вкл|выкл|on|off|да|нет|yes|no|true|false|1|0)/i.test(raw)) {
+      log_('Настройки', 'непонятное значение у «' + f.key + '»: «' + raw + '» — считаю «вкл»');
+    }
+  });
+  return out;
+}
+
+/** Ручной запуск из редактора: создать лист «Настройки» и заполнить ключами. */
+function setupSettings() {
+  const sh = ensureSettingsSheet_(ss_());
+  log_('Настройки', 'setupSettings: ' + (sh ? 'лист готов' : 'лист не создан'));
+}
+
 
 /* =====================================================================
  *  СРОКИ ХРАНЕНИЯ — справочник для этикетки 30×20

@@ -55,6 +55,8 @@ const SHEETS = {
   facts:     'Факты',               // факт дня на главном экране (создаётся автоматически)
   checklists: 'Чек-листы',          // списки пунктов, которые правит владелец (создаётся автоматически)
   checklistMarks: 'Чек-листы — отметки', // история прохождений (создаётся автоматически)
+  settings:  'Настройки',           // разделы приложения вкл/выкл (создаётся автоматически)
+  pairs:     'Пары позиций',        // позиции, которые взвешивают вместе: мята — листья и ветки
 };
 
 // В каком столбце листа лежит ID записи (считаем с 1: A=1, B=2 ...).
@@ -208,9 +210,29 @@ function getConfig_() {
     log_('Проверка фото', 'этажи/эталоны не прочитаны: ' + String(e && e.stack || e));
   }
 
+  // Флаги разделов: лист «Настройки». Нет листа, нет ключа или ошибка чтения —
+  // раздел включён. Иначе опечатка в таблице могла бы оставить бар без приложения.
+  let features = featuresDefault_();
+  try {
+    features = features_(ss);
+  } catch (e) {
+    log_('Настройки', 'не прочитаны, все разделы включены: ' + String(e && e.stack || e));
+  }
+
+  // Пары позиций (мята: листья и ветки). Ошибка чтения не ломает config —
+  // приложение просто покажет одно поле, как раньше.
+  let pairs = [];
+  try {
+    pairs = pairs_(ss);
+  } catch (e) {
+    log_('Пары позиций', 'не прочитаны: ' + String(e && e.stack || e));
+  }
+
   return {
     theme, ok: true, employees, items, reasons, zones, ttk, inventory, acts, shelfLife, factOfDay, checklists,
     photoZones, photoRefs, photoRefLimit: PHOTO_MAX_REFS,
+    features,
+    pairs,
     directions: DIRECTIONS, units: UNITS };
 }
 
@@ -266,6 +288,401 @@ function inventoryItems_(ss) {
       density: num_(r[6]),
     }));
 }
+
+/* =====================================================================
+ *  ФЛАГИ РАЗДЕЛОВ — что показывать в приложении
+ * =====================================================================
+ *
+ *  Лист «Настройки» (создаётся автоматически при первом чтении config):
+ *    ключ | значение | комментарий
+ *
+ *  Значение: «вкл» / «выкл» (регистр не важен). Пусто = «вкл».
+ *  Нет листа или нет ключа — раздел ВКЛЮЧЁН: опечатка в таблице не должна
+ *  оставить бар без приложения. Неизвестное значение тоже считается
+ *  включённым, а в «Лог» пишется предупреждение.
+ *
+ *  Флаги — только про вход в раздел. Очередь отправляется как раньше:
+ *  записи, уже сохранённые на телефоне (викторина, чек-листы и т. п.),
+ *  уходят на сервер независимо от флагов. Сервер записи не отклоняет.
+ * ===================================================================== */
+
+const SETTINGS_HEADERS = ['ключ', 'значение', 'комментарий'];
+
+/** Ключи таблицы → поля config.features. Порядок = порядок строк в листе. */
+const FEATURE_KEYS = [
+  { code: 'quiz',       key: 'раздел_викторина',     note: 'Викторина — вопросы смены' },
+  { code: 'duel',       key: 'раздел_дуэль',         note: 'Дуэль — игра на двоих' },
+  { code: 'checklists', key: 'раздел_чеклисты',      note: 'Чек-листы — смены и заготовки' },
+  { code: 'acts',       key: 'раздел_акты',          note: 'Переработка — акты и этикетки' },
+  { code: 'photo',      key: 'раздел_фото',          note: 'Фото уборки — зоны после смены' },
+  { code: 'inventory',  key: 'раздел_инвентаризация', note: 'Инвентаризация — подсчёт остатков' },
+  { code: 'ttk',        key: 'раздел_ттк',           note: 'ТТК — рецептуры' },
+  { code: 'transfer',   key: 'раздел_перенос',       note: 'Перенос — кухня ⇄ бар' },
+  { code: 'writeoff',   key: 'раздел_списание',      note: 'Списание — бой, порча, проливы' },
+];
+
+/** Все разделы включены — ответ по умолчанию, если лист не прочитался. */
+function featuresDefault_() {
+  const out = {};
+  FEATURE_KEYS.forEach(function (f) { out[f.code] = true; });
+  return out;
+}
+
+/**
+ * «вкл» → true, «выкл» → false, пусто / непонятное → true.
+ * Сравниваем по началу слова: «выкл.», «ВЫКЛ», «off», «нет» тоже поймутся.
+ */
+function featureOn_(v) {
+  const s = str_(v).toLowerCase().replace(/[\s.]+$/g, '');
+  if (!s) return true;
+  if (/^(выкл|off|нет|no|false|0)/.test(s)) return false;
+  if (/^(вкл|on|да|yes|true|1)/.test(s)) return true;
+  return true;
+}
+
+/** Колонки ищутся по названиям в шапке — порядок можно менять. */
+function settingsHeader_(sh) {
+  const width = Math.max(sh.getLastColumn(), SETTINGS_HEADERS.length);
+  const head = sh.getRange(1, 1, 1, width).getValues()[0].map(str_);
+  return {
+    key: head.indexOf(SETTINGS_HEADERS[0]),
+    value: head.indexOf(SETTINGS_HEADERS[1]),
+  };
+}
+
+/**
+ * Лист «Настройки»: создаёт и один раз заполняет девятью ключами.
+ * Существующий лист не перезаписывает — значения владельца остаются.
+ */
+function ensureSettingsSheet_(ss) {
+  let sh = ss.getSheetByName(SHEETS.settings);
+  if (sh) return sh;
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) return null;
+  try {
+    sh = ss.getSheetByName(SHEETS.settings);
+    if (sh) return sh;
+    sh = ss.insertSheet(SHEETS.settings);
+    sh.getRange(1, 1, 1, SETTINGS_HEADERS.length).setValues([SETTINGS_HEADERS]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+    sh.setColumnWidth(1, 240);
+    sh.setColumnWidth(2, 110);
+    sh.setColumnWidth(3, 380);
+    const rows = FEATURE_KEYS.map(function (f) { return [text_(f.key, 80), 'вкл', text_(f.note, 200)]; });
+    sh.getRange(2, 1, rows.length, SETTINGS_HEADERS.length).setValues(rows);
+    // Выпадающий список, чтобы не приходилось угадывать написание; вписать своё всё равно можно.
+    sh.getRange(2, 2, Math.max(rows.length, 50), 1)
+      .setDataValidation(SpreadsheetApp.newDataValidation()
+        .requireValueInList(['вкл', 'выкл'], true).build());
+    log_('Настройки', 'создан лист «' + SHEETS.settings + '», ключей: ' + FEATURE_KEYS.length);
+    return sh;
+  } catch (e) {
+    sh = ss.getSheetByName(SHEETS.settings);
+    if (sh) return sh;
+    throw e;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Значения из «Настроек»: { 'раздел_викторина': 'выкл', ... }. */
+function settingsValues_(ss) {
+  const sh = ensureSettingsSheet_(ss);
+  if (!sh) return {};
+  const h = settingsHeader_(sh);
+  if (h.value < 0) return {};
+  const keyCol = h.key < 0 ? 0 : h.key;
+  const out = {};
+  rows_(ss, SHEETS.settings).forEach(function (r) {
+    const k = str_(r[keyCol]);
+    if (k) out[k] = r[h.value];
+  });
+  return out;
+}
+
+/** {quiz:true, duel:false, ...} — всегда все девять ключей. */
+function features_(ss) {
+  const values = settingsValues_(ss);
+  const out = {};
+  FEATURE_KEYS.forEach(function (f) {
+    const raw = str_(values[f.key]);
+    out[f.code] = featureOn_(raw);
+    // Значение не распознали — раздел оставили включённым, но след в «Логе» нужен.
+    if (raw && !/^(вкл|выкл|on|off|да|нет|yes|no|true|false|1|0)/i.test(raw)) {
+      log_('Настройки', 'непонятное значение у «' + f.key + '»: «' + raw + '» — считаю «вкл»');
+    }
+  });
+  return out;
+}
+
+/** Ручной запуск из редактора: создать лист «Настройки» и заполнить ключами. */
+function setupSettings() {
+  const sh = ensureSettingsSheet_(ss_());
+  log_('Настройки', 'setupSettings: ' + (sh ? 'лист готов' : 'лист не создан'));
+}
+
+
+/* =====================================================================
+ *  ПАРЫ ПОЗИЦИЙ — что взвешивают вместе (мята: листья и ветки)
+ * =====================================================================
+ *
+ *  Лист «Пары позиций» (создаётся автоматически при первом чтении config):
+ *    позиция_A | позиция_B | доля_A | доля_B | активен | комментарий
+ *
+ *  Доли — от общей массы: A + B = 1.0. Пример для мяты: 0.6 / 0.4.
+ *  Это стартовое значение, владелец поправит его по факту взвешивания.
+ *  Если сумма не равна 1.0, сервер НЕ падает: нормализует доли и пишет
+ *  предупреждение в «Лог». Приложение получает уже нормализованные доли.
+ *
+ *  В форме акта позиция из активной пары показывается двумя полями
+ *  («листья, г» / «ветки, г»), и ввод в любое поле пересчитывает второе.
+ *  В акт пишутся оба значения и то, какое поле взвешено вручную:
+ *  «Акты переработки», новые колонки Q–V (см. ACT_PAIR_HEADERS).
+ *
+ *  На расчёт выхода акта пара НЕ влияет: в «Сырьё»/«Результат» идёт
+ *  количество позиции своей строки (например, листья), вторая доля —
+ *  справочная (ветки — отход). Это сохраняет прежние формулы выхода.
+ * ===================================================================== */
+
+const PAIR_HEADERS = ['позиция_A', 'позиция_B', 'доля_A', 'доля_B', 'активен', 'комментарий'];
+
+/** Первое заполнение: мята. Дальше владелец добавляет строки сам, код не нужен. */
+const PAIR_SEED = [
+  { a: 'Мята (листья)', b: 'Мята (ветки)', shareA: 0.6, shareB: 0.4,
+    note: 'стартовое значение 0.6 / 0.4 — поправьте по факту взвешивания' },
+];
+
+const ACT_PAIR_HEADERS = ['пара_позиция', 'пара_кол-во', 'доля_A', 'доля_B', 'взвешено', 'всего, г'];
+
+/** Пустая галочка = пара включена; «нет»/«выкл»/0 — выключена. */
+function pairActive_(v) {
+  if (v === true) return true;
+  if (v === false) return false;
+  const s = str_(v).toLowerCase().replace(/[\s.]+$/g, '');
+  if (!s) return true;
+  return !/^(нет|выкл|off|no|false|0)/.test(s);
+}
+
+/** Сравнение названий позиций: регистр, «ё», лишние пробелы. */
+function sameName_(a, b) {
+  const k = function (v) { return str_(v).toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ').trim(); };
+  return !!k(a) && k(a) === k(b);
+}
+
+/** Колонки ищутся по названиям в шапке — порядок можно менять. */
+function pairsHeader_(sh) {
+  const width = Math.max(sh.getLastColumn(), PAIR_HEADERS.length);
+  const head = sh.getRange(1, 1, 1, width).getValues()[0].map(str_);
+  return {
+    a: head.indexOf(PAIR_HEADERS[0]),
+    b: head.indexOf(PAIR_HEADERS[1]),
+    shareA: head.indexOf(PAIR_HEADERS[2]),
+    shareB: head.indexOf(PAIR_HEADERS[3]),
+    active: head.indexOf(PAIR_HEADERS[4]),
+    note: head.indexOf(PAIR_HEADERS[5]),
+  };
+}
+
+/** Лист «Пары позиций»: создаёт и один раз заполняет парой для мяты. */
+function ensurePairsSheet_(ss) {
+  let sh = ss.getSheetByName(SHEETS.pairs);
+  if (sh) return sh;
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) return null;
+  try {
+    sh = ss.getSheetByName(SHEETS.pairs);
+    if (sh) return sh;
+    sh = ss.insertSheet(SHEETS.pairs);
+    sh.getRange(1, 1, 1, PAIR_HEADERS.length).setValues([PAIR_HEADERS]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+    sh.setColumnWidth(1, 220);
+    sh.setColumnWidth(2, 220);
+    sh.setColumnWidth(3, 80);
+    sh.setColumnWidth(4, 80);
+    sh.setColumnWidth(5, 80);
+    sh.setColumnWidth(6, 420);
+    seedPairs_(sh);
+    log_('Пары позиций', 'создан лист «' + SHEETS.pairs + '», пар: ' + PAIR_SEED.length);
+    return sh;
+  } catch (e) {
+    sh = ss.getSheetByName(SHEETS.pairs);
+    if (sh) return sh;
+    throw e;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Пишет стартовую пару для мяты и ставит галочку «активен». */
+function seedPairs_(sh) {
+  const rows = PAIR_SEED.map(function (p) {
+    return [text_(p.a, 120), text_(p.b, 120), p.shareA, p.shareB, true, text_(p.note, 300)];
+  });
+  sh.getRange(2, 1, rows.length, PAIR_HEADERS.length).setValues(rows);
+  sh.getRange(2, 5, rows.length, 1)
+    .setDataValidation(SpreadsheetApp.newDataValidation().requireCheckbox().build());
+}
+
+/**
+ * Активные пары с нормализованными долями:
+ * [{ a, b, shareA, shareB, comment }].
+ * Неверные строки (пусто, одинаковые позиции, доля ≤ 0) пропускаются с записью в «Лог».
+ */
+function pairs_(ss) {
+  const sh = ensurePairsSheet_(ss);
+  if (!sh) return [];
+  const h = pairsHeader_(sh);
+  if (h.a < 0 || h.b < 0 || h.shareA < 0 || h.shareB < 0) return [];
+
+  const out = [];
+  const seen = {};
+  rows_(ss, SHEETS.pairs).forEach(function (r) {
+    const a = str_(r[h.a]);
+    const b = str_(r[h.b]);
+    if (!a || !b) return;
+    if (sameName_(a, b)) {
+      log_('Пары позиций', 'пропущена пара с одинаковыми позициями: ' + a);
+      return;
+    }
+    if (!pairActive_(h.active >= 0 ? r[h.active] : true)) return;
+    let sa = num_(r[h.shareA]);
+    let sb = num_(r[h.shareB]);
+    if (!(sa > 0) || !(sb > 0)) {
+      log_('Пары позиций', 'пропущена пара без долей: ' + a + ' / ' + b);
+      return;
+    }
+    const sum = sa + sb;
+    if (Math.abs(sum - 1) > 0.001) {
+      const origSum = sum;
+      sa = sa / sum;
+      sb = sb / sum;
+      log_('Пары позиций', 'сумма долей ' + Math.round(origSum * 1000) / 1000 + ' у «' + a + ' / ' + b +
+        '» — доли нормализованы: ' + Math.round(sa * 1000) / 1000 + ' / ' + Math.round(sb * 1000) / 1000);
+    }
+    // Одна позиция — одна пара: первая активная строка выигрывает, остальные в «Лог».
+    const ka = str_(a).toLowerCase();
+    const kb = str_(b).toLowerCase();
+    if (seen[ka] || seen[kb]) {
+      log_('Пары позиций', 'пропущена вторая пара для той же позиции: ' + a + ' / ' + b);
+      return;
+    }
+    seen[ka] = true;
+    seen[kb] = true;
+    out.push({
+      a: a, b: b,
+      shareA: Math.round(sa * 1000) / 1000,
+      shareB: Math.round(sb * 1000) / 1000,
+      comment: h.note >= 0 ? str_(r[h.note]) : '',
+    });
+  });
+  return out;
+}
+
+/** Сторона пары для позиции: { name, share, isA } или null. */
+function pairSide_(pair, name) {
+  if (sameName_(pair.a, name)) return { name: pair.a, share: pair.shareA, isA: true };
+  if (sameName_(pair.b, name)) return { name: pair.b, share: pair.shareB, isA: false };
+  return null;
+}
+
+/**
+ * Данные пары из строки акта. Возвращает null, если пары нет, она выключена
+ * или данные неверные — тогда строка сохраняется как обычная, без пары.
+ *
+ * line.pair = { item: '<вторая позиция>', qty: <граммы>, source: 'own'|'other' }.
+ * source = 'own' — взвесили позицию этой строки, второе значение считаем;
+ * source = 'other' — взвесили вторую позицию, количество строки пересчитываем.
+ */
+function actPairForLine_(pairs, line, baseQty) {
+  const p = line && line.pair;
+  if (!p || typeof p !== 'object') return null;
+  const item = str_(line.item);
+  const partner = str_(p.item);
+  if (!item || !partner) return null;
+
+  const pair = (pairs || []).find(function (x) {
+    return (sameName_(x.a, item) && sameName_(x.b, partner)) ||
+           (sameName_(x.b, item) && sameName_(x.a, partner));
+  });
+  if (!pair) {
+    log_('Пары позиций', 'в акте нет активной пары «' + item + '» / «' + partner + '» — строка без пары');
+    return null;
+  }
+  const side = pairSide_(pair, item);
+  const other = pairSide_(pair, partner);
+  if (!side || !other) return null;
+
+  const source = str_(p.source) === 'other' ? 'other' : 'own';
+  let ownQty = Math.round(Number(baseQty) || 0);
+  let partnerQty = 0;
+  if (source === 'other') {
+    const weighed = Number(p.qty);
+    if (!(weighed >= 0 && weighed < 1000000)) return null;
+    partnerQty = Math.round(weighed);
+    ownQty = Math.round(partnerQty * side.share / other.share);
+  } else {
+    partnerQty = Math.round(ownQty * other.share / side.share);
+  }
+  if (!(ownQty >= 0) || !(partnerQty >= 0) || ownQty + partnerQty <= 0) return null;
+
+  return {
+    item: other.name,             // вторая позиция (например, «Мята (ветки)»)
+    qty: partnerQty,              // её граммы
+    shareA: pair.shareA,
+    shareB: pair.shareB,
+    weighed: source === 'own' ? side.name : other.name,
+    total: ownQty + partnerQty,
+    ownQty: ownQty,
+  };
+}
+
+/** Колонки пары в «Актах переработки»: { 'пара_позиция': 17, ... } (1 = A). */
+function actPairColumns_(sheet) {
+  const width = Math.max(sheet.getLastColumn(), 16);
+  const head = sheet.getRange(1, 1, 1, width).getValues()[0].map(str_);
+  const idx = {};
+  ACT_PAIR_HEADERS.forEach(function (name) { idx[name] = head.indexOf(name) + 1; }); // 0 → «нет»
+  return idx;
+}
+
+/**
+ * Дописывает колонки Q–V в «Акты переработки», если их нет.
+ * Существующие A–P не трогает, порядок и формулы не меняет.
+ */
+function ensureActPairColumns_(sheet) {
+  let idx = actPairColumns_(sheet);
+  if (idx[ACT_PAIR_HEADERS[0]] > 0) return idx;
+
+  const width = Math.max(sheet.getLastColumn(), 16);
+  const head = sheet.getRange(1, 1, 1, width).getValues()[0].map(str_);
+  let last = 0;
+  head.forEach(function (v, i) { if (str_(v)) last = i + 1; });
+  const start = Math.max(last, 16) + 1;
+  sheet.getRange(1, start, 1, ACT_PAIR_HEADERS.length)
+    .setValues([ACT_PAIR_HEADERS]).setFontWeight('bold');
+  for (let i = 0; i < ACT_PAIR_HEADERS.length; i++) sheet.setColumnWidth(start + i, i === 0 ? 160 : 100);
+  log_('Пары позиций', 'в «' + SHEETS.acts + '» добавлены колонки ' + start + '–' + (start + ACT_PAIR_HEADERS.length - 1));
+  return actPairColumns_(sheet);
+}
+
+/** Значения Q–V для строки акта (пустые, если пары нет). */
+function actPairRow_(pair) {
+  if (!pair) return ['', '', '', '', '', ''];
+  return [text_(pair.item, 120), pair.qty, pair.shareA, pair.shareB, text_(pair.weighed, 120), pair.total];
+}
+
+/** Ручной запуск из редактора: создать «Пары позиций» и колонки Q–V в актах. */
+function setupPairs() {
+  const ss = ss_();
+  const sh = ensurePairsSheet_(ss);
+  const acts = ss.getSheetByName(SHEETS.acts);
+  if (acts) ensureActPairColumns_(acts);
+  log_('Пары позиций', 'setupPairs: ' + (sh ? 'лист готов' : 'лист не создан') +
+    (acts ? ', колонки акта готовы' : ', листа актов нет'));
+}
+
 
 /* =====================================================================
  *  СРОКИ ХРАНЕНИЯ — справочник для этикетки 30×20
@@ -1385,31 +1802,53 @@ function saveInventory_(ss, sheet, auth, rec, id, created, received, comment) {
 
 /**
  * АКТ ПЕРЕРАБОТКИ.
- * Приходит: act (название шаблона) и lines: [{ role: 'Сырьё'|'Результат', item, unit, qty }].
+ * Приходит: act (название шаблона) и lines: [{ role: 'Сырьё'|'Результат', item, unit, qty, pair? }].
  * Пишем по строке на каждую позицию: так в «Своде переработки» легко сложить расход и приход.
  * Позиции и единицы обязаны совпадать с шаблоном — бармен не может «придумать» сырьё.
+ *
+ * Пара (мята: листья/ветки) — только справочные колонки Q–V. В «Кол-во» идёт
+ * количество своей позиции (листья), вторая доля (ветки) в сумму расхода и в
+ * выход НЕ входит: ветки — отход, а не результат. Формулы выхода не меняются.
  */
 function saveProcessing_(ss, sheet, auth, rec, id, created, received, comment) {
   const tpl = actTemplates_(ss).find(a => a.name === str_(rec.act));
   if (!tpl) return { id, status: 'error', error: 'Нет такого акта: ' + rec.act };
   const lines = Array.isArray(rec.lines) ? rec.lines : [];
   const allowed = tpl.inputs.map(i => 'Сырьё|' + i.item + '|' + i.unit).concat(['Результат|' + tpl.output.item + '|' + tpl.output.unit]);
+  const pairList = pairs_(ss); // один раз на запрос
+  const prepared = [];
   let inQty = 0, outQty = 0, keyQty = 0;
+  let hasPair = false;
+
   for (const l of lines) {
     const k = str_(l.role) + '|' + str_(l.item) + '|' + str_(l.unit);
     if (allowed.indexOf(k) === -1) return { id, status: 'error', error: 'Позиция не из шаблона: ' + l.item };
-    const q = Number(l.qty);
+    let q = Number(l.qty);
     if (!(q >= 0 && q < 1000000)) return { id, status: 'error', error: 'Некорректное количество: ' + l.item };
+
     const tplLine = tpl.inputs.find(i => i.item === str_(l.item));
-    if (l.role === 'Сырьё' && tplLine && tplLine.clean) {
-      const c = Number(l.clean);
-      if (!(c > 0)) return { id, status: 'error', error: 'Не указан чистый вес: ' + l.item };
-      if (c > q) return { id, status: 'error', error: 'Чистый вес больше грязного: ' + l.item };
+    const isClean = l.role === 'Сырьё' && tplLine && tplLine.clean;
+    let clean = Number(l.clean);
+
+    // Пара: сервер сам пересчитывает вторую долю, клиенту на слово не верим.
+    // База пересчёта — то, что реально взвесили: чистый вес, если сырьё чистили.
+    const base = isClean ? clean : q;
+    const pair = actPairForLine_(pairList, l, base);
+    if (pair) {
+      hasPair = true;
+      if (isClean) clean = pair.ownQty; else q = pair.ownQty;
+    }
+
+    if (isClean) {
+      if (!(clean > 0)) return { id, status: 'error', error: 'Не указан чистый вес: ' + l.item };
+      if (clean > q) return { id, status: 'error', error: 'Чистый вес больше грязного: ' + l.item };
     }
     if (l.role === 'Результат') outQty += q; else inQty += q;
     const keyLine = tpl.inputs.find(i => i.key);
     if (l.role === 'Сырьё' && keyLine && l.item === keyLine.item) keyQty = q;
+    prepared.push({ l, q, clean: isClean ? clean : 0, pair });
   }
+
   // pending = «выход запишем позже»: кордиал ещё варится, фреш ещё жмут
   const pending = rec.pending === true;
   if (!(inQty > 0)) return { id, status: 'error', error: 'Не указано сырьё' };
@@ -1418,28 +1857,40 @@ function saveProcessing_(ss, sheet, auth, rec, id, created, received, comment) {
 
   // Выход в % считаем для простых актов (было → стало): 100 г мяты → 70 г листьев = 70%
   const yieldPct = tpl.type === 'простой' && keyQty > 0 && outQty > 0 ? Math.round(outQty / keyQty * 1000) / 10 : '';
+  // Колонки пары добавляем один раз и только если в акте правда есть пара.
+  const pairCols = hasPair ? ensureActPairColumns_(sheet) : null;
+
   // Сырьё с очисткой: в «Кол-во» пишем грязный вес (он списывается),
   // в «Чистый вес» — после чистки, в «Выход, %» — процент чистого от грязного.
-  lines.filter(l => Number(l.qty) > 0 || l.role === 'Результат').forEach((l, i) => {
-    const c = Number(l.clean);
+  prepared.filter(p => p.q > 0 || p.l.role === 'Результат').forEach((p, i) => {
+    const l = p.l;
+    const c = p.clean;
     const hasClean = l.role === 'Сырьё' && c > 0;
-    const pct = l.role === 'Результат' ? yieldPct : (hasClean ? Math.round(c / Number(l.qty) * 1000) / 10 : '');
+    const pct = l.role === 'Результат' ? yieldPct : (hasClean ? Math.round(c / p.q * 1000) / 10 : '');
     const isOut = l.role === 'Результат';
     // M Статус | N Закрыл | O Когда закрыт — только у строки «Результат»
     const status = !isOut ? ['', '', ''] : pending ? ['⏳ В работе', '', ''] : ['✅ Закрыт', auth.name, received];
-    addRow_(sheet, [created, auth.name, "'" + tpl.name, l.role, "'" + str_(l.item), isOut && pending ? '' : Number(l.qty),
+    const row = addRow_(sheet, [created, auth.name, "'" + tpl.name, l.role, "'" + str_(l.item), isOut && pending ? '' : p.q,
       str_(l.unit), pct, i === 0 ? comment : '', received, "'" + id, hasClean ? c : ''].concat(status));
+    // Q–V: вторая позиция пары, её граммы, доли, что взвешено и общая масса.
+    // Пишем по названиям колонок, а не по номеру: владелец может их переставить.
+    if (pairCols) {
+      const vals = actPairRow_(p.pair);
+      ACT_PAIR_HEADERS.forEach(function (name, k) {
+        if (pairCols[name] > 0) sheet.getRange(row, pairCols[name]).setValue(vals[k]);
+      });
+    }
   });
   return { id, status: 'saved' };
 }
 
 /**
  * Закрытие акта, где выход записали позже. Закрыть может ЛЮБОЙ бармен.
- * rec: { actId, qty, comment }
+ * rec: { actId, qty, comment, pair? } — pair, если у результата есть пара.
  */
 function closeProcessing_(ss, sheet, auth, rec, id, received) {
   const actId = str_(rec.actId);
-  const qty = Number(rec.qty);
+  let qty = Number(rec.qty);
   if (!(qty > 0 && qty < 1000000)) return { id, status: 'error', error: 'Некорректный выход' };
   const last = sheet.getLastRow();
   const data = last < 2 ? [] : sheet.getRange(2, 1, last - 1, 16).getValues();
@@ -1452,6 +1903,11 @@ function closeProcessing_(ss, sheet, auth, rec, id, received) {
   }
   // Выход в % — для простых актов: стало / было
   const tpl = actTemplates_(ss).find(a => a.name === str_(r[2]));
+  // Пара у результата: количество листьев остаётся в F, ветки — в Q–V.
+  const pair = rec.pair && typeof rec.pair === 'object' && tpl
+    ? actPairForLine_(pairs_(ss), { item: tpl.output.item, pair: rec.pair }, qty)
+    : null;
+  if (pair) qty = pair.ownQty;
   let pct = '';
   if (tpl && tpl.type === 'простой') {
     const raw = data.find(x => str_(x[10]) === actId && str_(x[3]) === 'Сырьё');
@@ -1464,6 +1920,13 @@ function closeProcessing_(ss, sheet, auth, rec, id, received) {
   sheet.getRange(row, 8).setValue(pct);
   if (note) sheet.getRange(row, 9).setValue("'" + (oldComment ? oldComment + ' | ' : '') + 'При закрытии: ' + note);
   sheet.getRange(row, 13, 1, 4).setValues([['✅ Закрыт', auth.name, received, "'" + id]]);
+  if (pair) {
+    const cols = ensureActPairColumns_(sheet);
+    const vals = actPairRow_(pair);
+    ACT_PAIR_HEADERS.forEach(function (name, i) {
+      if (cols[name] > 0) sheet.getRange(row, cols[name]).setValue(vals[i]);
+    });
+  }
   return { id, status: 'saved' };
 }
 

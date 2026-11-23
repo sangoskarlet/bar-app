@@ -217,6 +217,20 @@ textarea { margin-top: 16px; resize: vertical; }
 .clean-line .arrow { text-align: center; color: var(--muted); font-size: 20px; }
 .clean-caps { margin-top: -4px; color: var(--muted); font-size: 12px; text-align: center; }
 
+/* Пара позиций (мята: листья и ветки) — два поля, пересчёт по долям.
+   Поле, введённое вручную, помечено «взвешено»; второе посчитано. */
+.pair-block { margin-top: 8px; }
+.pair-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.pair-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.pair-cap { color: var(--muted); font-size: 13px; }
+.pair-line { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.pair-line input { width: 100%; min-width: 0; }
+.pair-badge { align-self: flex-start; font-size: 11px; line-height: 1.5; color: var(--accent-text);
+  background: var(--accent); border-radius: 8px; padding: 0 6px; white-space: nowrap; }
+.pair-note { margin: 6px 0 0; font-size: 13px; }
+.pair-row { margin-top: 8px; }
+.pair-row .label { margin-top: 0; }
+
 /* Голосовой ввод */
 .voice-btn { margin-top: 8px; margin-bottom: 8px; border-color: var(--accent); color: var(--accent); }
 .overlay.center { align-items: center; justify-content: center; }

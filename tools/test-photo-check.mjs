@@ -203,6 +203,17 @@ test('критерии зоны режутся на предложения', () 
   assert.match(list[3], /чёрных контейнеров/);
 });
 
+test('критерии списком: строки, «1.», «—» и «;» режутся на пункты', () => {
+  const what = '1. Подоконник сухой.\n2) Стекло чистое, без разводов;\n— Шторы ровно.\n• Нет посторонних вещей.';
+  const list = sandbox.splitPhotoCriteria_(what);
+  assert.deepEqual(JSON.parse(JSON.stringify(list)), [
+    'Подоконник сухой',
+    'Стекло чистое, без разводов',
+    'Шторы ровно',
+    'Нет посторонних вещей',
+  ]);
+});
+
 test('промпт: зона, критерии, только JSON, запрет людей, unclear', () => {
   const p = sandbox.buildPhotoPrompt_('Бар 1 этаж', ['Стойка сухая', 'Нет посуды'], false);
   assert.match(p, /Бар 1 этаж/);
@@ -496,6 +507,37 @@ test('миграция: колонка «этаж» добавляется и з
   assert.equal(state.refsSheet.get(1, 4), 'этаж');
   assert.equal(state.refsSheet.get(2, 4), '9');
 });
+
+test('новая схема «эталонов уборки»: этаж | зона | критерии | эталонное_фото', () => {
+  state.refsSheet = new FakeSheet(['этаж', 'зона', 'критерии', 'эталонное_фото'], [
+    ['2', 'Окно', 'Подоконник сухой.\nСтекло чистое.', ''],
+    ['1', 'Бар', 'Стойка сухая.', refLink('ABC123456789012345678')],
+  ]);
+  const refs = sandbox.photoRefs_(ss());
+  assert.equal(refs['окно'].floor, '2');
+  assert.equal(refs['окно'].what, 'Подоконник сухой.\nСтекло чистое.');
+  assert.equal(refs['окно'].fileId, '');
+  assert.equal(refs['бар'].floor, '1');
+  assert.equal(refs['бар'].fileId, 'ABC123456789012345678');
+  const zones = sandbox.photoZones_(ss(), ['Окно', 'Бар']);
+  assert.deepEqual(JSON.parse(JSON.stringify(zones)), [
+    { zone: 'Окно', floor: '2' },
+    { zone: 'Бар', floor: '1' },
+  ]);
+});
+
+test('новая схема: миграция не добавляет вторую колонку «этаж»', () => {
+  state.refsSheet = new FakeSheet(['этаж', 'зона', 'критерии', 'эталонное_фото'], [
+    ['2', 'Окно', 'x', ''],
+  ]);
+  state.refPhotosSheet = new FakeSheet(REF_PHOTO_HEADERS);
+  const filled = sandbox.photoMigrate_(ss());
+  assert.equal(filled, 0);
+  assert.equal(state.refsSheet.get(1, 1), 'этаж');
+  assert.equal(state.refsSheet.get(1, 4), 'эталонное_фото');
+  assert.equal(state.refsSheet.get(2, 1), '2');
+});
+
 
 // ---------- 4b. Эталоны — фото ----------
 test('эталоны — фото: неактивный не берётся, порядок, максимум 3', () => {

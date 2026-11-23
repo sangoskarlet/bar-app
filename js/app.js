@@ -738,7 +738,9 @@ function screenLabel() {
 /** Закрыть акт: вписать, сколько получилось. Может любой бармен. */
 function screenCloseAct(a) {
   const root = h('main', { class: 'screen' }, header('Закрыть акт'));
-  const qty = h('input', { type: 'text', inputmode: 'decimal', placeholder: '0', class: 'qty big' });
+  // Выход может быть позицией-парой (мята): тогда два поля вместо одного.
+  const closePair = makePairBlock(a.item, { big: true, unit: a.unit });
+  const qty = closePair ? closePair.input : h('input', { type: 'text', inputmode: 'decimal', placeholder: '0', class: 'qty big' });
   const info = h('p', { class: 'total' });
   const comment = h('textarea', { rows: '2', placeholder: 'Комментарий (необязательно)' });
   const saveBtn = h('button', { class: 'primary' }, '✅ Закрыть акт');
@@ -760,14 +762,15 @@ function screenCloseAct(a) {
     labelSlot.replaceChildren(labelBox.el);
   };
 
-  qty.addEventListener('input', () => {
+  const recalcInfo = () => {
     const v = parseQty(qty.value);
     if (!(v > 0) || !(a.expected > 0)) { info.textContent = ''; return; }
     const d = dev(v);
     info.textContent = Math.abs(d) < 1 ? 'Точно как ожидалось' : `${d > 0 ? '+' : ''}${fmtNum(d)}% от ожидаемого`;
     info.classList.toggle('warn', Math.abs(d) >= 15);
-  });
-  qty.addEventListener('input', syncLabel);
+  };
+  qty.addEventListener('input', () => { recalcInfo(); syncLabel(); });
+  if (closePair) closePair.otherInput.addEventListener('input', () => { recalcInfo(); syncLabel(); });
   saveBtn.addEventListener('click', async () => {
     const v = parseQty(qty.value);
     if (!(v > 0)) return toast('Введите, сколько получилось', 'bad');
@@ -778,15 +781,17 @@ function screenCloseAct(a) {
     }
     saveBtn.disabled = true;
     const madeAt = labelBox ? labelBox.madeAt : startedAt;
+    const pairNote = closePair ? closePair.summary() : '';
     await enqueue({ type: 'processingClose', name: session.name, pin: session.pin, actId: a.id, act: a.act,
-      qty: v, unit: a.unit, comment: comment.value.trim() });
+      qty: v, unit: a.unit, comment: comment.value.trim(), pair: closePair ? closePair.meta() : null });
     toast('Акт закрыт');
     stack.pop(); // экран закрытия в истории заменяем на «Акт закрыт» + этикетка
     go(screenActDone, {
       title: 'Акт закрыт',
       name: a.item || '',
       madeAt,
-      note: 'Дата производства — время начала акта: время закрытия в таблице не хранится.',
+      note: 'Дата производства — время начала акта: время закрытия в таблице не хранится.' +
+        (pairNote ? ' ' + pairNote : ''),
     });
   });
   root.append(
@@ -798,8 +803,9 @@ function screenCloseAct(a) {
     a.comment ? h('p', { class: 'muted' }, '💬 ' + a.comment) : null,
     h('p', { class: 'label' }, `Получилось: ${a.item}, ${a.unit}`),
     a.expected > 0 ? h('p', { class: 'hint left' }, `Ожидается ≈ ${fmtNum(a.expected)} ${a.unit} · ${a.basis}`) : null,
-    qty, info, labelSlot, comment, saveBtn);
-  setTimeout(() => qty.focus(), 50);
+    closePair ? closePair.el : qty,
+    info, labelSlot, comment, saveBtn);
+  setTimeout(() => (closePair ? closePair.focus() : qty.focus()), 50);
   return root;
 }
 
@@ -2198,6 +2204,183 @@ function smartRound(v) {
   return Number(v.toPrecision(2));
 }
 
+// =====================================================================
+//  ПАРЫ ПОЗИЦИЙ: мята — листья и ветки
+//
+//  Владелец добавляет строку в лист «Пары позиций» — приложение показывает
+//  у такой позиции два поля и пересчитывает одно в другое по долям.
+//  Доли приходят из таблицы уже нормализованными (сумма 1.0), например 0.6 / 0.4.
+//
+//  Что считается «своим», а что «вторым»: строка акта всегда про одну позицию
+//  (например, «Мята (листья)»). Второе поле — партнёр из пары («Мята (ветки)»).
+//  Ввод в любое поле пересчитывает другое и помечает введённое как источник —
+//  в акт уходит признак, что именно взвесили.
+//
+//  В расчёт выхода акта идёт только количество своей позиции: вторая доля
+//  (ветки) — справочная, это отход, а не результат. Прежние формулы не меняются.
+// =====================================================================
+
+/** Активная пара, в которую входит позиция (или null). */
+function pairFor(item) {
+  const key = nameKey(item);
+  if (!key) return null;
+  const list = (config && config.pairs) || [];
+  return list.find(p => nameKey(p.a) === key || nameKey(p.b) === key) || null;
+}
+
+/** «Мята (листья)» → «листья»; название без скобок возвращается как есть. */
+function pairPart(name) {
+  const m = /\(([^)]+)\)/.exec(String(name || ''));
+  return (m ? m[1] : String(name || '')).trim().toLowerCase();
+}
+
+/** «Мята (листья)» → «Мята»; используется в итоговой строке акта. */
+function pairBase(name) {
+  return String(name || '').replace(/\s*\([^)]*\)\s*$/, '').trim();
+}
+
+/** Родительный падеж для итоговой строки; незнакомое слово оставляем как есть. */
+const PAIR_GENITIVE = {
+  'листья': 'листьев', 'листьев': 'листьев',
+  'ветки': 'веток', 'веток': 'веток',
+  'стебли': 'стеблей', 'стеблей': 'стеблей',
+  'корни': 'корней', 'корней': 'корней',
+  'цедра': 'цедры', 'сок': 'сока',
+};
+function pairGenitive(part) {
+  return PAIR_GENITIVE[String(part || '').toLowerCase()] || part;
+}
+
+/**
+ * Два поля для позиции-пары. null — позиция не в паре (форма как раньше).
+ *
+ * @param {string} itemName  позиция строки акта (например, «Мята (листья)»)
+ * @param {{big?:boolean, unit?:string, onChange?:Function}} opts
+ * @returns {?{el:HTMLElement, input:HTMLInputElement, otherInput:HTMLInputElement,
+ *            inputs:HTMLInputElement[], value:Function, setOwn:Function,
+ *            meta:Function, summary:Function, focus:Function}}
+ */
+function makePairBlock(itemName, opts = {}) {
+  const pair = pairFor(itemName);
+  if (!pair) return null;
+
+  const isA = nameKey(pair.a) === nameKey(itemName);
+  const ownName = isA ? pair.a : pair.b;
+  const otherName = isA ? pair.b : pair.a;
+  const shareA = Number(pair.shareA);
+  const shareB = Number(pair.shareB);
+  const ownShare = isA ? shareA : shareB;
+  const otherShare = isA ? shareB : shareA;
+  const unit = opts.unit || 'г';
+  if (!(ownShare > 0) || !(otherShare > 0)) return null; // сервер такую пару не отдаст
+
+  const partA = pairPart(pair.a);
+  const partB = pairPart(pair.b);
+  const mkInput = () => h('input', {
+    type: 'text', inputmode: 'decimal', placeholder: '0',
+    class: 'qty' + (opts.big ? ' big' : ''),
+  });
+  const inputA = mkInput();
+  const inputB = mkInput();
+  const badgeA = h('span', { class: 'pair-badge hidden' }, 'взвешено');
+  const badgeB = h('span', { class: 'pair-badge hidden' }, 'взвешено');
+  const note = h('p', { class: 'pair-note muted' });
+  let source = ''; // 'a' | 'b' — какое поле ввели вручную
+
+  const fld = (part, input, badge) => h('div', { class: 'pair-field' },
+    h('span', { class: 'pair-cap' }, `${part}, ${unit}`),
+    h('div', { class: 'pair-line' }, input, badge));
+
+  const el = h('div', { class: 'pair-block' },
+    h('div', { class: 'pair-grid' }, fld(partA, inputA, badgeA), fld(partB, inputB, badgeB)),
+    note);
+
+  const showSource = () => {
+    badgeA.classList.toggle('hidden', source !== 'a');
+    badgeB.classList.toggle('hidden', source !== 'b');
+  };
+
+  const updateNote = () => {
+    const a = parseQty(inputA.value), b = parseQty(inputB.value);
+    const total = (isFinite(a) ? a : 0) + (isFinite(b) ? b : 0);
+    note.textContent = `Доли ${shareA} / ${shareB} · ` +
+      (total > 0 ? `всего ${fmtNum(Math.round(total))} ${unit}` : 'одно поле считается из другого');
+  };
+
+  /** Пересчёт второго поля по долям: целые граммы, округление. */
+  const syncFrom = which => {
+    source = which;
+    const from = which === 'a' ? inputA : inputB;
+    const to = which === 'a' ? inputB : inputA;
+    const fromShare = which === 'a' ? shareA : shareB;
+    const toShare = which === 'a' ? shareB : shareA;
+    if (from.value.trim() === '') {
+      to.value = '';
+    } else {
+      const v = parseQty(from.value);
+      if (isFinite(v)) to.value = String(Math.round(v * toShare / fromShare));
+    }
+    showSource();
+    updateNote();
+    if (opts.onChange) opts.onChange();
+  };
+
+  inputA.addEventListener('input', () => syncFrom('a'));
+  inputB.addEventListener('input', () => syncFrom('b'));
+
+  const primary = isA ? inputA : inputB;
+  const otherInput = isA ? inputB : inputA;
+  const ownPart = isA ? partA : partB;
+  const otherPart = isA ? partB : partA;
+
+  /** Программная подстановка (рецепт, «постоянное»): второе поле считаем сами. */
+  const setOwn = v => {
+    primary.value = v === '' || v === null || v === undefined ? '' : String(v).replace('.', ',');
+    if (primary.value === '') {
+      otherInput.value = '';
+    } else {
+      const n = parseQty(primary.value);
+      if (isFinite(n)) otherInput.value = String(Math.round(n * otherShare / ownShare));
+    }
+    source = '';
+    showSource();
+    updateNote();
+  };
+
+  const meta = () => {
+    const own = parseQty(primary.value);
+    if (!(own > 0)) return null;
+    const other = parseQty(otherInput.value);
+    const ownIsSource = source === '' || source === (isA ? 'a' : 'b');
+    return {
+      item: otherName,
+      qty: isFinite(other) ? Math.round(other) : 0,
+      source: ownIsSource ? 'own' : 'other',
+    };
+  };
+
+  /** Итоговая строка для экрана «Акт сохранён»: «мята: 120 г листьев / 80 г веток …». */
+  const summary = () => {
+    const own = parseQty(primary.value), other = parseQty(otherInput.value);
+    if (!(own > 0) || !isFinite(other)) return '';
+    const aVal = isA ? own : other;
+    const bVal = isA ? other : own;
+    const weighed = source === '' ? ownPart : (source === 'a' ? partA : partB);
+    const baseA = pairBase(pair.a), baseB = pairBase(pair.b);
+    const title = nameKey(baseA) === nameKey(baseB) ? baseA.toLowerCase() : `${baseA} / ${baseB}`.toLowerCase();
+    return `${title}: ${Math.round(aVal)} ${unit} ${pairGenitive(partA)} / ` +
+      `${Math.round(bVal)} ${unit} ${pairGenitive(partB)} ` +
+      `(по коэффициенту ${shareA}/${shareB}, взвешены ${weighed})`;
+  };
+
+  updateNote();
+  return {
+    el, input: primary, otherInput, inputs: [inputA, inputB],
+    value: () => parseQty(primary.value),
+    setOwn, meta, summary, focus: () => primary.focus(),
+  };
+}
+
 function screenActs() {
   const root = h('main', { class: 'screen' }, header('Переработка'));
   const acts = config.acts || [];
@@ -2241,7 +2424,9 @@ function screenAct(act) {
   const info = h('p', { class: 'total' });
   const comment = h('textarea', { rows: '2', placeholder: 'Комментарий (необязательно)' });
   const saveBtn = h('button', { class: 'primary' }, 'Сохранить акт');
-  const outInput = numInput(true);
+  // Позиция выхода в паре (например, «Мята (листья)») — два поля вместо одного.
+  const outPair = makePairBlock(act.output.item, { big: true, unit: act.output.unit });
+  const outInput = outPair ? outPair.input : numInput(true);
   let expectedOut = null;
 
   // Этикетка появляется, как только вписан выход: акт готов.
@@ -2263,15 +2448,19 @@ function screenAct(act) {
   // ---------- Простой акт: было → стало ----------
   if (!isRecipe) {
     const key = act.inputs[0];
-    const keyInput = numInput(true);
+    const keyPair = makePairBlock(key.item, { big: true, unit: key.unit });
+    const keyInput = keyPair ? keyPair.input : numInput(true);
     const recalc = () => {
       const k = parseQty(keyInput.value), o = parseQty(outInput.value);
       info.textContent = k > 0 && o >= 0 ? `Выход: ${fmtNum(o / k * 100)}%` : '';
     };
     keyInput.addEventListener('input', recalc);
     outInput.addEventListener('input', recalc);
-    outInput.placeholder = 'пусто = впишу позже';
+    if (keyPair) keyPair.otherInput.addEventListener('input', recalc);
+    if (outPair) outPair.otherInput.addEventListener('input', recalc);
+    if (!outPair) outInput.placeholder = 'пусто = впишу позже';
     outInput.addEventListener('input', () => setSaveLabel(saveBtn, outInput));
+    if (outPair) outPair.otherInput.addEventListener('input', () => setSaveLabel(saveBtn, outInput));
     saveBtn.addEventListener('click', async () => {
       const k = parseQty(keyInput.value);
       const later = outInput.value.trim() === '';
@@ -2280,23 +2469,24 @@ function screenAct(act) {
       if (!later && !(o > 0)) return toast('Проверьте, сколько стало', 'bad');
       saveBtn.disabled = true;
       const madeAt = labelBox ? labelBox.madeAt : new Date();
+      const pairNotes = [keyPair && keyPair.summary(), outPair && outPair.summary()].filter(Boolean);
       await enqueue({ type: 'processing', name: session.name, pin: session.pin, act: act.name, comment: comment.value.trim(),
         pending: later,
-        lines: [{ role: 'Сырьё', item: key.item, unit: key.unit, qty: k },
-                { role: 'Результат', item: act.output.item, unit: act.output.unit, qty: o }] });
+        lines: [{ role: 'Сырьё', item: key.item, unit: key.unit, qty: k, pair: keyPair ? keyPair.meta() : null },
+                { role: 'Результат', item: act.output.item, unit: act.output.unit, qty: o, pair: outPair ? outPair.meta() : null }] });
       toast(later ? 'Сохранено. Выход впишете позже в «⏳ В работе»' : 'Акт сохранён');
       if (later) return back();
       // Акт готов — сразу этикетка, чтобы не искать её потом
       stack.pop();
-      go(screenActDone, { name: act.output.item || '', madeAt });
+      go(screenActDone, { name: act.output.item || '', madeAt, note: pairNotes.join(' · ') });
     });
     setSaveLabel(saveBtn, outInput);
     root.append(
-      h('p', { class: 'label' }, `Было: ${key.item}, ${key.unit}`), keyInput,
-      h('p', { class: 'label' }, `Стало: ${act.output.item}, ${act.output.unit}`), outInput,
+      h('p', { class: 'label' }, `Было: ${key.item}, ${key.unit}`), keyPair ? keyPair.el : keyInput,
+      h('p', { class: 'label' }, `Стало: ${act.output.item}, ${act.output.unit}`), outPair ? outPair.el : outInput,
       h('p', { class: 'muted' }, 'Ещё не готово? Оставьте «стало» пустым — допишете потом.'),
       info, labelSlot, comment, saveBtn);
-    setTimeout(() => keyInput.focus(), 50);
+    setTimeout(() => (keyPair ? keyPair.focus() : keyInput.focus()), 50);
     return root;
   }
 
@@ -2305,12 +2495,17 @@ function screenAct(act) {
   // Количество в рецепте — это вес «в дело» (для чистки — чистый вес).
   const key = act.inputs.find(i => i.key) || act.inputs[0];
   const rows = act.inputs.map(i => {
-    const amount = numInput(i === key);
+    const pair = makePairBlock(i.item, { unit: i.unit });
+    const amount = pair ? pair.input : numInput(i === key);
     const raw = i.clean ? numInput(false) : null;
     amount.dataset.dirty = '';
     amount.addEventListener('input', () => { if (i !== key) amount.dataset.dirty = '1'; });
-    if (i.fixed && i.qty > 0) amount.value = String(i.qty).replace('.', ',');
-    return { i, amount, raw };
+    if (pair) pair.otherInput.addEventListener('input', () => { if (i !== key) amount.dataset.dirty = '1'; });
+    if (i.fixed && i.qty > 0) {
+      if (pair) pair.setOwn(i.qty);
+      else amount.value = String(i.qty).replace('.', ',');
+    }
+    return { i, amount, raw, pair };
   });
   const keyRow = rows.find(r => r.i === key);
 
@@ -2320,7 +2515,9 @@ function screenAct(act) {
       const f = k / key.qty;
       rows.forEach(r => {
         if (r.i === key || r.i.fixed || r.amount.dataset.dirty || !(r.i.qty > 0)) return;
-        r.amount.value = String(smartRound(r.i.qty * f)).replace('.', ',');
+        const v = smartRound(r.i.qty * f);
+        if (r.pair) r.pair.setOwn(v);
+        else r.amount.value = String(v).replace('.', ',');
       });
       // Выход не подставляем — только подсказка: его вписывают, когда заготовка готова
       if (act.output.qty > 0) { expectedOut = smartRound(act.output.qty * f); outInput.placeholder = `≈ ${String(expectedOut).replace('.', ',')} по рецепту, или пусто — позже`; }
@@ -2335,6 +2532,7 @@ function screenAct(act) {
   }
   rows.forEach(r => {
     r.amount.addEventListener('input', recalc);
+    if (r.pair) r.pair.otherInput.addEventListener('input', recalc);
     if (r.raw) { r.raw.addEventListener('input', recalc); r.pct = h('p', { class: 'muted' }); }
   });
 
@@ -2344,29 +2542,33 @@ function screenAct(act) {
       const a = r.amount.value.trim() === '' ? 0 : parseQty(r.amount.value);
       if (!(a >= 0)) return toast(`Проверьте: ${r.i.item}`, 'bad');
       if (r.i === key && !(a > 0)) return toast(`Введите: ${r.i.item}`, 'bad');
+      const pair = r.pair ? r.pair.meta() : null;
       if (r.raw) {
         const w = parseQty(r.raw.value);
         if (a > 0 && !(w > 0)) return toast(`${r.i.item}: введите вес до чистки`, 'bad');
         if (a > w) return toast(`${r.i.item}: чистый вес больше, чем до чистки`, 'bad');
-        lines.push({ role: 'Сырьё', item: r.i.item, unit: r.i.unit, qty: a > 0 ? w : 0, clean: a });
+        lines.push({ role: 'Сырьё', item: r.i.item, unit: r.i.unit, qty: a > 0 ? w : 0, clean: a, pair });
       } else {
-        lines.push({ role: 'Сырьё', item: r.i.item, unit: r.i.unit, qty: a });
+        lines.push({ role: 'Сырьё', item: r.i.item, unit: r.i.unit, qty: a, pair });
       }
     }
     const later = outInput.value.trim() === '';
     const o = later ? 0 : parseQty(outInput.value);
     if (!later && !(o > 0)) return toast('Проверьте, сколько получилось', 'bad');
-    lines.push({ role: 'Результат', item: act.output.item, unit: act.output.unit, qty: o });
+    lines.push({ role: 'Результат', item: act.output.item, unit: act.output.unit, qty: o, pair: outPair ? outPair.meta() : null });
     saveBtn.disabled = true;
     const madeAt = labelBox ? labelBox.madeAt : new Date();
+    const pairNotes = rows.map(r => r.pair && r.pair.summary()).filter(Boolean);
+    if (outPair) pairNotes.push(outPair.summary());
     await enqueue({ type: 'processing', name: session.name, pin: session.pin, act: act.name, lines, comment: comment.value.trim(),
       pending: later, expected: later ? expectedOut : null });
     toast(later ? 'Сохранено. Выход впишете позже в «⏳ В работе»' : 'Акт сохранён');
     if (later) return back();
     stack.pop();
-    go(screenActDone, { name: act.output.item || '', madeAt });
+    go(screenActDone, { name: act.output.item || '', madeAt, note: pairNotes.filter(Boolean).join(' · ') });
   });
   outInput.addEventListener('input', () => setSaveLabel(saveBtn, outInput));
+  if (outPair) outPair.otherInput.addEventListener('input', () => setSaveLabel(saveBtn, outInput));
   setSaveLabel(saveBtn, outInput);
 
   const block = (r) => {
@@ -2378,11 +2580,16 @@ function screenAct(act) {
       r.amount.placeholder = 'чистый';
       return h('div', { class: 'clean-block' + (i === key ? ' key' : '') },
         h('p', { class: 'label' }, `${i.item}${tag}`),
-        h('div', { class: 'clean-line' }, r.raw, h('span', { class: 'arrow' }, '='), r.amount, h('span', { class: 'unit' }, i.unit)),
-        h('div', { class: 'clean-caps' }, h('span', {}, 'грязный'), h('span', {}), h('span', {}, 'чистый (идёт в рецепт)'), h('span', {})),
+        r.pair
+          ? h('div', {}, h('p', { class: 'muted' }, 'Грязный вес (до чистки), ' + i.unit), r.raw)
+          : h('div', { class: 'clean-line' }, r.raw, h('span', { class: 'arrow' }, '='), r.amount, h('span', { class: 'unit' }, i.unit)),
+        r.pair ? h('p', { class: 'muted' }, 'Чистый вес — в паре:') : null,
+        r.pair ? r.pair.el : null,
+        r.pair ? null : h('div', { class: 'clean-caps' }, h('span', {}, 'грязный'), h('span', {}), h('span', {}, 'чистый (идёт в рецепт)'), h('span', {})),
         r.pct);
     }
-    if (i === key) return h('div', {}, h('p', { class: 'label' }, `${i.item}, ${i.unit}${tag}`), r.amount);
+    if (i === key) return h('div', {}, h('p', { class: 'label' }, `${i.item}, ${i.unit}${tag}`), r.pair ? r.pair.el : r.amount);
+    if (r.pair) return h('div', { class: 'pair-row' }, h('p', { class: 'label' }, `${i.item}${tag}`), r.pair.el);
     return h('div', { class: 'act-line' }, h('span', {}, i.item + (i.fixed ? ' · пост.' : '')), r.amount, h('span', { class: 'unit' }, i.unit));
   };
   const keyFirst = [keyRow, ...rows.filter(r => r !== keyRow)];

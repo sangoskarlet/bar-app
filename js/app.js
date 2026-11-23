@@ -853,22 +853,24 @@ function openItemPicker(onPick) {
 //  ЭКРАН: ФОТО УБОРКИ — этаж → зоны этажа → камера
 // =====================================================================
 //  Сервер отдаёт config.photoZones: [{zone, floor}] и config.photoRefs:
-//  [{zone, floor, active, total}]. Если телефон работает со старым кэшем
-//  без photoZones — все зоны попадут в группу «Без этажа», ничего не пропадёт.
+//  [{zone, floor, active, total}]. Список зон фиксированный и все зоны
+//  размечены по этажам, поэтому группы «Без этажа» на экране нет.
 function photoZoneGroups() {
   const src = (config && Array.isArray(config.photoZones) && config.photoZones.length)
     ? config.photoZones
-    : ((config && config.zones) || []).map(zone => ({ zone: zone, floor: '' }));
+    : ((config && config.zones) || []).map(zone => ({ zone: zone, floor: '1' }));
   const groups = new Map();
   src.forEach(item => {
     const zone = String((item && item.zone) || '').trim();
     if (!zone) return;
-    const floor = String((item && item.floor) || '').trim();
+    // Пустой этаж не показываем как «Без этажа»: относим зону к 1 этажу,
+    // чтобы бармен её не потерял, даже если в таблице забыли этаж.
+    const floor = String((item && item.floor) || '').trim() || '1';
     if (!groups.has(floor)) groups.set(floor, []);
     if (!groups.get(floor).includes(zone)) groups.get(floor).push(zone);
   });
-  // Этажи: числа по возрастанию, потом текст, «Без этажа» — всегда последней.
-  const floors = [...groups.keys()].filter(Boolean);
+  // Этажи: числа по возрастанию, потом текст.
+  const floors = [...groups.keys()];
   floors.sort((a, b) => {
     const na = parseInt(a, 10), nb = parseInt(b, 10);
     const fa = isFinite(na), fb = isFinite(nb);
@@ -876,7 +878,6 @@ function photoZoneGroups() {
     if (fa !== fb) return fa ? -1 : 1;
     return a.localeCompare(b, 'ru');
   });
-  if (groups.has('')) floors.push('');
   return { groups: groups, floors: floors };
 }
 
@@ -898,15 +899,14 @@ function screenPhoto(initialZone) {
   const all = photoZoneGroups();
 
   // «Переснять» приносит уже выбранную зону: находим её этаж и сразу
-  // показываем форму. Если зоны нет в списке — кладём её в «Без этажа».
+  // показываем форму. Если зоны нет в списке — относим её к 1 этажу.
   if (form.zone) {
     const found = [...all.groups.entries()].find(([, zs]) => zs.includes(form.zone));
-    form.floor = found ? found[0] : '';
+    form.floor = found ? found[0] : '1';
     form.floorPicked = true;
     if (!found) {
-      if (!all.groups.has('')) all.groups.set('', []);
-      all.groups.get('').push(form.zone);
-      if (!all.floors.includes('')) all.floors.push('');
+      if (!all.groups.has('1')) { all.groups.set('1', []); all.floors.push('1'); }
+      all.groups.get('1').push(form.zone);
     }
   }
 

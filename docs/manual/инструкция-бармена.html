@@ -20,9 +20,9 @@
   .page:last-child { page-break-after: auto; break-after: auto; }
   .footer {
     position: absolute; left: 0; right: 0; bottom: 0;
-    display: flex; justify-content: space-between; align-items: baseline;
-    font-size: 7.6pt; color: #7a7a7a;
-    border-top: 0.2mm solid #d8d4cd; padding-top: 1.6mm; padding-right: 1.5mm;
+    display: flex; justify-content: flex-end; align-items: baseline;
+    font-size: 8pt; color: #7a7a7a;
+    padding-top: 1.6mm; padding-right: 1.5mm;
   }
   .footer .pg { font-weight: 700; color: #141414; font-size: 8.4pt; }
 
@@ -88,7 +88,7 @@
   .toc .sub { font-size: 9.2pt; color: #6b6b6b; display: block; margin-top: 0.4mm; }
 
   /* Обложка */
-  .cover { height: 266.5mm; position: relative; }
+  .cover { height: 266.5mm; position: relative; padding-left: 1.2mm; }
   .cover .top-line { height: 1.2mm; background: #141414; width: 42mm; }
   .cover .brand { margin-top: 34mm; font-size: 46pt; letter-spacing: 7pt; font-weight: 300; line-height: 1; }
   .cover .brand-sub { margin-top: 2mm; font-size: 13pt; letter-spacing: 5.4pt; color: #555; }
@@ -120,7 +120,6 @@
 <!-- ============ 1. ОБЛОЖКА ============ -->
 <div class="page cover">
   <div class="top-line"></div>
-  <div class="mark">ВЕРСИЯ 1.0</div>
   <div class="brand">ESSE</div>
   <div class="brand-sub">JAZZ CLUB</div>
 
@@ -134,9 +133,7 @@
     <div class="line"></div>
   </div>
 
-  <div class="addr">
-    Адрес приложения: sangoskarlet.github.io/bar-app/ · Инструкция для внутреннего использования
-  </div>
+
 </div>
 
 <!-- ============ 2. ОГЛАВЛЕНИЕ ============ -->
@@ -168,7 +165,7 @@
     <p>Рамки с красной полосой слева — важное. Их стоит прочитать до того, как нажимать.</p>
   </div>
 
-  <div class="footer"><span>ESSE — журнал бара · инструкция для барменов</span><span class="pg">2</span></div>
+  <div class="footer"><span class="pg">2</span></div>
 </div>
 
 <!-- ============ 3. УСТАНОВКА + ВХОД ============ -->
@@ -223,7 +220,7 @@
   <h3>Сменить сотрудника</h3>
   <p>На главной сверху: <b>«Смена: Имя»</b> и кнопка <b>«Сменить»</b>. Нажмите её, когда телефон передаёте коллеге. Если в очереди есть неотправленные записи, приложение предупредит — они всё равно отправятся.</p>
 
-  <div class="footer"><span>ESSE — журнал бара · инструкция для барменов</span><span class="pg">3</span></div>
+  <div class="footer"><span class="pg">3</span></div>
 </div>
 
 <!-- ============ 4. ГЛАВНЫЙ ЭКРАН ============ -->
@@ -285,7 +282,7 @@
     <p>Запись не приняли. Нажмите на полоску: там будет причина. Чаще всего это смена PIN. Тогда: «Сменить» → войти с новым PIN → вернуться в «Отправка» → <b>«Повторить»</b>.</p>
   </div>
 
-  <div class="footer"><span>ESSE — журнал бара · инструкция для барменов</span><span class="pg">4</span></div>
+  <div class="footer"><span class="pg">4</span></div>
 </div>
 
 <!-- ============ 5. ИНВЕНТАРИЗАЦИЯ ============ -->
@@ -329,7 +326,7 @@
     </div>
   </div>
 
-  <div class="footer"><span>ESSE — журнал бара · инструкция для барменов</span><span class="pg">5</span></div>
+  <div class="footer"><span class="pg">5</span></div>
 </div>
 
 <!-- ============ 6. ТТК ============ -->
@@ -376,7 +373,7 @@
     <p>Помните вкус, но не название? Введите в поиск «лайм», «имбирь» или «просекко» — приложение покажет все позиции, где он есть.</p>
   </div>
 
-  <div class="footer"><span>ESSE — журнал бара · инструкция для барменов</span><span class="pg">6</span></div>
+  <div class="footer"><span class="pg">6</span></div>
 </div>
 
 <!-- ============ 7. ПЕРЕРАБОТКА ============ -->
@@ -422,7 +419,7 @@
     </div>
   </div>
 
-  <div class="footer"><span>ESSE — журнал бара · инструкция для барменов</span><span class="pg">7</span></div>
+  <div class="footer"><span class="pg">7</span></div>
 </div>
 
 <!-- ============ 8. ЭТИКЕТКА ============ -->
@@ -471,7 +468,7 @@
   <p>Под превью мелким текстом написано, откуда взят срок: <b>«Срок 24 ч (справочник)»</b>, <b>«Срок 24 ч (по умолчанию) — позиции нет в справочнике»</b> или <b>«правили вручную»</b>. Срок можно поменять в поле <b>«Срок хранения»</b> — в часах.</p>
   <p>На самой этикетке печатаются название, <b>«изг.»</b> (когда сделали) и <b>«годен до»</b>. Справочник сроков ведёт владелец; если срока нет, приложение ставит 24 часа и честно пишет об этом под превью. Если под превью написано, что название не помещается, — сократите его в поле «Название».</p>
 
-  <div class="footer"><span>ESSE — журнал бара · инструкция для барменов</span><span class="pg">8</span></div>
+  <div class="footer"><span class="pg">8</span></div>
 </div>
 
 <!-- ============ 9. ФОТО УБОРКИ ============ -->
@@ -514,7 +511,7 @@
     <p>Вердикт — подсказка, а не запрет. Даже при «Критично» или «Не удалось проверить» можно нажать <b>«Всё равно закрыть»</b> или <b>«Позже»</b> и продолжить работу. Но замечание лучше исправить сразу. Без интернета снимок сохранится, а вердикт появится в <b>«Истории снимков»</b>, когда будет связь.</p>
   </div>
 
-  <div class="footer"><span>ESSE — журнал бара · инструкция для барменов</span><span class="pg">9</span></div>
+  <div class="footer"><span class="pg">9</span></div>
 </div>
 
 <!-- ============ 10. СТОП-ЛИСТ ============ -->
@@ -554,7 +551,7 @@
     <p>Фотографируйте планшет целиком. Половина колонки в кадре — половина стоп-листа в учёте.</p>
   </div>
 
-  <div class="footer"><span>ESSE — журнал бара · инструкция для барменов</span><span class="pg">10</span></div>
+  <div class="footer"><span class="pg">10</span></div>
 </div>
 
 <!-- ============ 11. ЧЕК-ЛИСТЫ ============ -->
@@ -598,7 +595,7 @@
     <p>Прогон сохраняется на телефоне. Откройте «Чек-листы» снова: на карточке списка будет <b>«Продолжить»</b> — отметки на месте.</p>
   </div>
 
-  <div class="footer"><span>ESSE — журнал бара · инструкция для барменов</span><span class="pg">11</span></div>
+  <div class="footer"><span class="pg">11</span></div>
 </div>
 
 <!-- ============ 12. ВИКТОРИНА И ДУЭЛЬ ============ -->
@@ -649,7 +646,7 @@
     </div>
   </div>
 
-  <div class="footer"><span>ESSE — журнал бара · инструкция для барменов</span><span class="pg">12</span></div>
+  <div class="footer"><span class="pg">12</span></div>
 </div>
 
 <!-- ============ 13. ПРОБЛЕМЫ ============ -->
@@ -692,10 +689,9 @@
   </table>
 
   <div class="note" style="margin-top:6mm">
-    <span class="t">Телефоны</span>
-    <p>Старший бармен: ______________________________</p>
-    <p>Менеджер смены: ______________________________</p>
-    <p class="small muted">Впишите телефоны до того, как инструкция попадёт за бар. Если номера изменятся — исправьте здесь.</p>
+    <span class="t">Кому звонить</span>
+    <p><b>Старший бармен</b> — уточните номер у администратора.</p>
+    <p><b>Менеджер</b> — уточните номер у администратора.</p>
   </div>
 
   <div class="note warn">
@@ -703,7 +699,7 @@
     <p>1) Не удаляйте приложение и не очищайте данные браузера: вместе с ними пропадут неотправленные записи. 2) Сфотографируйте экран с ошибкой. 3) Позвоните старшему бармену или менеджеру и скажите, что именно делали.</p>
   </div>
 
-  <div class="footer"><span>ESSE — журнал бара · инструкция для барменов</span><span class="pg">13</span></div>
+  <div class="footer"><span class="pg">13</span></div>
 </div>
 
 <!-- ============ 14. ПАМЯТКА ============ -->
@@ -746,13 +742,9 @@
     </ul>
   </div>
 
-  <div class="memo-bottom">
-    <p><b>Телефон старшего бармена:</b> ______________________________</p>
-    <p><b>Телефон менеджера:</b> ______________________________</p>
-    <p class="small muted" style="margin-top:4mm">ESSE — журнал бара. Инструкция для барменов, версия 1.0 · 24.11.2026. Адрес приложения: sangoskarlet.github.io/bar-app/</p>
-  </div>
 
-  <div class="footer"><span>ESSE — журнал бара · инструкция для барменов</span><span class="pg">14</span></div>
+
+  <div class="footer"><span class="pg">14</span></div>
 </div>
 
 </body>

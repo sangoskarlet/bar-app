@@ -514,13 +514,13 @@ test('сопоставление со справочником не отреза
   assert.equal(sandbox.stopMatchName_('КУРПФАЙЦ НЕФИЛЬТРОВАННОЕ', dict).name, 'Курпфайц нефильтрованное');
   assert.equal(sandbox.stopMatchName_('0,3 Курпфайц нефильтрованное', dict), null);
   assert.equal(sandbox.stopMatchName_('0,5 Курпфайц нефильтрованное', dict), null);
-  // Опечатка без чисел — можно, с другим числом — нельзя.
-  assert.equal(sandbox.stopMatchName_('Курпфайц нефильтрованое', dict).name, 'Курпфайц нефильтрованное');
+  // Опечатки сознательно не склеиваем: «Курпфайц» и «Курпфаиц» — разные строки.
+  assert.equal(sandbox.stopMatchName_('Курпфайц нефильтрованое', dict), null);
   assert.equal(sandbox.stopMatchName_('Домен Брюне Шинон 0,150', dict), null);
   assert.equal(sandbox.stopMatchName_('Сливки 33%', dict), null);
 });
 
-test('«сливки» находит «Сливки», а «Сливки 33%» — отдельная позиция', () => {
+test('«сливки» находит «Сливки» по падежам, а «Сливки 33%» — отдельная позиция', () => {
   const ss = makeSs();
   state.ss = ss;
   const dict = sandbox.stopDictionary_(ss);
@@ -1105,6 +1105,118 @@ test('шапка пустого листа приводится к схеме с
   assert.equal(head[0], 'дата');
   assert.equal(head[9], 'этаж');
   assert.equal(head[10], 'id');
+});
+
+// =====================================================================
+//  I. «Ё» И «Е» — ОДНА БУКВА ПРИ СРАВНЕНИИ, НО НЕ ПРИ ПОКАЗЕ
+// =====================================================================
+test('ключ сравнения: «ё» и «Ё» равны «е»', () => {
+  assert.equal(sandbox.stopNameKey_('Вишнёвка 40мл'), sandbox.stopNameKey_('Вишневка 40мл'));
+  assert.equal(sandbox.stopNameKey_('ВИШНЁВКА 40МЛ'), sandbox.stopNameKey_('вишневка 40мл'));
+  assert.equal(sandbox.stopNameKey_('Щёлочь'), sandbox.stopNameKey_('щелочь'));
+  // Знак «ё» — единственное отличие, которое склеиваем: «Сидр» и «Сидер» разные.
+  assert.notEqual(sandbox.stopNameKey_('Сидр 0,5'), sandbox.stopNameKey_('Сидер 0,5'));
+});
+
+test('дни: «Вишнёвка» и «Вишневка» в разные дни — одна позиция, 2 дня', () => {
+  const ss = makeSs();
+  state.ss = ss;
+  photoSave(ss, { day: dayAgo(1), stop: ['Вишнёвка 40мл'] });
+  photoSave(ss, { stop: ['Вишневка 40мл'] });
+  const f1 = floorOf(sandbox.stopListState_(ss), '1');
+  assert.equal(f1.current.length, 1, 'одна позиция, а не две');
+  assert.equal(f1.current[0].days, 2);
+  assert.equal(f1.positions.length, 1);
+  assert.equal(f1.positions[0].totalDays, 2);
+  // На экране — написание первого появления, а не «причёсанное» справочником.
+  assert.equal(f1.current[0].name, 'Вишнёвка 40мл');
+});
+
+test('дни: обратный порядок — показываем то, что написали первым', () => {
+  const ss = makeSs();
+  state.ss = ss;
+  photoSave(ss, { day: dayAgo(1), stop: ['Вишневка 40мл'] });
+  photoSave(ss, { stop: ['Вишнёвка 40мл'] });
+  const p = floorOf(sandbox.stopListState_(ss), '1').current[0];
+  assert.equal(p.name, 'Вишневка 40мл');
+  assert.equal(p.days, 2);
+});
+
+test('в листе обе строки остаются как написаны', () => {
+  const ss = makeSs();
+  state.ss = ss;
+  photoSave(ss, { day: dayAgo(1), stop: ['Вишнёвка 40мл'] });
+  photoSave(ss, { stop: ['Вишневка 40мл'] });
+  const rows = rowsOf(ss, 'Стоп-лист');
+  const idx = {};
+  sandbox.STOP_HEADERS.forEach((h, i) => { idx[h] = i; });
+  assert.deepEqual(JSON.parse(JSON.stringify(rows.map(r => r[idx['позиция']]))),
+    ['Вишнёвка 40мл', 'Вишневка 40мл']);
+});
+
+test('один снимок: «Вишнёвка» справа и «Вишневка» с нулём слева — одна строка', () => {
+  const ss = makeSs();
+  state.ss = ss;
+  const saved = photoSave(ss, {
+    stop: ['Вишнёвка 40мл'],
+    stock: [['Вишневка 40мл', 0]],
+  });
+  assert.equal(saved.stop.length, 1);
+  assert.equal(rowsOf(ss, 'Стоп-лист').length, 1);
+});
+
+test('кухня: «ё» не мешает отсечению ни в одну сторону', () => {
+  const ss = makeSs({ 'Кухня': [['позиция', 'активен', 'комментарий'], [
+    ['Свёкла отварная', 'вкл', 'кухня'],
+    ['Крем-брюле', 'вкл', 'кухня'],
+  ]] });
+  state.ss = ss;
+  const kitchen = sandbox.stopKitchenSet_(ss);
+  assert.equal(sandbox.stopIsKitchen_('Свекла отварная', kitchen), true);
+  assert.equal(sandbox.stopIsKitchen_('СВЁКЛА ОТВАРНАЯ', kitchen), true);
+  assert.equal(sandbox.stopIsKitchen_('свекла отварная', kitchen), true);
+  // Обратно: в «Кухне» без «ё», а распознали с «ё».
+  const ss2 = makeSs({ 'Кухня': [['позиция', 'активен', 'комментарий'], [
+    ['Свекла отварная', 'вкл', 'кухня'],
+  ]] });
+  assert.equal(sandbox.stopIsKitchen_('Свёкла отварная', sandbox.stopKitchenSet_(ss2)), true);
+});
+
+test('справочник: «ё» не мешает подсказке ни в одну сторону', () => {
+  const ss = makeSs({ 'Справочник': [['Позиция', 'Ед.', 'Категория', 'Показывать'], [
+    ['Вишнёвка 40мл', 'мл', 'Настойки', true],
+    ['Свекла', 'г', 'Овощи', true],
+  ]] });
+  state.ss = ss;
+  const dict = sandbox.stopDictionary_(ss);
+  assert.equal(sandbox.stopMatchName_('вишневка 40мл', dict).name, 'Вишнёвка 40мл');
+  assert.equal(sandbox.stopMatchName_('Вишнёвка 40мл', dict).name, 'Вишнёвка 40мл');
+  assert.equal(sandbox.stopMatchName_('свёкла', dict).name, 'Свекла');
+});
+
+test('«ё» не превращается в агрессивную нечёткость: «Сидр» ≠ «Сидер»', () => {
+  const ss = makeSs({ 'Справочник': [['Позиция', 'Ед.', 'Категория', 'Показывать'], [
+    ['Сидр 0,5', 'мл', 'Сидр', true],
+    ['Вино белое', 'мл', 'Вино', true],
+  ]] });
+  state.ss = ss;
+  const dict = sandbox.stopDictionary_(ss);
+  // Отличие не только в «ё» — не склеиваем.
+  assert.equal(sandbox.stopMatchName_('Сидер 0,5', dict), null);
+  assert.equal(sandbox.stopMatchName_('Вино белое сухое', dict), null);
+  // И в группировке это тоже разные позиции (разные серии, а не одна).
+  const ss2 = makeSs();
+  state.ss = ss2;
+  photoSave(ss2, { day: dayAgo(1), stop: ['Сидр 0,5'] });
+  photoSave(ss2, { stop: ['Сидер 0,5'] });
+  photoSave(ss2, { stop: ['Вино белое'] });
+  const f1 = floorOf(sandbox.stopListState_(ss2), '1');
+  assert.deepEqual(JSON.parse(JSON.stringify(f1.positions.map(p => p.name).sort())),
+    ['Вино белое', 'Сидер 0,5', 'Сидр 0,5']);
+  // «Сидр» выпал сегодня — его серия закрыта, но история на месте.
+  const sidr = f1.positions.find(p => p.name === 'Сидр 0,5');
+  assert.equal(sidr.days, 0);
+  assert.equal(sidr.totalDays, 1);
 });
 
 // =====================================================================

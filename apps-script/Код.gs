@@ -3789,8 +3789,17 @@ function stopFloorLabel_(floor) {
 /* ---------- нормализация названий ----------------------------------- */
 
 /**
- * Ключ сравнения: маркер списка, регистр, «ё», знаки препинания, пробелы.
- * Объём («0,3», «40мл») остаётся в ключе: он различает позиции.
+ * Ключ сравнения названий. Приводим ТОЛЬКО то, что не меняет позицию:
+ *   • маркер списка («1. », «- », «• »);
+ *   • регистр («Вишнёвка» = «ВИШНЕВКА»);
+ *   • «ё» → «е» и «Ё» → «Е» (после toLowerCase это одно и то же) —
+ *     «Вишнёвка 40мл» и «Вишневка 40мл» одна позиция;
+ *   • кавычки, дефисы, точки, запятые и другие знаки → пробел;
+ *   • несколько пробелов → один.
+ * НЕ приводим (это разные позиции): объёмы и числа («0,3» ≠ «0,5», «40мл»),
+ * слова («Вино белое» ≠ «Вино белое сухое»), «бут.»/«0,150» и прочие приставки.
+ * Ключ используется только для сравнения — в лист и на экран идёт исходное
+ * написание (см. stopGroupState_).
  */
 function stopNameKey_(s) {
   return stopStripMarker_(s).toLowerCase().replace(/ё/g, 'е')
@@ -3846,36 +3855,6 @@ function stopStemKey_(s) {
   return stopNameKey_(s).split(' ').map(stopStemWord_).join(' ');
 }
 
-/** Расстояние Левенштейна (сколько вставок/удалений/замен). */
-function stopLevenshtein_(a, b) {
-  const s1 = String(a === null || a === undefined ? '' : a);
-  const s2 = String(b === null || b === undefined ? '' : b);
-  if (s1 === s2) return 0;
-  const m = s1.length, n = s2.length;
-  if (!m) return n;
-  if (!n) return m;
-  let prev = new Array(n + 1), cur = new Array(n + 1);
-  for (let j = 0; j <= n; j++) prev[j] = j;
-  for (let i = 1; i <= m; i++) {
-    cur[0] = i;
-    for (let j = 1; j <= n; j++) {
-      const cost = s1.charCodeAt(i - 1) === s2.charCodeAt(j - 1) ? 0 : 1;
-      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
-    }
-    const swap = prev; prev = cur; cur = swap;
-  }
-  return prev[n];
-}
-
-/** Порог опечатки по длине: короткие названия сравниваем строго. */
-function stopMaxDist_(a, b) {
-  const n = Math.min(String(a || '').length, String(b || '').length);
-  if (n <= 4) return 0;
-  if (n <= 8) return 1;
-  if (n <= 14) return 2;
-  return 3;
-}
-
 /**
  * Справочник для сопоставления: все позиции листа «Справочник» с названием.
  * Галочка «Показывать» здесь не важна: скрытая позиция всё равно существует.
@@ -3902,30 +3881,25 @@ function stopDictionary_(ss) {
 }
 
 /**
- * Название → позиция справочника: {name, how, distance} или null.
- * Порядок: точное совпадение ключа → усечённые падежи → опечатки с порогом.
- * Падежи и опечатки принимаем только при совпадении чисел в названии:
- * «0,3 Курпфайц» и «0,5 Курпфайц» — разные позиции и не сливаются.
- * cheap = true — только точное и падежи: так пересчитывать историю дешево.
+ * Название → позиция справочника: {name, how} или null.
+ * Сравниваем ровно две вещи:
+ *   1) нормализованный ключ (регистр, «ё»→«е», пробелы, кавычки, дефисы,
+ *      маркер списка) — точное совпадение;
+ *   2) усечённые падежи («Лимоны» → «Лимон»), но только когда числа в
+ *      названиях совпадают: «0,3 Курпфайц» и «0,5 Курпфайц» не сливаются.
+ * Опечатки, перестановки слов, лишние/недостающие слова и «похожесть»
+ * сознательно НЕ сравниваем: «Сидр» и «Сидер» — разные позиции, «Вино белое»
+ * и «Вино белое сухое» — тоже. Не сопоставилось — позиция сохраняется как
+ * написана и получает «нет в справочнике».
  */
-function stopMatchName_(name, dict, cheap) {
+function stopMatchName_(name, dict) {
   const key = stopNameKey_(name);
   if (!key || !dict) return null;
-  if (dict.byKey[key]) return { name: dict.byKey[key], how: 'exact', distance: 0 };
-  const nums = stopNumbers_(name);
+  if (dict.byKey[key]) return { name: dict.byKey[key], how: 'exact' };
   const stem = stopStemKey_(name);
   const stemHit = dict.byStem[stem];
-  if (stemHit && stopSameNumbers_(name, stemHit)) return { name: stemHit, how: 'stem', distance: 0 };
-  if (cheap) return null;
-  let best = null;
-  (dict.list || []).forEach(function (c) {
-    if (!stopSameNumbers_(nums, c.nums)) return;
-    const d = stopLevenshtein_(key, c.key);
-    if (!best || d < best.distance) best = { name: c.name, key: c.key, distance: d };
-  });
-  if (!best || best.distance <= 0) return null;
-  if (best.distance > stopMaxDist_(key, best.key)) return null;
-  return { name: best.name, how: 'levenshtein', distance: best.distance };
+  if (stemHit && stopSameNumbers_(name, stemHit)) return { name: stemHit, how: 'stem' };
+  return null;
 }
 
 /** «true»/«да»/«перечёркнута» → true; пусто/«нет»/false → false. */
@@ -4190,7 +4164,7 @@ function stopListSavePhotoRows_(ss, auth, id, created, fileUrl, floor, res) {
     // 3. Запись активного стопа.
     const rows = [];
     active.forEach(it => {
-      const match = stopMatchName_(it.name, dict, false);
+      const match = stopMatchName_(it.name, dict);
       const canonical = match ? match.name : '';
       const notes = [];
       if (it.origin === 'stock') notes.push('из остатка 0');
@@ -4278,7 +4252,7 @@ function saveStopListItem_(ss, sheet, auth, rec, id, created, received, comment)
   if (stopIsKitchen_(name, stopKitchenSet_(ss))) {
     return { id, status: 'error', error: '«' + name + '» — позиция кухни, в стоп-лист бара не идёт' };
   }
-  const match = stopMatchName_(name, dict, false);
+  const match = stopMatchName_(name, dict);
   const canonical = match ? match.name : '';
   const key = stopNameKey_(canonical || name);
 
@@ -4325,9 +4299,14 @@ function stopSettings_(ss) {
   };
 }
 
-/** Одно название из счётчика {название: сколько раз} — самое частое. */
-function stopPickName_(names, canonical) {
-  if (canonical) return canonical;
+/**
+ * Как показывать позицию. Правило владельца: на экране — исходное написание,
+ * а не «причёсанное» справочником или нормализацией. Поэтому берём написание
+ * первого появления в записях (строки листа идут в порядке добавления, то есть
+ * по времени); справочник — только для тега «нет в справочнике».
+ */
+function stopPickName_(names, first) {
+  if (first) return first;
   let best = '', bestN = -1;
   Object.keys(names || {}).forEach(k => {
     if (names[k] > bestN) { bestN = names[k]; best = k; }
@@ -4400,7 +4379,7 @@ function stopGroupState_(g, dataDays, lastDataDay, today, settings) {
     .map(r => ({ day: r.day, crossed: r.crossed, source: r.source, name: r.name }));
 
   return {
-    name: stopPickName_(g.names, g.canonical),
+    name: stopPickName_(g.names, g.firstName),
     canonical: g.canonical || '',
     inCatalog: !!g.canonical,
     fromStock: !!g.fromStock,
@@ -4464,16 +4443,20 @@ function stopFloorState_(floor, rowsF, stockF, settings, today, dict) {
   const order = [];
   rowsF.forEach(r => {
     if (!r.name) return;
-    const rematch = !r.catalog ? stopMatchName_(r.name, dict, true) : null;
+    const rematch = !r.catalog ? stopMatchName_(r.name, dict) : null;
     const canonical = r.catalog || (rematch ? rematch.name : '');
     const gkey = canonical ? 'c:' + stopNameKey_(canonical) : 'r:' + stopNameKey_(r.name);
     if (!gkey || gkey === 'r:') return;
     if (!groups[gkey]) {
-      groups[gkey] = { key: gkey, canonical: canonical, names: {}, days: {}, records: [], crossedDays: {}, fromStock: false };
+      groups[gkey] = {
+        key: gkey, canonical: canonical, names: {}, days: {}, records: [],
+        crossedDays: {}, fromStock: false, firstName: '',
+      };
       order.push(gkey);
     }
     const g = groups[gkey];
     if (!g.canonical && canonical) g.canonical = canonical;
+    if (!g.firstName) g.firstName = r.name;
     if (!g.fromStock && /из остатка 0/.test(r.note || '')) g.fromStock = true;
     const label = canonical || r.name;
     g.names[label] = (g.names[label] || 0) + 1;

@@ -3420,6 +3420,8 @@ const STOP_SETTINGS = [
   { key: 'стоплист_проверять_преждевременно', value: 'вкл', note: 'недочёт «убрано преждевременно» — показывать' },
   { key: 'стоплист_проверять_справочник', value: 'вкл', note: 'недочёт «нет в справочнике» — показывать' },
   { key: 'стоплист_проверять_данные', value: 'вкл', note: 'недочёт «нет данных за смену» (снимок не распознан) — показывать' },
+  { key: 'стоплист_пропуск_обрывает', value: 'выкл',
+    note: 'стоп-лист: «вкл» — день без снимка обрывает счёт дней; «выкл» — пропуск не обрывает, но виден как «без данных»' },
   { key: 'стоплист_история_дней', value: '30', note: 'стоп-лист: сколько дней истории позиции показывать в приложении' },
 ];
 
@@ -3986,10 +3988,13 @@ function stopSettings_(ss) {
     if (!raw || !isFinite(n) || n <= 0) return def;
     return Math.min(Math.max(Math.round(n), min), max);
   };
+  // Пропуск дня: пусто = не обрывает (мягкий режим), «вкл» — строгий.
+  const gapRaw = str_(values['стоплист_пропуск_обрывает']);
   return {
     longDays: num('стоплист_долго_дней', STOP_DEFAULT_LONG_DAYS, 1, 60),
     prematureDays: num('стоплист_преждевременно_дней', STOP_DEFAULT_PREMATURE_DAYS, 1, 14),
     historyDays: num('стоплист_история_дней', STOP_DEFAULT_HISTORY_DAYS, 1, 365),
+    gapBreaks: gapRaw ? featureOn_(gapRaw) : false,
     checks: {
       long: featureOn_(values['стоплист_проверять_долго']),
       premature: featureOn_(values['стоплист_проверять_преждевременно']),
@@ -4020,6 +4025,11 @@ function stopGroupState_(g, dataDays, lastDataDay, today, settings) {
   dataDays.forEach(day => {
     const d = g.days[day];
     if (d && d.present) {
+      // Строгий режим: день без данных внутри отрезка обрывает счёт.
+      if (cur && settings.gapBreaks && stopDayDiff_(cur.to, day) > 1) {
+        streaks.push(cur);
+        cur = null;
+      }
       if (!cur) cur = { from: day, to: day, days: 0 };
       cur.to = day;
       cur.days++;

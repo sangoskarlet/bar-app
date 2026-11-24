@@ -556,6 +556,21 @@ test('дни: пропуск дня без данных не обрывает с
   assert.equal(p.gaps, 1);   // один день без данных
 });
 
+test('дни: строгий режим (стоплист_пропуск_обрывает = вкл) обрывает счёт на пропуске', () => {
+  const ss = makeSs();
+  state.ss = ss;
+  addStopRow(ss, { day: dayAgo(3), name: 'Лимоны', catalog: 'Лимоны' });
+  addStopRow(ss, { day: dayAgo(1), name: 'Лимоны', catalog: 'Лимоны' });
+  addStopRow(ss, { day: today(), name: 'Лимоны', catalog: 'Лимоны' });
+  assert.equal(sandbox.stopSettings_(ss).gapBreaks, false, 'по умолчанию мягкий режим');
+  assert.ok(setSetting(ss, 'стоплист_пропуск_обрывает', 'вкл'));
+  const st = sandbox.stopListState_(ss);
+  assert.equal(st.settings.gapBreaks, true);
+  assert.equal(st.current[0].days, 2);        // 23.11 и 24.11, пропуск 22.11 обрывает
+  assert.equal(st.current[0].since, dayAgo(1));
+  assert.equal(st.positions[0].totalDays, 3); // история сохранилась
+});
+
 test('дни: позиция выпала на день (данные есть, её нет) — счёт обнулился, история осталась', () => {
   const ss = makeSs();
   state.ss = ss;

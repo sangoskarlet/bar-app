@@ -34,66 +34,105 @@ function dayAgo(n) {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
-/** Демо-стоп-лист: долгожитель, скорое возвращение, позиция не из справочника. */
+/** Позиция демо-стоп-листа: дни, отрезки, теги. */
+function demoStopItem(o) {
+  const days = o.days || 0;
+  const streaks = o.streaks || (days ? [{ from: o.since, to: dayAgo(0), days: days, gaps: o.gaps || 0 }] : []);
+  return {
+    name: o.name, canonical: o.canonical === undefined ? o.name : o.canonical,
+    inCatalog: o.canonical === undefined ? true : !!o.canonical,
+    days: days, since: o.since || '', span: o.span || days, gaps: o.gaps || 0,
+    long: !!o.long, streaks: streaks,
+    wasCrossed: !!o.wasCrossed, removedAt: o.removedAt || '',
+    premature: o.premature || null, returned: !!o.returned,
+    lastReturnAt: o.lastReturnAt || '', totalDays: o.totalDays || days,
+    lastSeen: o.lastSeen || dayAgo(0), records: o.records || days,
+  };
+}
+
+/**
+ * Демо-стоп-лист: два этажа, долгожитель, возврат после «убрали»,
+ * позиция не из справочника и недочёты по остаткам.
+ */
 function demoStopList(withHistory) {
-  const current = [
-    {
-      name: 'Джин Монки 47', canonical: 'Джин Монки 47', inCatalog: true,
-      days: 4, since: dayAgo(3), span: 4, gaps: 0, long: true, streaks: [{ from: dayAgo(3), to: dayAgo(0), days: 4, gaps: 0 }],
-      wasCrossed: false, removedAt: '', premature: null, returned: false,
-      lastReturnAt: '', totalDays: 4, lastSeen: dayAgo(0), records: 4,
-    },
-    {
-      name: 'Лимоны', canonical: 'Лимоны', inCatalog: true,
-      days: 2, since: dayAgo(1), span: 2, gaps: 0, long: false, streaks: [{ from: dayAgo(1), to: dayAgo(0), days: 2, gaps: 0 }],
-      wasCrossed: false, removedAt: '', premature: null, returned: false,
-      lastReturnAt: '', totalDays: 2, lastSeen: dayAgo(0), records: 2,
-    },
-    {
-      name: 'Просекко', canonical: 'Просекко', inCatalog: true,
-      days: 1, since: dayAgo(0), span: 1, gaps: 0, long: false, streaks: [{ from: dayAgo(3), to: dayAgo(2), days: 2, gaps: 0 }, { from: dayAgo(0), to: dayAgo(0), days: 1, gaps: 0 }],
-      wasCrossed: true, removedAt: dayAgo(1),
+  const f1current = [
+    demoStopItem({
+      name: '0,3 Курпфайц нефильтрованное', days: 4, since: dayAgo(3), long: true,
+      totalDays: 4, records: 4,
+    }),
+    demoStopItem({
+      name: 'Вишневка 40мл', days: 2, since: dayAgo(1), totalDays: 2, records: 2,
+    }),
+    demoStopItem({
+      name: 'Просекко', days: 1, since: dayAgo(0), totalDays: 3, records: 4,
+      wasCrossed: true, removedAt: dayAgo(1), returned: true, lastReturnAt: dayAgo(0),
       premature: { removedAt: dayAgo(1), returnedAt: dayAgo(0), gapDays: 1, beforeDays: 2 },
-      returned: true, lastReturnAt: dayAgo(0), totalDays: 3, lastSeen: dayAgo(0), records: 4,
-    },
-    {
-      name: 'Саке', canonical: '', inCatalog: false,
-      days: 1, since: dayAgo(0), span: 1, gaps: 0, long: false, streaks: [{ from: dayAgo(0), to: dayAgo(0), days: 1, gaps: 0 }],
-      wasCrossed: false, removedAt: '', premature: null, returned: false,
-      lastReturnAt: '', totalDays: 1, lastSeen: dayAgo(0), records: 1,
-    },
+      streaks: [{ from: dayAgo(3), to: dayAgo(2), days: 2, gaps: 0 }, { from: dayAgo(0), to: dayAgo(0), days: 1, gaps: 0 }],
+    }),
+    demoStopItem({ name: 'Саке', canonical: '', days: 1, since: dayAgo(0), totalDays: 1, records: 1 }),
   ];
+  const f2current = [
+    demoStopItem({ name: 'бут. Лондон Прайд', days: 3, since: dayAgo(2), totalDays: 3, records: 3 }),
+    demoStopItem({ name: 'Торт Три Шоколада', days: 1, since: dayAgo(0), totalDays: 1, records: 1 }),
+  ];
+  const stockIssues1 = [
+    { kind: 'zero', day: dayAgo(0), floor: '1', name: 'Чиз-кейк "Нью-Йорк"', qty: 0 },
+    { kind: 'zero', day: dayAgo(0), floor: '1', name: 'бут.Сидр Эйбрахолс яблочный сух.', qty: 0 },
+    { kind: 'stock', day: dayAgo(0), floor: '1', name: 'Вишневка 40мл', qty: 2, stopName: 'Вишневка 40мл' },
+  ];
+
+  const makeFloor = (floor, current, stockIssues) => ({
+    floor: floor,
+    label: floor === '1' ? '1 этаж' : '2 этаж',
+    current: current,
+    long: current.filter(p => p.long),
+    premature: current.filter(p => p.premature),
+    missingCatalog: current.filter(p => !p.inCatalog),
+    returned: current.filter(p => p.returned),
+    noData: floor === '2' ? [{ day: dayAgo(1), time: '23:40', reason: 'квота Gemini (429)', employee: 'Анна' }] : [],
+    stockIssues: stockIssues,
+    issuesCount: current.filter(p => p.long).length + current.filter(p => p.premature).length +
+      current.filter(p => !p.inCatalog).length + stockIssues.length + (floor === '2' ? 1 : 0),
+    totals: {
+      positions: current.length, inStop: current.length, daysWithData: 4,
+      photos: 6, photoShots: 4, manual: 1, stockRows: 8, unreadable: floor === '2' ? 1 : 0, lastDay: dayAgo(0),
+    },
+  });
+
+  const floors = [makeFloor('1', f1current, stockIssues1), makeFloor('2', f2current, [])];
   const out = {
     ok: true,
     today: dayAgo(0),
     updatedAt: new Date().toISOString(),
     settings: {
-      longDays: 3, prematureDays: 2, historyDays: 30,
-      checks: { long: true, premature: true, catalog: true, data: true },
+      longDays: 3, prematureDays: 2, historyDays: 30, gapBreaks: false,
+      checks: { zero: true, stock: true, long: true, premature: true, catalog: true, data: true },
     },
-    current,
-    long: current.filter(p => p.long),
-    premature: current.filter(p => p.premature),
-    missingCatalog: current.filter(p => !p.inCatalog),
-    returned: current.filter(p => p.returned),
-    noData: [{ day: dayAgo(1), time: '23:40', reason: 'квота Gemini (429)', employee: 'Анна' }],
-    totals: { positions: 5, inStop: 4, daysWithData: 5, photos: 8, photoShots: 5, manual: 1, unreadable: 1, lastDay: dayAgo(0) },
+    floors: floors,
+    summary: floors.map(f => ({ floor: f.floor, label: f.label, inStop: f.current.length, long: f.long.length, issues: f.issuesCount })),
+    totals: { floors: 2, positions: 6, inStop: 6, photos: 12, manual: 1, stockRows: 8, unreadable: 1 },
   };
   if (withHistory) {
     out.history = {
-      'Джин Монки 47': [0, 1, 2, 3].map(n => ({ day: dayAgo(n), crossed: false, source: 'фото', name: 'Джин Монки 47' })),
-      'Лимоны': [0, 1].map(n => ({ day: dayAgo(n), crossed: false, source: 'фото', name: 'Лимоны' })),
-      'Просекко': [
-        { day: dayAgo(3), crossed: false, source: 'фото', name: 'Просекко' },
-        { day: dayAgo(2), crossed: false, source: 'фото', name: 'Просекко' },
-        { day: dayAgo(1), crossed: true, source: 'фото', name: 'Просекко' },
-        { day: dayAgo(0), crossed: false, source: 'фото', name: 'Просекко' },
-      ],
-      'Саке': [{ day: dayAgo(0), crossed: false, source: 'ручной ввод', name: 'Саке' }],
-      'Апероль': [
-        { day: dayAgo(6), crossed: false, source: 'фото', name: 'Апероль' },
-        { day: dayAgo(7), crossed: false, source: 'фото', name: 'Апероль' },
-      ],
+      '1': {
+        '0,3 Курпфайц нефильтрованное': [0, 1, 2, 3].map(n => ({ day: dayAgo(n), crossed: false, source: 'фото', name: '0,3 Курпфайц нефильтрованное' })),
+        'Вишневка 40мл': [0, 1].map(n => ({ day: dayAgo(n), crossed: false, source: 'фото', name: 'Вишневка 40мл' })),
+        'Просекко': [
+          { day: dayAgo(3), crossed: false, source: 'фото', name: 'Просекко' },
+          { day: dayAgo(2), crossed: false, source: 'фото', name: 'Просекко' },
+          { day: dayAgo(1), crossed: true, source: 'фото', name: 'Просекко' },
+          { day: dayAgo(0), crossed: false, source: 'фото', name: 'Просекко' },
+        ],
+        'Саке': [{ day: dayAgo(0), crossed: false, source: 'ручной ввод', name: 'Саке' }],
+        'Апероль': [
+          { day: dayAgo(6), crossed: false, source: 'фото', name: 'Апероль' },
+          { day: dayAgo(7), crossed: false, source: 'фото', name: 'Апероль' },
+        ],
+      },
+      '2': {
+        'бут. Лондон Прайд': [0, 1, 2].map(n => ({ day: dayAgo(n), crossed: false, source: 'фото', name: 'бут. Лондон Прайд' })),
+        'Торт Три Шоколада': [{ day: dayAgo(0), crossed: false, source: 'фото', name: 'Торт Три Шоколада' }],
+      },
     };
   }
   return out;
@@ -221,26 +260,38 @@ const server = http.createServer((req, res) => {
           return json(res, { ok: true, duplicate: false, results: [{ id: b.id, status: 'saved' }] });
         }
         if (b.action === 'submit') {
-          // Снимок стоп-листа: отдаём то, что «распознала» модель, чтобы
-          // экран результата было на чём проверить.
+          // Снимок стоп-листа: отдаём то, что «распознала» модель (обе
+          // колонки), чтобы экран результата было на чём проверить.
           const results = (b.records || []).map(r => {
             if (r.type === 'photo' && (r.stopList === true || r.zone === 'Стоп-лист')) {
+              const floor = String(r.floor || '1');
               return {
                 id: r.id, status: 'saved',
                 verdict: {
-                  level: 'stoplist', verdict: 'стоп-лист', confidence: 0.88,
-                  notes: 'распознано позиций: 3, перечёркнуто: 1, нет в справочнике: 1',
+                  level: 'stoplist', verdict: 'стоп-лист', confidence: null,
+                  notes: 'стоп-лист: 13, остатки: 8, недочётов: 2',
                   items: [], model: 'gemini-flash-lite-latest',
                   checkedAt: new Date().toISOString(), reference: '', references: [], error: '',
                 },
                 stoplist: {
                   ok: true, reason: '', unreadable: '', model: 'gemini-flash-lite-latest',
-                  confidence: 0.88, day: dayAgo(0),
-                  summary: 'распознано позиций: 3, перечёркнуто: 1, нет в справочнике: 1',
-                  items: [
-                    { name: 'джин монки', canonical: 'Джин Монки 47', inCatalog: true, crossedOut: false, confidence: 0.94, note: '' },
-                    { name: 'Просеко', canonical: 'Просекко', inCatalog: true, crossedOut: true, confidence: 0.81, note: '' },
-                    { name: 'Саке', canonical: '', inCatalog: false, crossedOut: false, confidence: 0.62, note: 'нет в справочнике' },
+                  day: dayAgo(0), floor: floor,
+                  summary: 'стоп-лист: 13, остатки: 8, недочётов: 2',
+                  stop: [
+                    { name: '0,3 Курпфайц нефильтрованное', canonical: '', inCatalog: false },
+                    { name: '0,5 Курпфайц нефильтрованное', canonical: '', inCatalog: false },
+                    { name: 'бут. Бридог ИПА 0,33', canonical: '', inCatalog: false },
+                    { name: 'Вишневка 40мл', canonical: '', inCatalog: false },
+                  ],
+                  stock: [
+                    { name: '0,150 Домен Брюне Шинон', qty: 3 },
+                    { name: 'Чиз-кейк "Нью-Йорк"', qty: 0 },
+                    { name: 'бут.Сидр Эйбрахолс яблочный сух.', qty: 0 },
+                    { name: 'Штрудель Яблочный', qty: 4 },
+                  ],
+                  issues: [
+                    { kind: 'zero', name: 'Чиз-кейк "Нью-Йорк"', qty: 0 },
+                    { kind: 'zero', name: 'бут.Сидр Эйбрахолс яблочный сух.', qty: 0 },
                   ],
                 },
               };

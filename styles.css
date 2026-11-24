@@ -699,7 +699,18 @@ textarea { margin-top: 16px; resize: vertical; }
 }
 .stop-issue-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--wait); margin-top: 6px; flex: none; }
 .stop-issue.long .stop-issue-dot, .stop-issue.premature .stop-issue-dot, .stop-issue.catalog .stop-issue-dot { background: var(--bad); }
+.stop-issue.zero .stop-issue-dot, .stop-issue.stock .stop-issue-dot { background: var(--bad); }
 .stop-issue.data .stop-issue-dot { background: var(--muted); }
+
+.stop-floors { margin: 2px 0 4px; }
+.stop-floor-chips { margin-top: 6px; }
+.stop-floor-block { display: flex; flex-direction: column; gap: 8px; }
+.stop-floor-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; margin-top: 6px; }
+.stop-floor-label { margin: 0; }
+.stop-floor-day { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.stop-result-qty { margin-left: auto; font-variant-numeric: tabular-nums; font-weight: 600; }
+.stop-result-qty.zero { color: var(--bad); }
+.stop-result-issues { margin-top: 14px; }
 
 .stop-past { display: flex; flex-direction: column; gap: 6px; }
 .stop-past .chips { gap: 6px; }

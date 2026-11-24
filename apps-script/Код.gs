@@ -58,6 +58,7 @@ const SHEETS = {
   settings:  'Настройки',           // разделы приложения вкл/выкл (создаётся автоматически)
   pairs:     'Пары позиций',        // позиции, которые взвешивают вместе: мята — листья и ветки
   stopList:  'Стоп-лист',           // что закончилось: фото стоп-листа, позиции, дни в стопе
+  stopStock: 'Стоп-лист — остатки', // количества из колонки «Блюда на остатке» (для недочётов)
 };
 
 // В каком столбце листа лежит ID записи (считаем с 1: A=1, B=2 ...).
@@ -69,7 +70,7 @@ const ID_COLUMN = {
   inventory: 16, // Подсчёт: P
   processing: 11, // Акты переработки: K
   processingClose: 16, // Акты переработки: P «ID закрытия» (закрытие акта, где выход записали позже)
-  stoplist: 10, // Стоп-лист: J
+  stoplist: 11, // Стоп-лист: K «id» (после «этаж»)
 };
 
 const DIRECTIONS = ['Кухня → Бар', 'Бар → Кухня'];
@@ -1765,22 +1766,24 @@ function savePhoto_(ss, sheet, auth, rec, id, created, received, comment) {
     SpreadsheetApp.newRichTextValue().setText('Открыть фото').setLinkUrl(file.getUrl()).build());
 
   // Стоп-лист: чистоту зоны не проверяем, распознаём текст. Эталоны не нужны.
+  // Этаж — часть записи: стоп-лист свой на каждом этаже.
   if (stopList) {
+    const stopFloor = stopFloorNorm_(rec.floor || rec['этаж']) || '1';
     const res = stopListRecognize_(Utilities.newBlob(bytes, m[1], fileName), file.getId());
-    let saved = { items: [], day: stopDayKey_(created) };
+    let saved = { stop: [], stock: [], issues: [], day: stopDayKey_(created), floor: stopFloor };
     try {
-      saved = stopListSavePhotoRows_(ss, auth, id, created, file.getUrl(), res);
+      saved = stopListSavePhotoRows_(ss, auth, id, created, file.getUrl(), stopFloor, res);
     } catch (e) {
       log_('Стоп-лист', 'позиции не записались: ' + e);
     }
-    const summary = stopPhotoSummary_(res, saved.items);
+    const summary = stopPhotoSummary_(res, saved);
     writeStopPhotoVerdict_(sheet, photoRow, res, summary);
     return {
       id, status: 'saved', fileId: file.getId(), zone: zonePlain,
       verdict: {
         level: res.ok ? 'stoplist' : 'unclear',
         verdict: 'стоп-лист',
-        confidence: res.ok && res.confidence !== null ? res.confidence : null,
+        confidence: null,
         notes: summary,
         items: [],
         model: res.model || '',
@@ -1791,8 +1794,13 @@ function savePhoto_(ss, sheet, auth, rec, id, created, received, comment) {
       },
       stoplist: {
         ok: !!res.ok, reason: str_(res.reason), unreadable: str_(res.unreadable),
-        model: str_(res.model), confidence: res.ok ? res.confidence : null,
-        day: saved.day || stopDayKey_(created), items: saved.items, summary: summary,
+        model: str_(res.model),
+        day: saved.day || stopDayKey_(created),
+        floor: saved.floor || stopFloor,
+        stop: saved.stop || [],
+        stock: saved.stock || [],
+        issues: saved.issues || [],
+        summary: summary,
       },
     };
   }
@@ -2140,7 +2148,7 @@ function setup() {
   // «Сроки хранения» — при первом чтении справочника (ensureShelfLifeSheet_).
   const auto = ['refs', 'refPhotos', 'questions', 'disputes', 'duels', 'ratings', 'quizTries',
     'characters', 'itemCatalog', 'inventory', 'shelfLife', 'facts', 'checklists', 'checklistMarks',
-    'settings', 'stopList'];
+    'settings', 'stopList', 'stopStock'];
   const missing = Object.keys(SHEETS).filter(k => auto.indexOf(k) === -1)
     .map(k => SHEETS[k]).filter(n => !ss.getSheetByName(n));
   if (missing.length) throw new Error('В таблице нет листов: ' + missing.join(', '));
@@ -3324,91 +3332,102 @@ function photoLevelFromSheet_(v) {
 
 
 /* =====================================================================
- *  СТОП-ЛИСТ ПО ФОТО — что закончилось, как давно и когда убрали
+ *  СТОП-ЛИСТ ПО ФОТО — две колонки, этажи, дни в стопе
  * =====================================================================
  *
- *  Зачем: в конце смены бармен фотографирует стоп-лист — лист бумаги или
- *  доску, где перечислено, чего нет в наличии (перечёркнутое — уже убрали).
- *  Приложение распознаёт позиции, ведёт историю и считает, сколько дней
- *  позиция стоит в стопе. Владельцу это нужно, чтобы вовремя заказать
- *  товар, а не узнать о проблеме через неделю.
+ *  Реальное фото владельца: снимок экрана планшета (POS), две колонки:
+ *    «Блюда на остатке» — позиция и количество (0.00 = закончилось);
+ *    «СТОП-ЛИСТ»        — только позиции, без количеств.
+ *  Отсюда главная проверка «неправильно убрано»: остаток 0.00, а в
+ *  стоп-листе позиции нет. И обратная: позиция в стопе, а остаток есть.
  *
- *  КАК ПОПАДАЕТ В ПРИЛОЖЕНИЕ
- *    На экране «Фото уборки» есть переключатель «📷 Фото зоны / 📋 Стоп-лист».
- *    Снимок в режиме стоп-листа:
- *      — сохраняется как обычно: файл на Диске + строка в «Фото уборки»
- *        (зона записывается как «Стоп-лист»);
- *      — НЕ проверяется на чистоту зоны: эталон и критерии ему не нужны,
- *        поэтому отдельная зона в «Эталонах уборки» не требуется;
- *      — уходит на распознавание текста (Gemini).
- *    Дополнительный лист в «Списках» и «Эталонах уборки» создавать не надо:
- *    приложение само помечает снимок как стоп-лист (rec.stopList = true).
+ *  ПОЧЕМУ ДВЕ КОЛОНКИ
+ *    Количество — единственный признак, по которому видно, что товар
+ *    кончился, а в стоп его забыли поставить. Без остатков «неправильно
+ *    убрано» не проверить, поэтому модель читает обе колонки и возвращает
+ *    их раздельно: {"stock":[{"name","qty"}],"stop":[{"name"}],
+ *    "unreadable":""}. Количества — числа (3.00 → 3, 0.00 → 0); если число
+ *    не читается — qty пустой (не ноль!), чтобы не выдумать «закончилось».
  *
- *  ЛИСТ «Стоп-лист» (создаётся автоматически при первом чтении config)
- *    дата | смена/время | сотрудник | позиция | позиция_в_справочнике |
- *    перечёркнута | уверенность | фото | источник |
- *    id | день | модель | заметка            ← служебные, добавлены справа
- *      id      — ID записи с телефона: повторный тот же снимок не даёт дублей;
- *      день    — дата «2026-11-24» по Москве, по ней считаются дни в стопе;
- *      модель  — какая модель распознала (для разбора);
- *      заметка — причина «не распознано» или «нет в справочнике».
- *    Одна строка = одна позиция одного снимка. Строка без позиции и с
- *    источником «не распознано» — это отметка, что снимок был, но текст не
- *    прочитался: день не считается данными, а в недочётах появляется
- *    «нет данных за смену».
+ *  ЭТАЖИ
+ *    Стоп-лист свой на каждом этаже (владелец: «добавить каждому этажу
+ *    этот пункт»). На экране фото — выбор этажа до снимка; в листе
+ *    «Стоп-лист» — колонка «этаж»; дни считаются в разрезе этаж + позиция.
+ *    То, что в стопе на втором этаже, не значит стоп на первом.
  *
- *  РАСПОЗНАВАНИЕ (ключ GEMINI_API_KEY в свойствах скрипта, как у фото уборки)
- *    Ответ модели — строго JSON:
- *      {"items":[{"name":"…","crossed_out":true|false,"confidence":0..1}],
- *       "unreadable":"…"}
- *    Модель НЕ нормализует названия: пишет как видит. Сопоставление со
- *    справочником делает сервер: регистр, «ё», падежи (усечение окончаний)
- *    и опечатки (расстояние Левенштейна с порогом по длине). Не нашлось —
- *    позиция пишется как есть и помечается «нет в справочнике».
- *    Квота (429), таймаут и любой сбой: пишется строка «не распознано» с
- *    причиной, фото и запись остаются, смена не блокируется.
+ *  ЛИСТЫ
+ *    «Стоп-лист»:
+ *      дата | смена/время | сотрудник | позиция | позиция_в_справочнике |
+ *      перечёркнута | уверенность | фото | источник | этаж |
+ *      id | день | модель | заметка        ← служебные, справа
+ *      первые девять колонок — как в задании, «этаж» добавлен десятым.
+ *      Строка = позиция стоп-листа (фото или ручной ввод). Строка без
+ *      позиции и с источником «не распознано» — отметка, что снимок был,
+ *      но текст не прочитался.
+ *    «Стоп-лист — остатки» (создаётся автоматически):
+ *      дата | смена/время | сотрудник | этаж | позиция | количество |
+ *      фото | id | день | модель
+ *      Строка = позиция из колонки «Блюда на остатке» с количеством.
+ *      В текущий стоп-лист и в счётчик дней эти строки не попадают — они
+ *      нужны только для проверок остатка.
  *
- *  ДНИ В СТОПЕ (см. stopListState_)
+ *  НАЗВАНИЯ
+ *    Модель пишет как видно, с объёмом и «бут.». Объём отличает позиции
+ *    («0,3 Курпфайц» ≠ «0,5 Курпфайц»), поэтому его НЕ отрезаем.
+ *    Приведение — только регистр, «ё», кавычки, дефисы, лишние пробелы и
+ *    маркер списка («1. », «- »). Справочник используется для подсказки;
+ *    сравнение — точное, по падежам и по опечаткам с порогом, но только
+ *    когда числа в названиях совпадают: 0,3 и 0,5 никогда не сливаются.
+ *    Не сопоставилось — позиция пишется как есть и помечается
+ *    «нет в справочнике».
+ *
+ *  ДНИ В СТОПЕ (в разрезе этаж + позиция)
  *    «День с данными» — календарная дата по Москве, на которую есть хотя бы
- *    одна запись с позицией (фото или ручной ввод). Для каждой позиции идём
- *    по дням с данными от последнего к первому:
- *      • позиция есть и НЕ перечёркнута  → +1 день, идём дальше;
- *      • позиция есть, но перечёркнута   → счёт закончен (её убрали);
- *      • позиции в этот день нет         → счёт закончен (выпала);
- *      • дня с данными нет вовсе         → день не считаем и счёт НЕ обрываем
- *        (снимка не было или он не распознан — это наша недоработка, а не
- *        факт по позиции). Сколько смен пропущено, видно в поле gaps.
- *    Поэтому «дней в стопе» = число смен с подтверждением, а не разница дат.
- *    Если позиция выпала, счётчик обнуляется, но прошлый отрезок остаётся в
- *    истории: streaks [{from,to,days}], totalDays, «была N дней до этого».
+ *    одна запись стоп-листа ЭТОГО этажа. Одна позиция = одна запись в день:
+ *    повторный снимок в тот же день счётчик не увеличивает (но обновляет
+ *    данные — новая строка дня перекрывает старую).
+ *    Идём по дням с данными от последнего к первому: позиция есть и не
+ *    перечёркнута → +1; день с данными, где позиции нет → счёт закончен;
+ *    дня с данными нет вовсе → день не считаем и счёт не обрываем (видно
+ *    в gaps). Если позиция выпала, счётчик обнуляется, но прошлый отрезок
+ *    остаётся в истории («была N дней до этого»).
  *
- *  НЕДОЧЁТЫ (только помечаем и показываем, ничего не блокируем)
- *    Всё настраивается в листе «Настройки» (флаги «вкл/выкл» и числа):
- *      стоплист_долго_дней            (3)  — с какого числа дней «долго в стопе»;
- *      стоплист_преждевременно_дней   (2)  — окно «убрано преждевременно»;
- *      стоплист_проверять_долго       вкл  — недочёт «долго в стопе»;
- *      стоплист_проверять_преждевременно вкл — «убрано преждевременно»
- *                                             (перечеркнули и вернули в 1–2 дня);
- *      стоплист_проверять_справочник  вкл  — «недочёт номенклатуры»;
- *      стоплист_проверять_данные      вкл  — «нет данных за смену»;
- *      стоплист_история_дней          (30) — сколько дней истории показывать.
+ *  НЕДОЧЁТЫ (только помечаем, ничего не блокируем; всё настраивается)
+ *    стоплист_проверять_нулевой_остаток  вкл — «нет в стопе при нулевом остатке»
+ *    стоплист_проверять_остаток_в_стопе  вкл — «в стопе, а остаток есть»
+ *    стоплист_проверять_долго            вкл — «долго в стопе»
+ *    стоплист_проверять_преждевременно   вкл — «убрано преждевременно»
+ *    стоплист_проверять_справочник        вкл — «нет в справочнике»
+ *    стоплист_проверять_данные            вкл — «нет данных за смену»
+ *    стоплист_долго_дней                   3 — порог «долго»
+ *    стоплист_преждевременно_дней          2 — окно «убрали и вернули»
+ *    стоплист_пропуск_обрывает           выкл — строгий режим пропуска дня
+ *    стоплист_история_дней                30 — сколько дней истории в приложении
  * ===================================================================== */
 
 const STOP_ZONE = 'Стоп-лист';
+
+// Лист «Стоп-лист». Первые девять колонок — как в задании, дальше служебные.
 const STOP_HEADERS = ['дата', 'смена/время', 'сотрудник', 'позиция', 'позиция_в_справочнике',
-  'перечёркнута', 'уверенность', 'фото', 'источник', 'id', 'день', 'модель', 'заметка'];
+  'перечёркнута', 'уверенность', 'фото', 'источник', 'этаж', 'id', 'день', 'модель', 'заметка'];
 const STOP_HEADER_KEYS = ['date', 'time', 'employee', 'name', 'catalog', 'crossed', 'confidence',
-  'photo', 'source', 'id', 'day', 'model', 'note'];
+  'photo', 'source', 'floor', 'id', 'day', 'model', 'note'];
+
+// Лист остатков из колонки «Блюда на остатке».
+const STOP_STOCK_HEADERS = ['дата', 'смена/время', 'сотрудник', 'этаж', 'позиция',
+  'количество', 'фото', 'id', 'день', 'модель'];
+const STOP_STOCK_KEYS = ['date', 'time', 'employee', 'floor', 'name', 'qty', 'photo', 'id', 'day', 'model'];
+
 const STOP_SOURCE_PHOTO = 'фото';
 const STOP_SOURCE_MANUAL = 'ручной ввод';
 const STOP_SOURCE_UNREADABLE = 'не распознано';
-const STOP_MAX_ITEMS = 40;            // больше позиций с одного снимка не принимаем
+const STOP_MAX_ITEMS = 60;            // больше позиций с одного снимка не принимаем
 const STOP_ANALYSIS_DAYS = 180;       // старше — в расчёт дней не берём
-const STOP_CONFIDENCE_MIN = 0.5;      // ниже — помечаем «низкая уверенность»
-const STOP_WALK_GUARD = 400;          // страховка от бесконечного цикла
+const STOP_ISSUE_DAYS = 14;           // остатки и «недочёты» смотрим за две недели
 const STOP_DEFAULT_LONG_DAYS = 3;
 const STOP_DEFAULT_PREMATURE_DAYS = 2;
 const STOP_DEFAULT_HISTORY_DAYS = 30;
+const STOP_STANDARD_FLOORS = ['1', '2'];
 
 /** Настройки стоп-листа: дописываются в лист «Настройки», если их там нет. */
 const STOP_SETTINGS = [
@@ -3416,6 +3435,10 @@ const STOP_SETTINGS = [
     note: 'стоп-лист: с какого числа дней подряд позиция считается «долго в стопе»' },
   { key: 'стоплист_преждевременно_дней', value: '2',
     note: 'стоп-лист: вернулась в течение стольких дней после «убрали» — «убрано преждевременно» (1–3)' },
+  { key: 'стоплист_проверять_нулевой_остаток', value: 'вкл',
+    note: 'недочёт «нет в стопе при нулевом остатке» (остаток 0.00, а в стоп-листе позиции нет) — показывать' },
+  { key: 'стоплист_проверять_остаток_в_стопе', value: 'вкл',
+    note: 'недочёт «в стопе, а остаток есть» (возможно, забыли убрать) — показывать' },
   { key: 'стоплист_проверять_долго', value: 'вкл', note: 'недочёт «долго в стопе» — показывать' },
   { key: 'стоплист_проверять_преждевременно', value: 'вкл', note: 'недочёт «убрано преждевременно» — показывать' },
   { key: 'стоплист_проверять_справочник', value: 'вкл', note: 'недочёт «нет в справочнике» — показывать' },
@@ -3425,34 +3448,85 @@ const STOP_SETTINGS = [
   { key: 'стоплист_история_дней', value: '30', note: 'стоп-лист: сколько дней истории позиции показывать в приложении' },
 ];
 
-/* ---------- лист и его колонки -------------------------------------- */
+/* ---------- листы и их колонки -------------------------------------- */
 
-/** Лист «Стоп-лист»: создаётся при первом обращении, шапка не дублируется. */
+/** Лист «Стоп-лист»: создаётся сам, шапка не дублируется, «этаж» — миграцией. */
 function ensureStopSheet_(ss) {
   let sh = ss.getSheetByName(SHEETS.stopList);
   if (!sh) {
     sh = ss.insertSheet(SHEETS.stopList);
     log_('Стоп-лист', 'создан лист «' + SHEETS.stopList + '»');
   }
-  if (!str_(sh.getRange(1, 1).getValue())) {
-    sh.getRange(1, 1, 1, STOP_HEADERS.length).setValues([STOP_HEADERS]).setFontWeight('bold');
+  const width = Math.max(sh.getLastColumn(), 1);
+  const head = sh.getRange(1, 1, 1, width).getValues()[0]
+    .map(v => str_(v).toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' '));
+  const want = STOP_HEADERS.map(h => h.replace(/ё/g, 'е'));
+  const empty = sh.getLastRow() < 2;
+  const same = want.every(function (h, i) { return head[i] === h; });
+
+  if (empty && !same) {
+    // Данных нет — просто пишем новую шапку (в том числе добавляем «этаж»).
+    const cols = Math.max(sh.getLastColumn(), STOP_HEADERS.length);
+    const row = STOP_HEADERS.concat(new Array(Math.max(0, cols - STOP_HEADERS.length)).fill(''));
+    sh.getRange(1, 1, 1, row.length).setValues([row]).setFontWeight('bold');
+    log_('Стоп-лист', 'шапка «' + SHEETS.stopList + '» приведена к новой схеме (этаж)');
+  } else if (!empty) {
+    // Есть данные — порядок не трогаем, недостающие колонки дописываем справа.
+    const have = {};
+    head.forEach(function (h) { if (h) have[h] = true; });
+    let at = sh.getLastColumn();
+    STOP_HEADERS.forEach(function (name) {
+      if (have[name.replace(/ё/g, 'е')]) return;
+      at++;
+      sh.getRange(1, at).setValue(name).setFontWeight('bold');
+      log_('Стоп-лист', 'в «' + SHEETS.stopList + '» добавлена колонка «' + name + '»');
+    });
+  }
+  if (empty) {
+    const widths = [110, 90, 150, 230, 230, 110, 100, 80, 130, 80, 250, 100, 150, 280];
+    widths.forEach(function (w, i) { sh.setColumnWidth(i + 1, w); });
     sh.setFrozenRows(1);
-    const widths = [110, 90, 150, 230, 230, 110, 100, 80, 130, 250, 100, 150, 280];
-    widths.forEach((w, i) => sh.setColumnWidth(i + 1, w));
   }
   return sh;
 }
 
-/** Колонки ищутся по названию в шапке: владелец может переставить их местами. */
+/** Лист «Стоп-лист — остатки»: создаётся сам при первой записи/чтении. */
+function ensureStopStockSheet_(ss) {
+  let sh = ss.getSheetByName(SHEETS.stopStock);
+  if (sh) {
+    if (!str_(sh.getRange(1, 1).getValue())) {
+      sh.getRange(1, 1, 1, STOP_STOCK_HEADERS.length).setValues([STOP_STOCK_HEADERS]).setFontWeight('bold');
+      sh.setFrozenRows(1);
+    }
+    return sh;
+  }
+  sh = ss.insertSheet(SHEETS.stopStock);
+  sh.getRange(1, 1, 1, STOP_STOCK_HEADERS.length).setValues([STOP_STOCK_HEADERS]).setFontWeight('bold');
+  sh.setFrozenRows(1);
+  const widths = [110, 90, 150, 80, 260, 100, 80, 250, 100, 150];
+  widths.forEach(function (w, i) { sh.setColumnWidth(i + 1, w); });
+  log_('Стоп-лист', 'создан лист «' + SHEETS.stopStock + '»');
+  return sh;
+}
+
+/** Колонки листа «Стоп-лист» по шапке (порядок можно менять). */
 function stopColumnMap_(sheet) {
-  const width = Math.max(sheet.getLastColumn(), STOP_HEADERS.length);
+  return stopMapByHeaders_(sheet, STOP_HEADERS, STOP_HEADER_KEYS);
+}
+
+/** Колонки листа «Стоп-лист — остатки» по шапке. */
+function stopStockColumnMap_(sheet) {
+  return stopMapByHeaders_(sheet, STOP_STOCK_HEADERS, STOP_STOCK_KEYS);
+}
+
+function stopMapByHeaders_(sheet, headers, keys) {
+  const width = Math.max(sheet.getLastColumn(), headers.length);
   const head = sheet.getRange(1, 1, 1, width).getValues()[0]
     .map(v => str_(v).toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' '));
   const out = {};
-  STOP_HEADERS.forEach((name, i) => {
-    const want = name.toLowerCase().replace(/ё/g, 'е');
-    const idx = head.indexOf(want);
-    out[STOP_HEADER_KEYS[i]] = idx >= 0 ? idx + 1 : i + 1;
+  headers.forEach(function (name, i) {
+    const idx = head.indexOf(name.toLowerCase().replace(/ё/g, 'е'));
+    out[keys[i]] = idx >= 0 ? idx + 1 : i + 1;
   });
   return out;
 }
@@ -3472,7 +3546,7 @@ function stopAppendRows_(sheet, rows) {
   return start;
 }
 
-/** Строка для ячейки: начинается с «=»/«+»/«−»/«@» — ставим апостроф, чтобы не стала формулой. */
+/** Строка для ячейки: начинается с «=»/«+»/«−»/«@» — апостроф, чтобы не стала формулой. */
 function stopCell_(v) {
   const s = str_(v);
   return s && /^[=+\-@]/.test(s) ? "'" + s : s;
@@ -3503,8 +3577,9 @@ function stopRows_(sheet) {
     const conf = rawConf === '' || rawConf === null || rawConf === undefined ? null : Number(rawConf);
     out.push({
       row: i + 2, at: date, day: day, time: str_(r[cols.time - 1]),
-      employee: stopPlain_(r[cols.employee - 1]), name: name,
-      catalog: stopPlain_(r[cols.catalog - 1]),
+      employee: stopPlain_(r[cols.employee - 1]),
+      floor: stopFloorNorm_(r[cols.floor - 1]),
+      name: name, catalog: stopPlain_(r[cols.catalog - 1]),
       crossed: stopCrossed_(r[cols.crossed - 1]),
       confidence: conf !== null && isFinite(conf) ? conf : null,
       photo: str_(r[cols.photo - 1]), source: source,
@@ -3515,7 +3590,36 @@ function stopRows_(sheet) {
   return out;
 }
 
-/* ---------- даты ----------------------------------------------------- */
+/** Строки листа «Стоп-лист — остатки» в виде объектов. */
+function stopStockRows_(ss) {
+  const sh = ss.getSheetByName(SHEETS.stopStock);
+  if (!sh || sh.getLastRow() < 2) return [];
+  const cols = stopStockColumnMap_(sh);
+  const width = Math.max(sh.getLastColumn(), STOP_STOCK_HEADERS.length);
+  const out = [];
+  sh.getRange(2, 1, sh.getLastRow() - 1, width).getValues().forEach((r, i) => {
+    const rawDate = r[cols.date - 1];
+    const date = rawDate instanceof Date ? rawDate : (rawDate ? new Date(rawDate) : null);
+    const day = str_(r[cols.day - 1]) ||
+      (date && !isNaN(date.getTime()) ? stopDayKey_(date) : '');
+    if (!day) return;
+    const name = stopPlain_(r[cols.name - 1]);
+    if (!name) return;
+    const rawQty = r[cols.qty - 1];
+    const qty = rawQty === '' || rawQty === null || rawQty === undefined ? null : stopQty_(rawQty);
+    out.push({
+      row: i + 2, day: day, time: str_(r[cols.time - 1]),
+      employee: stopPlain_(r[cols.employee - 1]),
+      floor: stopFloorNorm_(r[cols.floor - 1]),
+      name: name, qty: qty,
+      id: stopPlain_(r[cols.id - 1]),
+      model: str_(r[cols.model - 1]),
+    });
+  });
+  return out;
+}
+
+/* ---------- даты и этажи -------------------------------------------- */
 
 /** Календарный день по Москве: Date → «2026-11-24». */
 function stopDayKey_(date) {
@@ -3540,12 +3644,27 @@ function stopDayDiff_(from, to) {
   return Math.round((Date.UTC(+b[1], +b[2] - 1, +b[3]) - Date.UTC(+a[1], +a[2] - 1, +a[3])) / 86400000);
 }
 
+/** Этаж: «1», «1 этаж», «2 ЭТАЖ» → '1'/'2'; пусто → ''. */
+function stopFloorNorm_(v) {
+  const s = str_(v).toLowerCase().replace(/ё/g, 'е');
+  if (!s) return '';
+  const m = /(\d+)/.exec(s);
+  if (m) return String(Number(m[1]));
+  return s.slice(0, 40);
+}
+
+/** Подпись этажа: '1' → «1 этаж». */
+function stopFloorLabel_(floor) {
+  const f = str_(floor);
+  if (!f) return 'Без этажа';
+  return /^\d+$/.test(f) ? f + ' этаж' : f;
+}
+
 /* ---------- нормализация названий ----------------------------------- */
 
 /**
- * Ключ сравнения: регистр, «ё», знаки препинания, лишние пробелы.
- * Заодно снимаем маркер списка («1. », «2) », «— », «• »): на фото стоп-лист
- * часто нумерованный, и «1. Джин» — это та же позиция, что «Джин».
+ * Ключ сравнения: маркер списка, регистр, «ё», знаки препинания, пробелы.
+ * Объём («0,3», «40мл») остаётся в ключе: он различает позиции.
  */
 function stopNameKey_(s) {
   return stopStripMarker_(s).toLowerCase().replace(/ё/g, 'е')
@@ -3558,29 +3677,25 @@ function stopStripMarker_(s) {
   return str_(s).replace(/^\s*(?:\d{1,3}[.)\]:]|[-–—•*·])\s+/, '').trim();
 }
 
-/** Хвост «объём/упаковка» в названии: «0,5», «0.5 л», «1 л», «бут.». */
-const STOP_VOL_TAIL = /\s+(?:(?:\d{1,3}[.,]\d{1,2})\s*(?:л|мл|г|кг|шт|бут\.?)?|\d{1,3}\s*(?:л|мл|г|кг|шт|бут\.?)|бут\.?)$/i;
-
-/**
- * Варианты ключа для сопоставления: как есть и без объёма в конце
- * («джин монки 47 0,5» → «джин монки 47»). Целое число в конце не трогаем:
- * «Джин Монки 47» — часть названия, а не объём.
- */
-function stopNameVariants_(s) {
+/** Числа из названия, нормализованные: «0,3» → 0.3, «33%» → 33. */
+function stopNumbers_(s) {
   const out = [];
-  const add = function (v) {
-    const k = stopNameKey_(v);
-    if (k && out.indexOf(k) < 0) out.push(k);
-  };
-  let raw = str_(s);
-  add(raw);
-  for (let i = 0; i < 3; i++) {
-    const cut = raw.replace(STOP_VOL_TAIL, '').trim();
-    if (!cut || cut === raw) break;
-    raw = cut;
-    add(raw);
+  const re = /\d+(?:[.,]\d+)?/g;
+  let m;
+  while ((m = re.exec(str_(s))) !== null) {
+    const n = Number(String(m[0]).replace(',', '.'));
+    if (isFinite(n)) out.push(n);
   }
-  return out;
+  return out.sort(function (a, b) { return a - b; });
+}
+
+/** Совпадают ли числа в двух названиях (объём, размер, год — часть позиции). */
+function stopSameNumbers_(a, b) {
+  const na = stopNumbers_(a);
+  const nb = stopNumbers_(b);
+  if (na.length !== nb.length) return false;
+  for (let i = 0; i < na.length; i++) if (na[i] !== nb[i]) return false;
+  return true;
 }
 
 // Окончания для грубого «усечения падежей». Длинные — раньше коротких.
@@ -3649,10 +3764,10 @@ function stopDictionary_(ss) {
       if (!name) return;
       const key = stopNameKey_(name);
       if (!key || byKey[key]) return;
-      const stem = stopStemKey_(name);
       byKey[key] = name;
+      const stem = stopStemKey_(name);
       if (!byStem[stem]) byStem[stem] = name;
-      list.push({ name: name, key: key, stem: stem });
+      list.push({ name: name, key: key, stem: stem, nums: stopNumbers_(name) });
     });
   } catch (e) {
     log_('Стоп-лист', 'справочник не прочитан: ' + e);
@@ -3662,58 +3777,29 @@ function stopDictionary_(ss) {
 
 /**
  * Название → позиция справочника: {name, how, distance} или null.
- * Порядок: точное совпадение ключа → без объёма в конце → усечённые падежи →
- * начало названия по границе слова («Клюква с/м» → «Клюква», «Сливки 33%» →
- * «Сливки») → расстояние Левенштейна.
- * cheap = true — только точное совпадение и усечение: так пересчитывать
- * историю при каждом чтении дёшево.
+ * Порядок: точное совпадение ключа → усечённые падежи → опечатки с порогом.
+ * Падежи и опечатки принимаем только при совпадении чисел в названии:
+ * «0,3 Курпфайц» и «0,5 Курпфайц» — разные позиции и не сливаются.
+ * cheap = true — только точное и падежи: так пересчитывать историю дешево.
  */
 function stopMatchName_(name, dict, cheap) {
-  if (!stopNameKey_(name) || !dict) return null;
-  const variants = stopNameVariants_(name);
-  for (let i = 0; i < variants.length; i++) {
-    if (dict.byKey[variants[i]]) return { name: dict.byKey[variants[i]], how: 'exact', distance: 0 };
-  }
-  for (let i = 0; i < variants.length; i++) {
-    const stem = stopStemKey_(variants[i]);
-    if (dict.byStem[stem]) return { name: dict.byStem[stem], how: 'stem', distance: 0 };
-  }
+  const key = stopNameKey_(name);
+  if (!key || !dict) return null;
+  if (dict.byKey[key]) return { name: dict.byKey[key], how: 'exact', distance: 0 };
+  const nums = stopNumbers_(name);
+  const stem = stopStemKey_(name);
+  const stemHit = dict.byStem[stem];
+  if (stemHit && stopSameNumbers_(name, stemHit)) return { name: stemHit, how: 'stem', distance: 0 };
   if (cheap) return null;
-  const prefix = stopPrefixMatch_(variants, dict);
-  if (prefix) return prefix;
   let best = null;
-  variants.forEach(v => {
-    (dict.list || []).forEach(c => {
-      const d = stopLevenshtein_(v, c.key);
-      if (!best || d < best.distance) best = { name: c.name, key: c.key, variant: v, distance: d };
-    });
+  (dict.list || []).forEach(function (c) {
+    if (!stopSameNumbers_(nums, c.nums)) return;
+    const d = stopLevenshtein_(key, c.key);
+    if (!best || d < best.distance) best = { name: c.name, key: c.key, distance: d };
   });
   if (!best || best.distance <= 0) return null;
-  // Порог зависит от длины: короткие названия сравниваем почти без опечаток.
-  if (best.distance > stopMaxDist_(best.variant, best.key)) return null;
+  if (best.distance > stopMaxDist_(key, best.key)) return null;
   return { name: best.name, how: 'levenshtein', distance: best.distance };
-}
-
-/**
- * Совпадение по началу названия на границе слова: «клюква с м» → «Клюква»,
- * «сливки 33» → «Сливки», «вино красное» → «Вино».
- * Только в одну сторону: распознанное название ДЛИННЕЕ справочного.
- * Обратную сторону не берём: «Джин» не должен стать «Джин Монки 47»,
- * «Мята» — «Мята (ветки)». Середину слова не трогаем: «лимонный фреш» —
- * не «Лимон».
- */
-function stopPrefixMatch_(variants, dict) {
-  const list = dict.list || [];
-  for (let i = 0; i < variants.length; i++) {
-    const v = variants[i];
-    for (let j = 0; j < list.length; j++) {
-      const c = list[j];
-      if (c.key.length >= 4 && v.length > c.key.length && v.indexOf(c.key + ' ') === 0) {
-        return { name: c.name, how: 'prefix', distance: 0 };
-      }
-    }
-  }
-  return null;
 }
 
 /** «true»/«да»/«перечёркнута» → true; пусто/«нет»/false → false. */
@@ -3725,34 +3811,48 @@ function stopCrossed_(v) {
   return /^(true|да|1|yes|перечеркн|перечёркн|вычеркн|crossed|зачеркн)/.test(s);
 }
 
+/** Количество из ответа модели: 3.00 → 3, 0.00 → 0, мусор → null (не 0!). */
+function stopQty_(v) {
+  if (v === null || v === undefined || v === '') return null;
+  let n;
+  if (typeof v === 'number') n = v;
+  else {
+    const s = str_(v).replace(',', '.').replace(/\s/g, '');
+    if (!/^-?\d+(\.\d+)?$/.test(s)) return null;
+    n = Number(s);
+  }
+  if (!isFinite(n) || n < 0 || n >= 1000000) return null;
+  return Math.round(n * 1000) / 1000;
+}
+
 /* ---------- распознавание: промпт и схема ответа -------------------- */
 
 /**
- * Промпт распознавания стоп-листа.
- * Главное: не выдумывать позиции и не нормализовать названия — только
- * прочитать то, что видно. Нормализация (справочник, падежи, опечатки) —
- * на сервере, после ответа модели.
+ * Промпт распознавания. Две колонки, ничего не выдумывать и не путать
+ * колонки; объём и «бут.» — часть названия, их не отрезать.
  */
 function buildStopListPrompt_() {
   return [
-    'Ты распознаёшь стоп-лист бара: снимок листа бумаги или доски, где перечислено, чего нет в наличии.',
-    'Твоя задача — прочитать позиции ровно так, как они написаны, и отметить перечёркнутые.',
+    'Ты распознаёшь экран планшета (или распечатку) со стоп-листом бара. На снимке две колонки:',
+    '  • слева — «Блюда на остатке»: название и количество (например «0,150 Домен Брюне Шинон   3.00»);',
+    '  • справа — «СТОП-ЛИСТ»: только названия, без количеств.',
+    'Твоя задача — прочитать обе колонки и не перепутать их.',
     '',
     'Правила:',
-    '1. Пиши позиции ТАК, КАК ОНИ НАПИСАНЫ: сохраняй регистр, сокращения, опечатки автора, объёмы и единицы («0,5», «1 л», «бут.»). Не исправляй, не переводи, не раскрывай сокращения, не добавляй пояснений и категорий.',
-    '2. Не придумывай позиции. Если часть текста не читается (почерк, блик, смазано, обрезано краем кадра) — не угадывай: перечисли в "unreadable", что именно не прочитано, а в "items" оставь только то, что действительно видно.',
-    '3. Если не читается весь список — верни {"items":[],"unreadable":"причина"}. Пустой items при непустом unreadable — правильный ответ, а не ошибка.',
-    '4. Пропускай заголовки и служебные надписи: «стоп-лист», «стоп», дату, время, подпись, имя автора, номер смены. В items — только позиции (напитки, продукты, ингредиенты, расходники).',
-    '5. crossed_out = true только если позиция перечёркнута линией, крестом или штриховкой — то есть её уже убрали со стопа. Если зачёркивания не видно — false. Не додумывай за автора, что «наверное, уже убрали».',
-    '6. Одна строка списка = одна позиция. Не дроби и не склеивай строки, не повторяй дубликаты, не сортируй по-своему — порядок как в списке.',
-    '7. confidence — число от 0 до 1: насколько уверен, что прочитал название правильно. 0.9 и выше — чёткий печатный текст; 0.5–0.8 — читается, но с сомнением; ниже 0.5 — скорее догадка, тогда позицию лучше не писать в items, а назвать в unreadable.',
+    '1. Правая колонка целиком идёт в "stop": каждая строка — отдельная позиция, количества у неё нет.',
+    '2. Левая колонка целиком идёт в "stock": name — название без числа-количества, qty — число из конца строки (3.00 → 3, 0.00 → 0). Если количество не читается, не выдумывай: не указывай qty совсем (пустое значение лучше нуля).',
+    '3. Пиши названия ТАК, КАК НАПИСАНО: сохраняй регистр, «бут.», объёмы («0,3», «0,33», «40мл»), кавычки, дефисы, сокращения и опечатки. Не исправляй, не переводи, не раскрывай сокращения и не отрезай объём от названия: объём различает позиции («0,3 Курпфайц» и «0,5 Курпфайц» — разные позиции).',
+    '4. Не придумывай позиции и не переноси строки между колонками. Если строка не читается (блик, смазано, обрезано краем) — не угадывай: перечисли в "unreadable", что именно не прочитано.',
+    '5. Заголовки колонок («Блюда на остатке», «СТОП-ЛИСТ»), дату, время и подписи в списки не включай.',
+    '6. Служебную строку внутри списка оставляй как написано (например «Комментарий на бар») — решает человек.',
+    '7. Фото экрана часто с бликами и под углом: читай внимательно; если уверенности нет — строка идёт в "unreadable", а не в списки.',
     '8. Верни ТОЛЬКО JSON, без markdown и текста вокруг, строго по схеме:',
-    '{"items":[{"name":"строка как написана","crossed_out":false,"confidence":0.9}],"unreadable":""}',
-    '9. Если на фото вообще нет списка (не тот кадр, пустой стол, стена) — items пустой, unreadable: "на фото нет списка".',
+    '{"stock":[{"name":"строка как написана","qty":3.0}],"stop":[{"name":"строка как написана"}],"unreadable":""}',
+    '9. Если на фото нет ни одной колонки (не тот кадр) — оба списка пустые, unreadable: "на фото нет стоп-листа".',
   ].join('\n');
 }
 
-/** Схема ответа для generationConfig: только name / crossed_out / confidence / unreadable. */
+/** Схема ответа: stock[name, qty] + stop[name] + unreadable. */
 function stopGenerationConfig_() {
   return {
     temperature: 0,
@@ -3760,21 +3860,30 @@ function stopGenerationConfig_() {
     responseSchema: {
       type: 'OBJECT',
       properties: {
-        items: {
+        stock: {
           type: 'ARRAY',
           items: {
             type: 'OBJECT',
             properties: {
               name: { type: 'STRING' },
-              crossed_out: { type: 'BOOLEAN' },
-              confidence: { type: 'NUMBER' },
+              qty: { type: 'NUMBER' },
             },
-            required: ['name', 'crossed_out', 'confidence'],
+            required: ['name'],
+          },
+        },
+        stop: {
+          type: 'ARRAY',
+          items: {
+            type: 'OBJECT',
+            properties: {
+              name: { type: 'STRING' },
+            },
+            required: ['name'],
           },
         },
         unreadable: { type: 'STRING' },
       },
-      required: ['items', 'unreadable'],
+      required: ['stock', 'stop', 'unreadable'],
     },
   };
 }
@@ -3788,46 +3897,51 @@ function validateStopListAnswer_(text) {
   try { obj = JSON.parse(photoJsonText_(text)); } catch (e) { return { ok: false, reason: 'ответ не JSON' }; }
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return { ok: false, reason: 'ответ не объект' };
   const unreadable = str_(obj.unreadable).slice(0, 400);
-  const raw = Array.isArray(obj.items) ? obj.items.slice(0, STOP_MAX_ITEMS * 2) : [];
-  const items = [];
-  const seen = {};
-  raw.forEach(it => {
-    const name = str_(it && it.name).slice(0, 120);
+
+  const stock = [];
+  const stockSeen = {};
+  (Array.isArray(obj.stock) ? obj.stock : []).slice(0, STOP_MAX_ITEMS * 2).forEach(it => {
+    const name = stopStripMarker_(str_(it && it.name)).slice(0, 160);
+    if (!name) return;
+    const qty = stopQty_(it && it.qty);
+    const key = stopNameKey_(name) + '#' + (qty === null ? '' : qty);
+    if (stockSeen[key]) return;
+    stockSeen[key] = true;
+    stock.push({ name: name, qty: qty });
+  });
+
+  const stop = [];
+  const stopSeen = {};
+  (Array.isArray(obj.stop) ? obj.stop : []).slice(0, STOP_MAX_ITEMS * 2).forEach(it => {
+    const name = stopStripMarker_(str_(it && it.name)).slice(0, 160);
     if (!name) return;
     const key = stopNameKey_(name);
-    if (!key || seen[key]) return;
-    seen[key] = true;
-    const c = Number(it && it.confidence);
-    items.push({
-      name: name,
-      crossed: stopCrossed_(it && it.crossed_out),
-      confidence: isFinite(c) && c >= 0 && c <= 1 ? Math.round(c * 100) / 100 : null,
-    });
+    if (!key || stopSeen[key]) return;
+    stopSeen[key] = true;
+    stop.push({ name: name });
   });
-  if (!items.length) {
-    // Пустой items с причиной — легальный ответ «не читается», а не сломанный JSON.
+
+  if (!stock.length && !stop.length) {
     return { ok: false, empty: true, reason: unreadable || 'модель не вернула позиции' };
   }
-  return { ok: true, items: items.slice(0, STOP_MAX_ITEMS), unreadable: unreadable };
-}
-
-/** Средняя уверенность распознавания (для колонки «уверенность» фото). */
-function stopAvgConfidence_(items) {
-  const vals = (items || []).map(i => i.confidence).filter(v => v !== null && isFinite(v));
-  if (!vals.length) return null;
-  const sum = vals.reduce((a, b) => a + b, 0);
-  return Math.round(sum / vals.length * 100) / 100;
+  return {
+    ok: true,
+    stock: stock.slice(0, STOP_MAX_ITEMS),
+    stop: stop.slice(0, STOP_MAX_ITEMS),
+    unreadable: unreadable,
+  };
 }
 
 /**
- * Один снимок стоп-листа → позиции. Никогда не бросает: любая ошибка
- * (нет ключа, квота 429, таймаут, мусор в ответе) превращается в
- * {ok:false, reason}, чтобы фото всё равно сохранилось.
+ * Один снимок → обе колонки. Никогда не бросает: любая ошибка (нет ключа,
+ * квота 429, таймаут, мусор в ответе) превращается в {ok:false, reason},
+ * чтобы фото всё равно сохранилось.
  */
 function stopListRecognize_(blob, fileId) {
   const key = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+  const empty = { stock: [], stop: [], unreadable: '', model: '', reason: '' };
   if (!key) {
-    return { ok: false, reason: 'не задан ключ GEMINI_API_KEY', items: [], unreadable: '', model: '', confidence: null };
+    return Object.assign({}, empty, { ok: false, reason: 'не задан ключ GEMINI_API_KEY' });
   }
   try {
     const parts = [
@@ -3842,89 +3956,155 @@ function stopListRecognize_(blob, fileId) {
       () => photoShrinkParts_([{ fileId: fileId }]), 'Стоп-лист');
     const v = validateStopListAnswer_(answer.text);
     if (!v.ok) {
-      // «Не читается» — не поломка разбора: причину от модели показываем как есть.
       const reason = v.empty ? (str_(v.reason) || 'на фото нет читаемых позиций')
         : 'ответ модели не разобран: ' + v.reason;
       log_('Стоп-лист', reason);
-      return { ok: false, reason: reason, items: [], unreadable: v.empty ? str_(v.reason) : '',
-        model: answer.model, confidence: null };
+      return Object.assign({}, empty, {
+        ok: false, reason: reason, unreadable: v.empty ? str_(v.reason) : '', model: answer.model,
+      });
     }
-    log_('Стоп-лист', 'Gemini ' + answer.model + ': позиций ' + v.items.length +
-      ', перечёркнуто ' + v.items.filter(i => i.crossed).length + (v.unreadable ? ', есть нечитаемое' : ''));
-    return { ok: true, items: v.items, unreadable: v.unreadable, model: answer.model,
-      confidence: stopAvgConfidence_(v.items), reason: '' };
+    log_('Стоп-лист', 'Gemini ' + answer.model + ': остатков ' + v.stock.length +
+      ', стоп-лист ' + v.stop.length + (v.unreadable ? ', есть нечитаемое' : ''));
+    return {
+      ok: true, stock: v.stock, stop: v.stop, unreadable: v.unreadable,
+      model: answer.model, reason: '',
+    };
   } catch (e) {
     const msg = String(e && e.message || e);
     const quota = /429|квот/i.test(msg);
     log_('Стоп-лист', 'Gemini: ' + msg.slice(0, 300));
-    return { ok: false, reason: (quota ? 'квота Gemini (429): ' : '') + msg.slice(0, 200),
-      items: [], unreadable: '', model: '', confidence: null };
+    return Object.assign({}, empty, {
+      ok: false, reason: (quota ? 'квота Gemini (429): ' : '') + msg.slice(0, 200),
+    });
   }
 }
 
-/* ---------- запись распознанного в лист ----------------------------- */
+/* ---------- запись распознанного в листы ---------------------------- */
 
 /** Короткая подпись для строки «Фото уборки» и экрана результата. */
-function stopPhotoSummary_(res, items) {
+function stopPhotoSummary_(res, saved) {
   if (!res || !res.ok) return 'не распознано: ' + str_(res && res.reason).slice(0, 200);
-  const crossed = (items || []).filter(i => i.crossedOut).length;
-  const unknown = (items || []).filter(i => !i.inCatalog).length;
-  const low = (items || []).filter(i => i.confidence !== null && i.confidence < STOP_CONFIDENCE_MIN).length;
-  const parts = ['распознано позиций: ' + (items || []).length];
-  if (crossed) parts.push('перечёркнуто: ' + crossed);
+  const stopCount = (saved && saved.stop ? saved.stop.length : 0);
+  const stockCount = (saved && saved.stock ? saved.stock.length : 0);
+  const unknown = (saved && saved.stop ? saved.stop.filter(i => !i.inCatalog).length : 0);
+  const parts = ['стоп-лист: ' + stopCount, 'остатки: ' + stockCount];
   if (unknown) parts.push('нет в справочнике: ' + unknown);
-  if (low) parts.push('низкая уверенность: ' + low);
+  const issues = (saved && saved.issues ? saved.issues.length : 0);
+  if (issues) parts.push('недочётов: ' + issues);
   let s = parts.join(', ');
   if (res.unreadable) s += '; не прочитано: ' + res.unreadable;
   return s.slice(0, 500);
 }
 
+/** Недочёты по одному снимку: остаток 0 без стопа и стоп с остатком. */
+function stopPhotoIssues_(stopItems, stockItems) {
+  const stopIndex = stopMakeIndex_((stopItems || []).map(i => ({ name: i.canonical || i.name })));
+  const issues = [];
+  (stockItems || []).forEach(s => {
+    const hit = stopFindIn_(s.name, stopIndex);
+    if (s.qty === 0 && !hit) issues.push({ kind: 'zero', name: s.name, qty: 0 });
+    if (s.qty !== null && s.qty > 0 && hit) issues.push({ kind: 'stock', name: s.name, qty: s.qty, stopName: hit.name });
+  });
+  return issues;
+}
+
+/** Индекс списка для сравнения: ключ, усечённый ключ, числа. */
+function stopMakeIndex_(entries) {
+  const list = [];
+  (entries || []).forEach(e => {
+    const key = stopNameKey_(e.name);
+    if (!key) return;
+    list.push({ name: e.name, key: key, stem: stopStemKey_(e.name), nums: stopNumbers_(e.name) });
+  });
+  return list;
+}
+
+/** Есть ли позиция в индексе: точное совпадение или падежи при тех же числах. */
+function stopFindIn_(name, index) {
+  const key = stopNameKey_(name);
+  if (!key) return null;
+  for (let i = 0; i < index.length; i++) if (index[i].key === key) return index[i];
+  const stem = stopStemKey_(name);
+  for (let i = 0; i < index.length; i++) {
+    if (index[i].stem === stem && stopSameNumbers_(name, index[i].name)) return index[i];
+  }
+  return null;
+}
+
 /**
- * Пишет позиции снимка в «Стоп-лист». Ошибка записи не отменяет фото:
- * обёрнута в try/catch у вызывающей стороны. Возвращает {items, day}.
+ * Пишет обе колонки снимка: позиции — в «Стоп-лист», количества — в
+ * «Стоп-лист — остатки». Возвращает {stop, stock, issues, day, floor}.
  */
-function stopListSavePhotoRows_(ss, auth, id, created, fileUrl, res) {
+function stopListSavePhotoRows_(ss, auth, id, created, fileUrl, floor, res) {
   const sh = ensureStopSheet_(ss);
   const cols = stopColumnMap_(sh);
+  const stockSh = ensureStopStockSheet_(ss);
+  const stockCols = stopStockColumnMap_(stockSh);
   const dict = stopDictionary_(ss);
   const day = stopDayKey_(created);
+  const fl = stopFloorNorm_(floor);
   const time = Utilities.formatDate(created, 'Europe/Moscow', 'HH:mm');
   const model = str_(res && res.model).slice(0, 80);
-  const rows = [];
+
   const items = [];
-  if (res && res.ok && res.items && res.items.length) {
-    res.items.forEach(it => {
-      // Маркер списка («1. ») — форматирование, а не часть названия: снимаем.
+  const stockItems = [];
+
+  if (res && res.ok) {
+    const rows = [];
+    (res.stop || []).forEach(it => {
       const shown = stopStripMarker_(it.name);
       const match = stopMatchName_(shown, dict, false);
       const canonical = match ? match.name : '';
-      let note = '';
-      if (!canonical) note = 'нет в справочнике';
-      else if (it.confidence !== null && it.confidence < STOP_CONFIDENCE_MIN) note = 'низкая уверенность';
-      rows.push([created, time, stopCell_(auth.name), stopCell_(shown), stopCell_(canonical), it.crossed === true,
-        it.confidence === null ? '' : it.confidence, '', STOP_SOURCE_PHOTO, "'" + id, day, model, stopCell_(note)]);
+      const note = canonical ? '' : 'нет в справочнике';
+      rows.push([created, time, stopCell_(auth.name), stopCell_(shown), stopCell_(canonical),
+        false, '', '', STOP_SOURCE_PHOTO, fl, "'" + id, day, model, stopCell_(note)]);
       items.push({
         name: shown, canonical: canonical, inCatalog: !!canonical,
-        crossedOut: it.crossed === true, confidence: it.confidence, note: note,
+        crossedOut: false, confidence: null, note: note, floor: fl,
       });
     });
+    if (rows.length) {
+      const start = stopAppendRows_(sh, rows);
+      stopLinkPhoto_(sh, cols.photo, start, rows.length, fileUrl);
+    }
+
+    const stockRows = [];
+    (res.stock || []).forEach(it => {
+      const shown = stopStripMarker_(it.name);
+      if (!shown) return;
+      stockRows.push([created, time, stopCell_(auth.name), fl, stopCell_(shown),
+        it.qty === null || it.qty === undefined ? '' : it.qty, '', "'" + id, day, model]);
+      stockItems.push({ name: shown, qty: it.qty === undefined ? null : it.qty, floor: fl });
+    });
+    if (stockRows.length) {
+      const start = stopAppendRows_(stockSh, stockRows);
+      stopLinkPhoto_(stockSh, stockCols.photo, start, stockRows.length, fileUrl);
+    }
   } else {
-    rows.push([created, time, stopCell_(auth.name), '', '', false, '', '', STOP_SOURCE_UNREADABLE,
-      "'" + id, day, model, stopCell_(str_(res && res.reason).slice(0, 300))]);
+    // Снимок был, текст не прочитался: отметка в «Стоп-листе», чтобы день
+    // не считался данными, а в недочётах появилось «нет данных за смену».
+    stopAppendRows_(sh, [[created, time, stopCell_(auth.name), '', '', false, '', '',
+      STOP_SOURCE_UNREADABLE, fl, "'" + id, day, model, stopCell_(str_(res && res.reason).slice(0, 300))]]);
   }
-  const start = stopAppendRows_(sh, rows);
-  // Колонка «фото» — ссылка на файл (как в «Фото уборки»), чтобы открыть снимок из таблицы.
-  if (start && fileUrl) {
-    for (let i = 0; i < rows.length; i++) {
-      try {
-        sh.getRange(start + i, cols.photo).setRichTextValue(
-          SpreadsheetApp.newRichTextValue().setText('фото').setLinkUrl(fileUrl).build());
-      } catch (e) {
-        sh.getRange(start + i, cols.photo).setValue(fileUrl);
-      }
+
+  return {
+    stop: items, stock: stockItems,
+    issues: stopPhotoIssues_(items, stockItems),
+    day: day, floor: fl,
+  };
+}
+
+/** Ссылка на снимок в колонке «фото» — для каждой записанной строки. */
+function stopLinkPhoto_(sheet, col, start, count, fileUrl) {
+  if (!start || !fileUrl) return;
+  for (let i = 0; i < count; i++) {
+    try {
+      sheet.getRange(start + i, col).setRichTextValue(
+        SpreadsheetApp.newRichTextValue().setText('фото').setLinkUrl(fileUrl).build());
+    } catch (e) {
+      sheet.getRange(start + i, col).setValue(fileUrl);
     }
   }
-  return { items: items, day: day };
 }
 
 /** Поля вердикта в строке «Фото уборки» для снимка стоп-листа. */
@@ -3934,8 +4114,7 @@ function writeStopPhotoVerdict_(sheet, row, res, summary) {
     sheet.getRange(row, PHOTO_COL.status).setValue('📋 Стоп-лист');
     sheet.getRange(row, PHOTO_COL.issues).setValue(text_(summary, 500));
     sheet.getRange(row, cols.verdict).setValue('стоп-лист');
-    sheet.getRange(row, cols.confidence).setValue(
-      res && res.ok && res.confidence !== null && res.confidence !== undefined ? Number(res.confidence) : '');
+    sheet.getRange(row, cols.confidence).setValue('');
     sheet.getRange(row, cols.notes).setValue(text_(summary, 1000));
     sheet.getRange(row, cols.model).setValue(str_(res && res.model).slice(0, 80));
     sheet.getRange(row, cols.checkedAt).setNumberFormat('dd.MM.yyyy HH:mm').setValue(new Date());
@@ -3947,14 +4126,15 @@ function writeStopPhotoVerdict_(sheet, row, res, summary) {
 /* ---------- ручной ввод --------------------------------------------- */
 
 /**
- * Ручной ввод позиции (когда фото не читается) — обычная запись из
- * очереди с телефона: type = 'stoplist'. Дата и сотрудник — как у всех.
- * Повторная та же позиция в тот же день (и с тем же признаком
- * «перечёркнута») второй строкой не пишется.
+ * Ручной ввод позиции (когда фото не читается) — обычная запись из очереди
+ * с телефона: type = 'stoplist'. Этаж — обязателен (по умолчанию 1).
+ * Повторная та же позиция в тот же день, на том же этаже и с тем же
+ * признаком «перечёркнута» второй строкой не пишется.
  */
 function saveStopListItem_(ss, sheet, auth, rec, id, created, received, comment) {
-  const name = stopStripMarker_(str_(rec.item)).slice(0, 120);
+  const name = stopStripMarker_(str_(rec.item)).slice(0, 160);
   if (!name) return { id, status: 'error', error: 'Не указана позиция стоп-листа' };
+  const floor = stopFloorNorm_(rec.floor) || '1';
   const crossed = rec.crossedOut === true;
   const day = stopDayKey_(created);
   const dict = stopDictionary_(ss);
@@ -3962,18 +4142,20 @@ function saveStopListItem_(ss, sheet, auth, rec, id, created, received, comment)
   const canonical = match ? match.name : '';
   const key = stopNameKey_(canonical || name);
 
-  // Такая же позиция в тот же день и с тем же признаком уже есть — дубль.
-  const dayRows = stopRows_(sheet).filter(r => r.day === day && r.name);
+  const dayRows = stopRows_(sheet).filter(r => r.day === day && r.floor === floor && r.name);
   const same = dayRows.find(r => stopNameKey_(r.catalog || r.name) === key && r.crossed === crossed);
   if (same) return { id, status: 'duplicate' };
 
   const note = canonical ? (comment ? comment.slice(0, 200) : '') : 'нет в справочнике';
-  const rows = [[created, Utilities.formatDate(created, 'Europe/Moscow', 'HH:mm'), stopCell_(auth.name),
-    stopCell_(name), stopCell_(canonical), crossed, '', '', STOP_SOURCE_MANUAL, "'" + id, day, '', stopCell_(note)]];
-  stopAppendRows_(sheet, rows);
-  log_('Стоп-лист', 'ручной ввод: ' + name + (canonical && canonical !== name ? ' → ' + canonical : '') +
-    (crossed ? ' (перечёркнута)' : ''));
-  return { id, status: 'saved', stoplist: { manual: true, item: name, canonical: canonical, crossed: crossed, day: day } };
+  stopAppendRows_(sheet, [[created, Utilities.formatDate(created, 'Europe/Moscow', 'HH:mm'),
+    stopCell_(auth.name), stopCell_(name), stopCell_(canonical), crossed, '', '',
+    STOP_SOURCE_MANUAL, floor, "'" + id, day, '', stopCell_(note)]]);
+  log_('Стоп-лист', 'ручной ввод (' + stopFloorLabel_(floor) + '): ' + name +
+    (canonical && canonical !== name ? ' → ' + canonical : '') + (crossed ? ' (перечёркнута)' : ''));
+  return {
+    id, status: 'saved',
+    stoplist: { manual: true, item: name, canonical: canonical, crossed: crossed, day: day, floor: floor },
+  };
 }
 
 /* ---------- расчёт: дни в стопе, история, недочёты ------------------ */
@@ -3988,7 +4170,6 @@ function stopSettings_(ss) {
     if (!raw || !isFinite(n) || n <= 0) return def;
     return Math.min(Math.max(Math.round(n), min), max);
   };
-  // Пропуск дня: пусто = не обрывает (мягкий режим), «вкл» — строгий.
   const gapRaw = str_(values['стоплист_пропуск_обрывает']);
   return {
     longDays: num('стоплист_долго_дней', STOP_DEFAULT_LONG_DAYS, 1, 60),
@@ -3996,6 +4177,8 @@ function stopSettings_(ss) {
     historyDays: num('стоплист_история_дней', STOP_DEFAULT_HISTORY_DAYS, 1, 365),
     gapBreaks: gapRaw ? featureOn_(gapRaw) : false,
     checks: {
+      zero: featureOn_(values['стоплист_проверять_нулевой_остаток']),
+      stock: featureOn_(values['стоплист_проверять_остаток_в_стопе']),
       long: featureOn_(values['стоплист_проверять_долго']),
       premature: featureOn_(values['стоплист_проверять_преждевременно']),
       catalog: featureOn_(values['стоплист_проверять_справочник']),
@@ -4016,8 +4199,7 @@ function stopPickName_(names, canonical) {
 
 /**
  * Состояние одной позиции: streaks, текущий счёт, «убрано преждевременно»,
- * история по дням. dataDays — все дни с данными (по возрастанию),
- * lastDataDay — последний из них.
+ * история по дням. dataDays — все дни с данными ЭТОГО этажа (по возрастанию).
  */
 function stopGroupState_(g, dataDays, lastDataDay, today, settings) {
   const streaks = [];
@@ -4025,7 +4207,6 @@ function stopGroupState_(g, dataDays, lastDataDay, today, settings) {
   dataDays.forEach(day => {
     const d = g.days[day];
     if (d && d.present) {
-      // Строгий режим: день без данных внутри отрезка обрывает счёт.
       if (cur && settings.gapBreaks && stopDayDiff_(cur.to, day) > 1) {
         streaks.push(cur);
         cur = null;
@@ -4034,7 +4215,7 @@ function stopGroupState_(g, dataDays, lastDataDay, today, settings) {
       cur.to = day;
       cur.days++;
     } else if (cur) {
-      // В этот день данные есть, а позиции нет — счёт закончен.
+      // В этот день данные есть, а позиции нет — её убрали, счёт закончен.
       streaks.push(cur);
       cur = null;
     }
@@ -4050,17 +4231,28 @@ function stopGroupState_(g, dataDays, lastDataDay, today, settings) {
   const crossedDays = Object.keys(g.crossedDays || {}).sort();
   const removedAt = crossedDays.length ? crossedDays[crossedDays.length - 1] : '';
 
-  // «Убрано преждевременно»: перечеркнули и вернули в течение N дней.
+  // «Убрано преждевременно»: позиция пропала (её убрали, в том числе
+  // перечеркнули руками) и вернулась в течение N дней. Считаем от дня,
+  // когда её убрали, а не от последнего дня, когда она была в стопе.
   let premature = null;
   for (let i = 1; i < streaks.length; i++) {
     const before = streaks[i - 1];
     const after = streaks[i];
-    const back = crossedDays.filter(d => stopDayDiff_(before.to, d) > 0 && stopDayDiff_(d, after.from) > 0).sort();
-    if (!back.length) continue;
-    const gap = stopDayDiff_(back[0], after.from);
-    if (gap >= 1 && gap <= settings.prematureDays) {
-      premature = { removedAt: back[0], returnedAt: after.from, gapDays: gap, beforeDays: before.days };
+    let removalDay = '';
+    for (let j = 0; j < dataDays.length; j++) {
+      const d = dataDays[j];
+      if (stopDayDiff_(before.to, d) > 0 && stopDayDiff_(d, after.from) > 0) { removalDay = d; break; }
     }
+    const crossedBetween = crossedDays.filter(d => stopDayDiff_(before.to, d) > 0 && stopDayDiff_(d, after.from) > 0).sort();
+    const removedAt = removalDay || crossedBetween[0] || before.to;
+    const gap = stopDayDiff_(removedAt, after.from);
+    if (gap < 1 || gap > settings.prematureDays) continue;
+    premature = {
+      removedAt: removedAt,
+      returnedAt: after.from,
+      gapDays: gap,
+      beforeDays: before.days,
+    };
   }
 
   const allDays = Object.keys(g.days).sort();
@@ -4092,30 +4284,18 @@ function stopGroupState_(g, dataDays, lastDataDay, today, settings) {
 }
 
 /**
- * Полное состояние стоп-листа: текущий список с днями, долгожители,
- * «убрано преждевременно», «нет в справочнике», «нет данных за смену».
+ * Состояние одного этажа: позиции стоп-листа, дни, недочёты, остатки.
+ * rowsF — строки «Стоп-листа» этого этажа, stockF — строки остатков.
  */
-function stopListState_(ss) {
-  const settings = stopSettings_(ss);
-  const sh = ensureStopSheet_(ss);
-  const rows = stopRows_(sh);
-  const today = stopDayKey_(new Date());
-  const dict = stopDictionary_(ss);
-
-  // Окно анализа: последние STOP_ANALYSIS_DAYS дней (+1 день на расхождение часов).
-  const inWindow = rows.filter(r => {
-    if (!r.day) return false;
-    const back = stopDayDiff_(r.day, today);
-    return back >= -1 && back <= STOP_ANALYSIS_DAYS;
-  });
-
+function stopFloorState_(floor, rowsF, stockF, settings, today, dict) {
   const dataDays = [];
   const seenDay = {};
   const noData = [];
   let photos = 0;
   let manual = 0;
   const photoIds = {};
-  inWindow.forEach(r => {
+
+  rowsF.forEach(r => {
     if (!r.name) {
       if (r.source === STOP_SOURCE_UNREADABLE) {
         noData.push({ day: r.day, time: r.time, reason: r.note || 'не распознано', employee: r.employee });
@@ -4133,13 +4313,11 @@ function stopListState_(ss) {
   noData.sort((a, b) => (a.day === b.day ? String(a.time).localeCompare(String(b.time)) : b.day.localeCompare(a.day)));
   const lastDataDay = dataDays.length ? dataDays[dataDays.length - 1] : '';
 
-  // Группы: одна позиция справочника (или одно ненайденное название) = одна группа.
+  // Группы: одна позиция справочника (или одно ненайденное название) = группа.
   const groups = {};
   const order = [];
-  inWindow.forEach(r => {
+  rowsF.forEach(r => {
     if (!r.name) return;
-    // История могла быть записана до появления позиции в справочнике:
-    // пересопоставляем дешёвым способом на чтении.
     const rematch = !r.catalog ? stopMatchName_(r.name, dict, true) : null;
     const canonical = r.catalog || (rematch ? rematch.name : '');
     const gkey = canonical ? 'c:' + stopNameKey_(canonical) : 'r:' + stopNameKey_(r.name);
@@ -4162,28 +4340,70 @@ function stopListState_(ss) {
   const positions = order.map(k => stopGroupState_(groups[k], dataDays, lastDataDay, today, settings));
   const current = positions.filter(p => p.days > 0)
     .sort((a, b) => (b.days - a.days) || String(a.name).localeCompare(String(b.name), 'ru'));
-  const noDataDays = [];
-  const seenNoData = {};
-  noData.forEach(n => {
-    if (seenNoData[n.day]) return;
-    seenNoData[n.day] = true;
-    noDataDays.push(n);
+
+  // Остатки по дням: последняя запись дня перекрывает предыдущую.
+  const stockByDay = {};
+  stockF.forEach(r => {
+    if (!r.name) return;
+    const map = stockByDay[r.day] || (stockByDay[r.day] = {});
+    const k = stopNameKey_(r.name);
+    if (k) map[k] = { name: r.name, qty: r.qty, key: k };
+  });
+  // Для сравнения остатков нужен индекс позиций стоп-листа по каждому дню.
+  const stopDayKeys = {};
+  rowsF.forEach(r => {
+    if (!r.name || r.crossed) return;
+    const map = stopDayKeys[r.day] || (stopDayKeys[r.day] = []);
+    map.push({ name: r.catalog || r.name });
   });
 
-  const history = {};
-  positions.forEach(p => { history[p.name] = p.history; });
+  const stockIssues = [];
+  if (settings.checks.zero || settings.checks.stock) {
+    Object.keys(stockByDay).sort().forEach(day => {
+      if (stopDayDiff_(day, today) > STOP_ISSUE_DAYS || stopDayDiff_(day, today) < -1) return;
+      const stockList = Object.keys(stockByDay[day]).map(k => stockByDay[day][k]);
+      const stopIndex = stopMakeIndex_(stopDayKeys[day] || []);
+      stockList.forEach(s => {
+        const hit = stopFindIn_(s.name, stopIndex);
+        if (settings.checks.zero && s.qty === 0 && !hit) {
+          stockIssues.push({ kind: 'zero', day: day, floor: floor, name: s.name, qty: 0 });
+        }
+        if (settings.checks.stock && s.qty !== null && s.qty > 0 && hit) {
+          stockIssues.push({ kind: 'stock', day: day, floor: floor, name: s.name, qty: s.qty, stopName: hit.name });
+        }
+      });
+    });
+  }
+  stockIssues.sort((a, b) => (a.day === b.day ? String(a.name).localeCompare(String(b.name), 'ru') : b.day.localeCompare(a.day)));
+
+  const missingCatalog = current.filter(p => !p.inCatalog);
+  const long = current.filter(p => p.long);
+  const premature = positions.filter(p => p.premature);
+  const returned = positions.filter(p => p.returned && p.days > 0);
+  const zeroIssues = stockIssues.filter(i => i.kind === 'zero');
+  const stockFlagged = stockIssues.filter(i => i.kind === 'stock');
+
+  const issuesCount =
+    (settings.checks.zero ? zeroIssues.length : 0) +
+    (settings.checks.stock ? stockFlagged.length : 0) +
+    (settings.checks.long ? long.length : 0) +
+    (settings.checks.premature ? premature.length : 0) +
+    (settings.checks.catalog ? missingCatalog.length : 0) +
+    (settings.checks.data ? noData.length : 0);
 
   return {
-    today: today,
-    settings: settings,
+    floor: floor,
     positions: positions,
     current: current,
-    long: current.filter(p => p.long),
-    missingCatalog: current.filter(p => !p.inCatalog),
-    premature: positions.filter(p => p.premature),
-    returned: positions.filter(p => p.returned && p.days > 0),
-    noData: noDataDays.slice(0, 10),
-    history: history,
+    long: long,
+    premature: premature,
+    missingCatalog: missingCatalog,
+    returned: returned,
+    noData: noData.slice(0, 10),
+    stockIssues: stockIssues.slice(0, 30),
+    zeroIssues: zeroIssues,
+    stockFlagged: stockFlagged,
+    issuesCount: issuesCount,
     totals: {
       positions: positions.length,
       inStop: current.length,
@@ -4191,15 +4411,89 @@ function stopListState_(ss) {
       photos: photos,
       photoShots: Object.keys(photoIds).length,
       manual: manual,
-      unreadable: noDataDays.length,
+      stockRows: stockF.length,
+      unreadable: noData.length,
       lastDay: lastDataDay,
     },
   };
 }
 
-/** Позиция для телефона: без внутренних полей, но со всем нужным для экрана. */
-function stopItemPublic_(p) {
+/**
+ * Полное состояние стоп-листа: по каждому этажу — текущий список с днями,
+ * долгожители, «убрано преждевременно», «нет в справочнике», остатки,
+ * «нет данных за смену».
+ */
+function stopListState_(ss) {
+  const settings = stopSettings_(ss);
+  const stopSh = ensureStopSheet_(ss);
+  // Лист остатков создаём заранее: владелец должен видеть его в таблице
+  // до первого снимка (ошибка создания не должна ломать чтение).
+  try { ensureStopStockSheet_(ss); } catch (e) { log_('Стоп-лист', 'лист остатков не создан: ' + e); }
+  const rows = stopRows_(stopSh);
+  const stockRows = stopStockRows_(ss);
+  const today = stopDayKey_(new Date());
+  const dict = stopDictionary_(ss);
+
+  const inWindow = function (r) {
+    if (!r.day) return false;
+    const back = stopDayDiff_(r.day, today);
+    return back >= -1 && back <= STOP_ANALYSIS_DAYS;
+  };
+
+  const byFloor = {};
+  const order = [];
+  const ensureFloor = function (f) {
+    if (!byFloor[f]) { byFloor[f] = { stop: [], stock: [] }; order.push(f); }
+    return byFloor[f];
+  };
+  // Оба этажа показываем всегда: даже пустой стоп — это ответ.
+  STOP_STANDARD_FLOORS.forEach(ensureFloor);
+  rows.filter(inWindow).forEach(r => ensureFloor(r.floor).stop.push(r));
+  stockRows.filter(inWindow).forEach(r => ensureFloor(r.floor).stock.push(r));
+
+  order.sort((a, b) => {
+    const na = parseInt(a, 10), nb = parseInt(b, 10);
+    const fa = isFinite(na), fb = isFinite(nb);
+    if (fa && fb && na !== nb) return na - nb;
+    if (fa !== fb) return fa ? -1 : 1;
+    return String(a).localeCompare(String(b), 'ru');
+  });
+
+  const floors = order.map(f => stopFloorState_(f, byFloor[f].stop, byFloor[f].stock, settings, today, dict));
+  const history = {};
+  let positions = 0, inStop = 0, photos = 0, manual = 0, unreadable = 0, stockRowsCount = 0;
+  floors.forEach(fs => {
+    history[fs.floor] = {};
+    fs.positions.forEach(p => { history[fs.floor][p.name] = p.history; });
+    positions += fs.totals.positions;
+    inStop += fs.totals.inStop;
+    photos += fs.totals.photos;
+    manual += fs.totals.manual;
+    unreadable += fs.totals.unreadable;
+    stockRowsCount += fs.totals.stockRows;
+  });
+
   return {
+    today: today,
+    settings: settings,
+    floors: floors,
+    history: history,
+    totals: {
+      floors: floors.length,
+      positions: positions,
+      inStop: inStop,
+      photos: photos,
+      manual: manual,
+      stockRows: stockRowsCount,
+      unreadable: unreadable,
+    },
+  };
+}
+
+/** Позиция для телефона: без внутренних полей, но со всем нужным для экрана. */
+function stopItemPublic_(p, floor) {
+  return {
+    floor: floor || '',
     name: p.name,
     canonical: p.canonical || '',
     inCatalog: !!p.inCatalog,
@@ -4223,29 +4517,49 @@ function stopItemPublic_(p) {
   };
 }
 
+/** Недочёт остатка для телефона. */
+function stopStockIssuePublic_(i) {
+  return {
+    kind: i.kind, day: i.day, floor: i.floor, name: i.name, qty: i.qty,
+    stopName: i.stopName || '',
+  };
+}
+
 /**
  * Ответ телефону. withHistory = true — отдельный запрос (?action=stopList),
  * false — компактная версия для config (история по позициям не влезает).
  */
 function stopListPublic_(state, withHistory) {
+  const floors = state.floors.map(f => ({
+    floor: f.floor,
+    label: stopFloorLabel_(f.floor),
+    current: f.current.map(p => stopItemPublic_(p, f.floor)),
+    long: f.long.map(p => stopItemPublic_(p, f.floor)),
+    premature: f.premature.map(p => stopItemPublic_(p, f.floor)),
+    missingCatalog: f.missingCatalog.map(p => stopItemPublic_(p, f.floor)),
+    returned: f.returned.map(p => stopItemPublic_(p, f.floor)),
+    noData: f.noData,
+    stockIssues: f.stockIssues.map(stopStockIssuePublic_),
+    issuesCount: f.issuesCount,
+    totals: f.totals,
+  }));
   const out = {
     ok: true,
     today: state.today,
     updatedAt: new Date().toISOString(),
     settings: state.settings,
-    current: state.current.map(stopItemPublic_),
-    long: state.long.map(stopItemPublic_),
-    premature: state.premature.map(stopItemPublic_),
-    missingCatalog: state.missingCatalog.map(stopItemPublic_),
-    returned: state.returned.map(stopItemPublic_),
-    noData: state.noData,
+    floors: floors,
+    summary: floors.map(f => ({
+      floor: f.floor, label: f.label,
+      inStop: f.current.length, long: f.long.length, issues: f.issuesCount,
+    })),
     totals: state.totals,
   };
   if (withHistory) out.history = state.history;
   return out;
 }
 
-/** GET ?action=stopList — текущий список, дни, история по позициям, недочёты. */
+/** GET ?action=stopList — текущий список по этажам, дни, история, недочёты. */
 function getStopList_() {
   try {
     return stopListPublic_(stopListState_(ss_()), true);
@@ -4255,12 +4569,15 @@ function getStopList_() {
   }
 }
 
-/** Ручной запуск из редактора: создать лист «Стоп-лист» и строки настроек. */
+/** Ручной запуск из редактора: создать листы и строки настроек. */
 function setupStopList() {
   const ss = ss_();
   const sh = ensureStopSheet_(ss);
+  const stock = ensureStopStockSheet_(ss);
   ensureSettingsSheet_(ss);
-  const msg = 'Стоп-лист: лист «' + SHEETS.stopList + '» ' + (sh.getLastRow() < 2 ? 'пустой' : 'строк: ' + (sh.getLastRow() - 1)) +
+  const msg = 'Стоп-лист: лист «' + SHEETS.stopList + '» ' +
+    (sh.getLastRow() < 2 ? 'пустой' : 'строк: ' + (sh.getLastRow() - 1)) +
+    '; остатки: ' + (stock.getLastRow() < 2 ? 'пусто' : 'строк: ' + (stock.getLastRow() - 1)) +
     '; ключ Gemini: ' + (PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY') ? 'есть' : 'НЕТ') + '.';
   Logger.log(msg);
   log_('Стоп-лист', msg);

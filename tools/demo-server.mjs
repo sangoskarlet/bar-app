@@ -41,6 +41,7 @@ function demoStopItem(o) {
   return {
     name: o.name, canonical: o.canonical === undefined ? o.name : o.canonical,
     inCatalog: o.canonical === undefined ? true : !!o.canonical,
+    fromStock: !!o.fromStock,
     days: days, since: o.since || '', span: o.span || days, gaps: o.gaps || 0,
     long: !!o.long, streaks: streaks,
     wasCrossed: !!o.wasCrossed, removedAt: o.removedAt || '',
@@ -52,7 +53,7 @@ function demoStopItem(o) {
 
 /**
  * Демо-стоп-лист: два этажа, долгожитель, возврат после «убрали»,
- * позиция не из справочника и недочёты по остаткам.
+ * позиция не из справочника, одна позиция пришла из нулевого остатка.
  */
 function demoStopList(withHistory) {
   const f1current = [
@@ -70,18 +71,17 @@ function demoStopList(withHistory) {
       streaks: [{ from: dayAgo(3), to: dayAgo(2), days: 2, gaps: 0 }, { from: dayAgo(0), to: dayAgo(0), days: 1, gaps: 0 }],
     }),
     demoStopItem({ name: 'Саке', canonical: '', days: 1, since: dayAgo(0), totalDays: 1, records: 1 }),
+    demoStopItem({
+      name: 'бут.Сидр Эйбрахолс яблочный сух.', fromStock: true,
+      days: 1, since: dayAgo(0), totalDays: 1, records: 1,
+    }),
   ];
   const f2current = [
     demoStopItem({ name: 'бут. Лондон Прайд', days: 3, since: dayAgo(2), totalDays: 3, records: 3 }),
     demoStopItem({ name: 'Торт Три Шоколада', days: 1, since: dayAgo(0), totalDays: 1, records: 1 }),
   ];
-  const stockIssues1 = [
-    { kind: 'zero', day: dayAgo(0), floor: '1', name: 'Чиз-кейк "Нью-Йорк"', qty: 0 },
-    { kind: 'zero', day: dayAgo(0), floor: '1', name: 'бут.Сидр Эйбрахолс яблочный сух.', qty: 0 },
-    { kind: 'stock', day: dayAgo(0), floor: '1', name: 'Вишневка 40мл', qty: 2, stopName: 'Вишневка 40мл' },
-  ];
 
-  const makeFloor = (floor, current, stockIssues) => ({
+  const makeFloor = (floor, current) => ({
     floor: floor,
     label: floor === '1' ? '1 этаж' : '2 этаж',
     current: current,
@@ -90,27 +90,26 @@ function demoStopList(withHistory) {
     missingCatalog: current.filter(p => !p.inCatalog),
     returned: current.filter(p => p.returned),
     noData: floor === '2' ? [{ day: dayAgo(1), time: '23:40', reason: 'квота Gemini (429)', employee: 'Анна' }] : [],
-    stockIssues: stockIssues,
     issuesCount: current.filter(p => p.long).length + current.filter(p => p.premature).length +
-      current.filter(p => !p.inCatalog).length + stockIssues.length + (floor === '2' ? 1 : 0),
+      current.filter(p => !p.inCatalog).length + (floor === '2' ? 1 : 0),
     totals: {
       positions: current.length, inStop: current.length, daysWithData: 4,
-      photos: 6, photoShots: 4, manual: 1, stockRows: 8, unreadable: floor === '2' ? 1 : 0, lastDay: dayAgo(0),
+      photos: 6, photoShots: 4, manual: 1, unreadable: floor === '2' ? 1 : 0, lastDay: dayAgo(0),
     },
   });
 
-  const floors = [makeFloor('1', f1current, stockIssues1), makeFloor('2', f2current, [])];
+  const floors = [makeFloor('1', f1current), makeFloor('2', f2current)];
   const out = {
     ok: true,
     today: dayAgo(0),
     updatedAt: new Date().toISOString(),
     settings: {
       longDays: 3, prematureDays: 2, historyDays: 30, gapBreaks: false,
-      checks: { zero: true, stock: true, long: true, premature: true, catalog: true, data: true },
+      checks: { long: true, premature: true, catalog: true, data: true },
     },
     floors: floors,
     summary: floors.map(f => ({ floor: f.floor, label: f.label, inStop: f.current.length, long: f.long.length, issues: f.issuesCount })),
-    totals: { floors: 2, positions: 6, inStop: 6, photos: 12, manual: 1, stockRows: 8, unreadable: 1 },
+    totals: { floors: 2, positions: 7, inStop: 7, photos: 12, manual: 1, unreadable: 1 },
   };
   if (withHistory) {
     out.history = {
@@ -124,6 +123,7 @@ function demoStopList(withHistory) {
           { day: dayAgo(0), crossed: false, source: 'фото', name: 'Просекко' },
         ],
         'Саке': [{ day: dayAgo(0), crossed: false, source: 'ручной ввод', name: 'Саке' }],
+        'бут.Сидр Эйбрахолс яблочный сух.': [{ day: dayAgo(0), crossed: false, source: 'фото', name: 'бут.Сидр Эйбрахолс яблочный сух.' }],
         'Апероль': [
           { day: dayAgo(6), crossed: false, source: 'фото', name: 'Апероль' },
           { day: dayAgo(7), crossed: false, source: 'фото', name: 'Апероль' },
@@ -276,22 +276,24 @@ const server = http.createServer((req, res) => {
                 stoplist: {
                   ok: true, reason: '', unreadable: '', model: 'gemini-flash-lite-latest',
                   day: dayAgo(0), floor: floor,
-                  summary: 'стоп-лист: 13, остатки: 8, недочётов: 2',
+                  summary: 'в стопе: 5, из них по остатку 0: 1, остатки: 4, кухня отсечена: 3',
                   stop: [
-                    { name: '0,3 Курпфайц нефильтрованное', canonical: '', inCatalog: false },
-                    { name: '0,5 Курпфайц нефильтрованное', canonical: '', inCatalog: false },
-                    { name: 'бут. Бридог ИПА 0,33', canonical: '', inCatalog: false },
-                    { name: 'Вишневка 40мл', canonical: '', inCatalog: false },
+                    { name: '0,3 Курпфайц нефильтрованное', canonical: '', inCatalog: false, origin: 'stop' },
+                    { name: '0,5 Курпфайц нефильтрованное', canonical: '', inCatalog: false, origin: 'stop' },
+                    { name: 'бут. Бридог ИПА 0,33', canonical: '', inCatalog: false, origin: 'stop' },
+                    { name: 'Вишневка 40мл', canonical: '', inCatalog: false, origin: 'stop' },
+                    { name: 'бут.Сидр Эйбрахолс яблочный сух.', canonical: '', inCatalog: false, origin: 'stock' },
                   ],
                   stock: [
                     { name: '0,150 Домен Брюне Шинон', qty: 3 },
-                    { name: 'Чиз-кейк "Нью-Йорк"', qty: 0 },
                     { name: 'бут.Сидр Эйбрахолс яблочный сух.', qty: 0 },
                     { name: 'Штрудель Яблочный', qty: 4 },
+                    { name: 'Настойка черная смородина 40мл', qty: 7 },
                   ],
-                  issues: [
-                    { kind: 'zero', name: 'Чиз-кейк "Нью-Йорк"', qty: 0 },
-                    { kind: 'zero', name: 'бут.Сидр Эйбрахолс яблочный сух.', qty: 0 },
+                  excluded: [
+                    'Комментарий на бар',
+                    'Равиоли с лососем',
+                    'Чиз-кейк "Нью-Йорк"',
                   ],
                 },
               };

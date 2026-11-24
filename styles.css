@@ -678,8 +678,10 @@ textarea { margin-top: 16px; resize: vertical; }
 }
 .stop-tag.long, .stop-tag.catalog, .stop-tag.premature { color: var(--bad); }
 .stop-tag.returned { color: var(--wait); }
+.stop-tag.stock { color: var(--wait); }
 .stop-tag.crossed { color: var(--muted); text-decoration: line-through; }
 .stop-tag.low { color: var(--wait); }
+.muted-item { opacity: .55; }
 .stop-days {
   display: flex; flex-direction: column; align-items: center; justify-content: center;
   min-width: 58px; padding: 4px 8px; border-radius: 10px;

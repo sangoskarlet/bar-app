@@ -58,7 +58,8 @@ const SHEETS = {
   settings:  'Настройки',           // разделы приложения вкл/выкл (создаётся автоматически)
   pairs:     'Пары позиций',        // позиции, которые взвешивают вместе: мята — листья и ветки
   stopList:  'Стоп-лист',           // что закончилось: фото стоп-листа, позиции, дни в стопе
-  stopStock: 'Стоп-лист — остатки', // количества из колонки «Блюда на остатке» (для недочётов)
+  stopStock: 'Стоп-лист — остатки', // количества из колонки «Блюда на остатке» (справка)
+  kitchen:   'Кухня',               // позиции кухни и служебные строки: в стоп-лист бара не идут
 };
 
 // В каком столбце листа лежит ID записи (считаем с 1: A=1, B=2 ...).
@@ -426,6 +427,7 @@ function ensureSettingsSheet_(ss) {
 function ensureSettingsExtraRows_(sh) {
   if (!sh) return 0;
   try {
+    dropCanceledSettings_(sh);
     const h = settingsHeader_(sh);
     const keyCol = h.key < 0 ? 0 : h.key;
     const last = sh.getLastRow();
@@ -446,6 +448,28 @@ function ensureSettingsExtraRows_(sh) {
     log_('Настройки', 'ключи не дописаны: ' + e);
     return 0;
   }
+}
+
+/**
+ * Убирает из «Настроек» ключи отменённых проверок (их добавила прошлая
+ * версия, владелец их не заводил). Чужие строки не трогаем: удаляем только
+ * точное совпадение ключа из STOP_CANCELED_SETTINGS.
+ */
+function dropCanceledSettings_(sh) {
+  const h = settingsHeader_(sh);
+  const keyCol = h.key < 0 ? 0 : h.key;
+  const last = sh.getLastRow();
+  if (last < 2) return 0;
+  const keys = sh.getRange(2, keyCol + 1, last - 1, 1).getValues();
+  let removed = 0;
+  for (let i = keys.length - 1; i >= 0; i--) {
+    const k = str_(keys[i][0]);
+    if (STOP_CANCELED_SETTINGS.indexOf(k) === -1) continue;
+    sh.deleteRow(i + 2);
+    removed++;
+  }
+  if (removed) log_('Настройки', 'удалены отменённые ключи: ' + removed);
+  return removed;
 }
 
 /** Значения из «Настроек»: { 'раздел_викторина': 'выкл', ... }. */
@@ -1770,7 +1794,7 @@ function savePhoto_(ss, sheet, auth, rec, id, created, received, comment) {
   if (stopList) {
     const stopFloor = stopFloorNorm_(rec.floor || rec['этаж']) || '1';
     const res = stopListRecognize_(Utilities.newBlob(bytes, m[1], fileName), file.getId());
-    let saved = { stop: [], stock: [], issues: [], day: stopDayKey_(created), floor: stopFloor };
+    let saved = { stop: [], stock: [], excluded: [], day: stopDayKey_(created), floor: stopFloor };
     try {
       saved = stopListSavePhotoRows_(ss, auth, id, created, file.getUrl(), stopFloor, res);
     } catch (e) {
@@ -1799,7 +1823,7 @@ function savePhoto_(ss, sheet, auth, rec, id, created, received, comment) {
         floor: saved.floor || stopFloor,
         stop: saved.stop || [],
         stock: saved.stock || [],
-        issues: saved.issues || [],
+        excluded: saved.excluded || [],
         summary: summary,
       },
     };
@@ -2148,7 +2172,7 @@ function setup() {
   // «Сроки хранения» — при первом чтении справочника (ensureShelfLifeSheet_).
   const auto = ['refs', 'refPhotos', 'questions', 'disputes', 'duels', 'ratings', 'quizTries',
     'characters', 'itemCatalog', 'inventory', 'shelfLife', 'facts', 'checklists', 'checklistMarks',
-    'settings', 'stopList', 'stopStock'];
+    'settings', 'stopList', 'stopStock', 'kitchen'];
   const missing = Object.keys(SHEETS).filter(k => auto.indexOf(k) === -1)
     .map(k => SHEETS[k]).filter(n => !ss.getSheetByName(n));
   if (missing.length) throw new Error('В таблице нет листов: ' + missing.join(', '));
@@ -3338,16 +3362,24 @@ function photoLevelFromSheet_(v) {
  *  Реальное фото владельца: снимок экрана планшета (POS), две колонки:
  *    «Блюда на остатке» — позиция и количество (0.00 = закончилось);
  *    «СТОП-ЛИСТ»        — только позиции, без количеств.
- *  Отсюда главная проверка «неправильно убрано»: остаток 0.00, а в
- *  стоп-листе позиции нет. И обратная: позиция в стопе, а остаток есть.
  *
- *  ПОЧЕМУ ДВЕ КОЛОНКИ
- *    Количество — единственный признак, по которому видно, что товар
- *    кончился, а в стоп его забыли поставить. Без остатков «неправильно
- *    убрано» не проверить, поэтому модель читает обе колонки и возвращает
- *    их раздельно: {"stock":[{"name","qty"}],"stop":[{"name"}],
- *    "unreadable":""}. Количества — числа (3.00 → 3, 0.00 → 0); если число
- *    не читается — qty пустой (не ноль!), чтобы не выдумать «закончилось».
+ *  АКТИВНЫЙ СТОП — ОБЪЕДИНЕНИЕ (уточнение владельца):
+ *    стоп = позиции правой колонки ∪ позиции с нулевым остатком слева.
+ *    Ноль слева САМ ПО СЕБЕ значит «в стопе», даже если справа позиции нет.
+ *    Позиция с нулём слева и без строки справа — нормальная ситуация, а не
+ *    ошибка. Сравнивать колонки и выводить из этого «недочёты» НЕЛЬЗЯ —
+ *    такая проверка была ошибочной и удалена.
+ *    Задача раздела одна: сколько дней подряд позиция стоит в стопе.
+ *
+ *  КУХНЯ
+ *    В стоп-лист бара входят только барные позиции. Блюда кухни и служебные
+ *    строки кассы («Комментарий на бар») отсекаются по данным листа «Кухня»
+ *    (позиция | активен | комментарий), а не кодом: владелец дополняет
+ *    список сам. Сравнение — по нормализованному названию (регистр, «ё»,
+ *    кавычки, дефисы, лишние пробелы), поэтому «Торт Три Шоколада» и
+ *    «торт три шоколада» отсекаются одинаково.
+ *    Недочёты по уборке — отдельная функция (проверка фото уборки), здесь
+ *    они не дублируются.
  *
  *  ЭТАЖИ
  *    Стоп-лист свой на каждом этаже (владелец: «добавить каждому этажу
@@ -3361,15 +3393,20 @@ function photoLevelFromSheet_(v) {
  *      перечёркнута | уверенность | фото | источник | этаж |
  *      id | день | модель | заметка        ← служебные, справа
  *      первые девять колонок — как в задании, «этаж» добавлен десятым.
- *      Строка = позиция стоп-листа (фото или ручной ввод). Строка без
- *      позиции и с источником «не распознано» — отметка, что снимок был,
- *      но текст не прочитался.
+ *      Строка = позиция активного стопа (фото или ручной ввод), источник
+ *      «фото» или «ручной ввод»; в заметке видно, пришла ли позиция из
+ *      остатка 0. Строка без позиции и с источником «не распознано» —
+ *      отметка, что снимок был, но текст не прочитался; «пустой стоп» —
+ *      снимок прочитан, барных позиций в стопе нет (день всё равно с данными).
  *    «Стоп-лист — остатки» (создаётся автоматически):
  *      дата | смена/время | сотрудник | этаж | позиция | количество |
  *      фото | id | день | модель
- *      Строка = позиция из колонки «Блюда на остатке» с количеством.
- *      В текущий стоп-лист и в счётчик дней эти строки не попадают — они
- *      нужны только для проверок остатка.
+ *      Справка: что и сколько было в колонке «Блюда на остатке». На счёт
+ *      дней не влияет — но по ней видно, откуда взялась позиция с нулём.
+ *    «Кухня» (создаётся автоматически, заполняется владельцем):
+ *      позиция | активен | комментарий
+ *      Пустой «активен» = активен; «выкл»/«нет»/0 — позиция снова считается
+ *      барной (если ошиблись).
  *
  *  НАЗВАНИЯ
  *    Модель пишет как видно, с объёмом и «бут.». Объём отличает позиции
@@ -3383,18 +3420,16 @@ function photoLevelFromSheet_(v) {
  *
  *  ДНИ В СТОПЕ (в разрезе этаж + позиция)
  *    «День с данными» — календарная дата по Москве, на которую есть хотя бы
- *    одна запись стоп-листа ЭТОГО этажа. Одна позиция = одна запись в день:
- *    повторный снимок в тот же день счётчик не увеличивает (но обновляет
- *    данные — новая строка дня перекрывает старую).
+ *    одна запись стоп-листа ЭТОГО этажа (в том числе «пустой стоп»). Одна
+ *    позиция = одна запись в день: повторный снимок в тот же день счётчик
+ *    не увеличивает (но обновляет данные).
  *    Идём по дням с данными от последнего к первому: позиция есть и не
  *    перечёркнута → +1; день с данными, где позиции нет → счёт закончен;
  *    дня с данными нет вовсе → день не считаем и счёт не обрываем (видно
  *    в gaps). Если позиция выпала, счётчик обнуляется, но прошлый отрезок
  *    остаётся в истории («была N дней до этого»).
  *
- *  НЕДОЧЁТЫ (только помечаем, ничего не блокируем; всё настраивается)
- *    стоплист_проверять_нулевой_остаток  вкл — «нет в стопе при нулевом остатке»
- *    стоплист_проверять_остаток_в_стопе  вкл — «в стопе, а остаток есть»
+ *  НАСТРОЙКИ (только помечаем, ничего не блокируем)
  *    стоплист_проверять_долго            вкл — «долго в стопе»
  *    стоплист_проверять_преждевременно   вкл — «убрано преждевременно»
  *    стоплист_проверять_справочник        вкл — «нет в справочнике»
@@ -3413,17 +3448,32 @@ const STOP_HEADERS = ['дата', 'смена/время', 'сотрудник',
 const STOP_HEADER_KEYS = ['date', 'time', 'employee', 'name', 'catalog', 'crossed', 'confidence',
   'photo', 'source', 'floor', 'id', 'day', 'model', 'note'];
 
-// Лист остатков из колонки «Блюда на остатке».
+// Лист остатков из колонки «Блюда на остатке» (справка: сколько было).
 const STOP_STOCK_HEADERS = ['дата', 'смена/время', 'сотрудник', 'этаж', 'позиция',
   'количество', 'фото', 'id', 'день', 'модель'];
 const STOP_STOCK_KEYS = ['date', 'time', 'employee', 'floor', 'name', 'qty', 'photo', 'id', 'day', 'model'];
 
+// Лист «Кухня»: позиции, которые в стоп-лист бара не входят (блюда кухни
+// и служебные строки кассы). Список ведёт владелец — код его только читает.
+const STOP_KITCHEN_HEADERS = ['позиция', 'активен', 'комментарий'];
+const STOP_KITCHEN_SEED = [
+  { name: 'Равиоли с лососем', note: 'кухня' },
+  { name: 'Салат с утиным филе', note: 'кухня' },
+  { name: 'Торт Три Шоколада', note: 'кухня' },
+  { name: 'Утиное филе на гриле', note: 'кухня' },
+  { name: 'Тапас с лососем', note: 'кухня' },
+  { name: 'Чиз-кейк "Нью-Йорк"', note: 'кухня' },
+  { name: 'Штрудель Яблочный', note: 'кухня' },
+  { name: 'Комментарий на бар', note: 'служебная строка кассы, не позиция' },
+];
+
 const STOP_SOURCE_PHOTO = 'фото';
 const STOP_SOURCE_MANUAL = 'ручной ввод';
 const STOP_SOURCE_UNREADABLE = 'не распознано';
+// Снимок распознан, но барных позиций в стопе нет: день всё равно «с данными».
+const STOP_SOURCE_EMPTY = 'пустой стоп';
 const STOP_MAX_ITEMS = 60;            // больше позиций с одного снимка не принимаем
 const STOP_ANALYSIS_DAYS = 180;       // старше — в расчёт дней не берём
-const STOP_ISSUE_DAYS = 14;           // остатки и «недочёты» смотрим за две недели
 const STOP_DEFAULT_LONG_DAYS = 3;
 const STOP_DEFAULT_PREMATURE_DAYS = 2;
 const STOP_DEFAULT_HISTORY_DAYS = 30;
@@ -3435,10 +3485,6 @@ const STOP_SETTINGS = [
     note: 'стоп-лист: с какого числа дней подряд позиция считается «долго в стопе»' },
   { key: 'стоплист_преждевременно_дней', value: '2',
     note: 'стоп-лист: вернулась в течение стольких дней после «убрали» — «убрано преждевременно» (1–3)' },
-  { key: 'стоплист_проверять_нулевой_остаток', value: 'вкл',
-    note: 'недочёт «нет в стопе при нулевом остатке» (остаток 0.00, а в стоп-листе позиции нет) — показывать' },
-  { key: 'стоплист_проверять_остаток_в_стопе', value: 'вкл',
-    note: 'недочёт «в стопе, а остаток есть» (возможно, забыли убрать) — показывать' },
   { key: 'стоплист_проверять_долго', value: 'вкл', note: 'недочёт «долго в стопе» — показывать' },
   { key: 'стоплист_проверять_преждевременно', value: 'вкл', note: 'недочёт «убрано преждевременно» — показывать' },
   { key: 'стоплист_проверять_справочник', value: 'вкл', note: 'недочёт «нет в справочнике» — показывать' },
@@ -3447,6 +3493,10 @@ const STOP_SETTINGS = [
     note: 'стоп-лист: «вкл» — день без снимка обрывает счёт дней; «выкл» — пропуск не обрывает, но виден как «без данных»' },
   { key: 'стоплист_история_дней', value: '30', note: 'стоп-лист: сколько дней истории позиции показывать в приложении' },
 ];
+
+// Проверки, которые владелец отменил. Строки, оставшиеся в «Настройках»
+// от прошлых версий, удаляются при чтении — чтобы не сбивать с толку.
+const STOP_CANCELED_SETTINGS = ['стоплист_проверять_нулевой_остаток', 'стоплист_проверять_остаток_в_стопе'];
 
 /* ---------- листы и их колонки -------------------------------------- */
 
@@ -3507,6 +3557,81 @@ function ensureStopStockSheet_(ss) {
   widths.forEach(function (w, i) { sh.setColumnWidth(i + 1, w); });
   log_('Стоп-лист', 'создан лист «' + SHEETS.stopStock + '»');
   return sh;
+}
+
+/**
+ * Лист «Кухня»: позиции, которых в стоп-листе бара быть не должно.
+ * Создаётся сам и один раз заполняется блюдами с реального фото и служебной
+ * строкой кассы. Дальше список ведёт владелец — код только читает:
+ * добавил строку — позиция перестала попадать в стоп-лист.
+ */
+function ensureKitchenSheet_(ss) {
+  let sh = ss.getSheetByName(SHEETS.kitchen);
+  if (!sh) {
+    sh = ss.insertSheet(SHEETS.kitchen);
+    log_('Стоп-лист', 'создан лист «' + SHEETS.kitchen + '»');
+  }
+  if (!str_(sh.getRange(1, 1).getValue())) {
+    sh.getRange(1, 1, 1, STOP_KITCHEN_HEADERS.length).setValues([STOP_KITCHEN_HEADERS]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+    sh.setColumnWidth(1, 280);
+    sh.setColumnWidth(2, 100);
+    sh.setColumnWidth(3, 320);
+  }
+  if (sh.getLastRow() < 2) {
+    const rows = STOP_KITCHEN_SEED.map(function (k) {
+      return [stopCell_(k.name), 'вкл', k.note];
+    });
+    sh.getRange(2, 1, rows.length, STOP_KITCHEN_HEADERS.length).setValues(rows);
+    log_('Стоп-лист', 'в «Кухню» записаны стартовые позиции: ' + rows.length);
+  }
+  return sh;
+}
+
+/** Карта колонок «Кухни» по шапке: позиция | активен | комментарий. */
+function stopKitchenColumnMap_(sheet) {
+  return stopMapByHeaders_(sheet, STOP_KITCHEN_HEADERS, ['name', 'active', 'note']);
+}
+
+/** Активная ли строка «Кухни»: пусто = активна, «выкл»/«нет»/0 — нет. */
+function stopKitchenActive_(v) {
+  if (v === false) return false;
+  if (v === true) return true;
+  const s = str_(v).toLowerCase().replace(/[\s.]+$/g, '');
+  if (!s) return true;
+  return !/^(выкл|off|нет|no|false|0)/.test(s);
+}
+
+/**
+ * Множество кухонных позиций: { ключ: как записано у владельца }.
+ * Ключ — нормализованное название (регистр, «ё», кавычки, дефисы, пробелы),
+ * поэтому «Торт Три Шоколада» и «торт три шоколада» — одно и то же.
+ */
+function stopKitchenSet_(ss) {
+  const out = { keys: {}, names: [] };
+  let sh = null;
+  try { sh = ensureKitchenSheet_(ss); } catch (e) {
+    log_('Стоп-лист', 'лист «Кухня» не создан: ' + e);
+    return out;
+  }
+  if (!sh || sh.getLastRow() < 2) return out;
+  const cols = stopKitchenColumnMap_(sh);
+  const width = Math.max(sh.getLastColumn(), STOP_KITCHEN_HEADERS.length);
+  sh.getRange(2, 1, sh.getLastRow() - 1, width).getValues().forEach(function (r) {
+    const name = stopPlain_(r[cols.name - 1]);
+    if (!name) return;
+    if (!stopKitchenActive_(r[cols.active - 1])) return;
+    const key = stopNameKey_(name);
+    if (!key) return;
+    if (!out.keys[key]) { out.keys[key] = name; out.names.push(name); }
+  });
+  return out;
+}
+
+/** Кухонная ли позиция (по нормализованному ключу). */
+function stopIsKitchen_(name, kitchen) {
+  const key = stopNameKey_(name);
+  return !!(key && kitchen && kitchen.keys[key]);
 }
 
 /** Колонки листа «Стоп-лист» по шапке (порядок можно менять). */
@@ -3572,7 +3697,8 @@ function stopRows_(sheet) {
     if (!day) return;
     const name = stopPlain_(r[cols.name - 1]);
     const source = str_(r[cols.source - 1]) || STOP_SOURCE_PHOTO;
-    if (!name && source !== STOP_SOURCE_UNREADABLE) return;
+    // Строка без позиции — только отметка дня: «не распознано» или «пустой стоп».
+    if (!name && source !== STOP_SOURCE_UNREADABLE && source !== STOP_SOURCE_EMPTY) return;
     const rawConf = r[cols.confidence - 1];
     const conf = rawConf === '' || rawConf === null || rawConf === undefined ? null : Number(rawConf);
     out.push({
@@ -3986,54 +4112,24 @@ function stopPhotoSummary_(res, saved) {
   if (!res || !res.ok) return 'не распознано: ' + str_(res && res.reason).slice(0, 200);
   const stopCount = (saved && saved.stop ? saved.stop.length : 0);
   const stockCount = (saved && saved.stock ? saved.stock.length : 0);
+  const fromStock = (saved && saved.stop ? saved.stop.filter(i => i.origin === 'stock').length : 0);
   const unknown = (saved && saved.stop ? saved.stop.filter(i => !i.inCatalog).length : 0);
-  const parts = ['стоп-лист: ' + stopCount, 'остатки: ' + stockCount];
+  const excluded = (saved && saved.excluded ? saved.excluded.length : 0);
+  const parts = ['в стопе: ' + stopCount];
+  if (fromStock) parts.push('из них по остатку 0: ' + fromStock);
+  parts.push('остатки: ' + stockCount);
+  if (excluded) parts.push('кухня отсечена: ' + excluded);
   if (unknown) parts.push('нет в справочнике: ' + unknown);
-  const issues = (saved && saved.issues ? saved.issues.length : 0);
-  if (issues) parts.push('недочётов: ' + issues);
   let s = parts.join(', ');
   if (res.unreadable) s += '; не прочитано: ' + res.unreadable;
   return s.slice(0, 500);
 }
 
-/** Недочёты по одному снимку: остаток 0 без стопа и стоп с остатком. */
-function stopPhotoIssues_(stopItems, stockItems) {
-  const stopIndex = stopMakeIndex_((stopItems || []).map(i => ({ name: i.canonical || i.name })));
-  const issues = [];
-  (stockItems || []).forEach(s => {
-    const hit = stopFindIn_(s.name, stopIndex);
-    if (s.qty === 0 && !hit) issues.push({ kind: 'zero', name: s.name, qty: 0 });
-    if (s.qty !== null && s.qty > 0 && hit) issues.push({ kind: 'stock', name: s.name, qty: s.qty, stopName: hit.name });
-  });
-  return issues;
-}
-
-/** Индекс списка для сравнения: ключ, усечённый ключ, числа. */
-function stopMakeIndex_(entries) {
-  const list = [];
-  (entries || []).forEach(e => {
-    const key = stopNameKey_(e.name);
-    if (!key) return;
-    list.push({ name: e.name, key: key, stem: stopStemKey_(e.name), nums: stopNumbers_(e.name) });
-  });
-  return list;
-}
-
-/** Есть ли позиция в индексе: точное совпадение или падежи при тех же числах. */
-function stopFindIn_(name, index) {
-  const key = stopNameKey_(name);
-  if (!key) return null;
-  for (let i = 0; i < index.length; i++) if (index[i].key === key) return index[i];
-  const stem = stopStemKey_(name);
-  for (let i = 0; i < index.length; i++) {
-    if (index[i].stem === stem && stopSameNumbers_(name, index[i].name)) return index[i];
-  }
-  return null;
-}
-
 /**
- * Пишет обе колонки снимка: позиции — в «Стоп-лист», количества — в
- * «Стоп-лист — остатки». Возвращает {stop, stock, issues, day, floor}.
+ * Пишет снимок: активный стоп (объединение правой колонки и нулевых остатков)
+ * — в «Стоп-лист», количества — в «Стоп-лист — остатки» (справка).
+ * Кухня и служебные строки отсекаются по листу «Кухня».
+ * Возвращает {stop, stock, excluded, day, floor}.
  */
 function stopListSavePhotoRows_(ss, auth, id, created, fileUrl, floor, res) {
   const sh = ensureStopSheet_(ss);
@@ -4041,6 +4137,7 @@ function stopListSavePhotoRows_(ss, auth, id, created, fileUrl, floor, res) {
   const stockSh = ensureStopStockSheet_(ss);
   const stockCols = stopStockColumnMap_(stockSh);
   const dict = stopDictionary_(ss);
+  const kitchen = stopKitchenSet_(ss);
   const day = stopDayKey_(created);
   const fl = stopFloorNorm_(floor);
   const time = Utilities.formatDate(created, 'Europe/Moscow', 'HH:mm');
@@ -4048,34 +4145,74 @@ function stopListSavePhotoRows_(ss, auth, id, created, fileUrl, floor, res) {
 
   const items = [];
   const stockItems = [];
+  const excluded = [];
 
   if (res && res.ok) {
-    const rows = [];
-    (res.stop || []).forEach(it => {
+    // 1. Левая колонка: количества (справка) и кандидаты в стоп по нулю.
+    const stockRows = [];
+    (res.stock || []).forEach(it => {
       const shown = stopStripMarker_(it.name);
-      const match = stopMatchName_(shown, dict, false);
+      if (!shown) return;
+      if (stopIsKitchen_(shown, kitchen)) {
+        if (excluded.indexOf(shown) < 0) excluded.push(shown);
+        return;
+      }
+      stockRows.push([created, time, stopCell_(auth.name), fl, stopCell_(shown),
+        it.qty === null || it.qty === undefined ? '' : it.qty, '', "'" + id, day, model]);
+      stockItems.push({ name: shown, qty: it.qty === undefined ? null : it.qty, floor: fl });
+    });
+
+    // 2. Активный стоп = правая колонка ∪ позиции с нулевым остатком.
+    const active = [];
+    const seen = {};
+    const addActive = function (name, origin) {
+      const shown = stopStripMarker_(name);
+      if (!shown) return;
+      if (stopIsKitchen_(shown, kitchen)) {
+        if (excluded.indexOf(shown) < 0) excluded.push(shown);
+        return;
+      }
+      const key = stopNameKey_(shown);
+      if (!key) return;
+      if (seen[key]) {
+        // Позиция уже в стопе; если она из правой колонки — источник важнее.
+        if (origin === 'stop') seen[key].origin = 'stop';
+        return;
+      }
+      seen[key] = { name: shown, origin: origin };
+      active.push(seen[key]);
+    };
+    (res.stop || []).forEach(it => addActive(it.name, 'stop'));
+    (res.stock || []).forEach(it => {
+      if (it.qty === 0) addActive(it.name, 'stock');
+    });
+
+    // 3. Запись активного стопа.
+    const rows = [];
+    active.forEach(it => {
+      const match = stopMatchName_(it.name, dict, false);
       const canonical = match ? match.name : '';
-      const note = canonical ? '' : 'нет в справочнике';
-      rows.push([created, time, stopCell_(auth.name), stopCell_(shown), stopCell_(canonical),
+      const notes = [];
+      if (it.origin === 'stock') notes.push('из остатка 0');
+      if (!canonical) notes.push('нет в справочнике');
+      const note = notes.join('; ');
+      rows.push([created, time, stopCell_(auth.name), stopCell_(it.name), stopCell_(canonical),
         false, '', '', STOP_SOURCE_PHOTO, fl, "'" + id, day, model, stopCell_(note)]);
       items.push({
-        name: shown, canonical: canonical, inCatalog: !!canonical,
-        crossedOut: false, confidence: null, note: note, floor: fl,
+        name: it.name, canonical: canonical, inCatalog: !!canonical,
+        crossedOut: false, confidence: null, note: note, floor: fl, origin: it.origin,
       });
     });
     if (rows.length) {
       const start = stopAppendRows_(sh, rows);
       stopLinkPhoto_(sh, cols.photo, start, rows.length, fileUrl);
+    } else {
+      // Снимок прочитан, но барных позиций в стопе нет: день с данными.
+      stopAppendRows_(sh, [[created, time, stopCell_(auth.name), '', '', false, '', '',
+        STOP_SOURCE_EMPTY, fl, "'" + id, day, model, stopCell_('стоп-лист пуст')]]);
     }
 
-    const stockRows = [];
-    (res.stock || []).forEach(it => {
-      const shown = stopStripMarker_(it.name);
-      if (!shown) return;
-      stockRows.push([created, time, stopCell_(auth.name), fl, stopCell_(shown),
-        it.qty === null || it.qty === undefined ? '' : it.qty, '', "'" + id, day, model]);
-      stockItems.push({ name: shown, qty: it.qty === undefined ? null : it.qty, floor: fl });
-    });
+    // 4. Остатки — справка (на счёт дней не влияют).
     if (stockRows.length) {
       const start = stopAppendRows_(stockSh, stockRows);
       stopLinkPhoto_(stockSh, stockCols.photo, start, stockRows.length, fileUrl);
@@ -4088,8 +4225,7 @@ function stopListSavePhotoRows_(ss, auth, id, created, fileUrl, floor, res) {
   }
 
   return {
-    stop: items, stock: stockItems,
-    issues: stopPhotoIssues_(items, stockItems),
+    stop: items, stock: stockItems, excluded: excluded,
     day: day, floor: fl,
   };
 }
@@ -4138,6 +4274,10 @@ function saveStopListItem_(ss, sheet, auth, rec, id, created, received, comment)
   const crossed = rec.crossedOut === true;
   const day = stopDayKey_(created);
   const dict = stopDictionary_(ss);
+  // Кухня в стоп-лист бара не идёт: список ведёт владелец в листе «Кухня».
+  if (stopIsKitchen_(name, stopKitchenSet_(ss))) {
+    return { id, status: 'error', error: '«' + name + '» — позиция кухни, в стоп-лист бара не идёт' };
+  }
   const match = stopMatchName_(name, dict, false);
   const canonical = match ? match.name : '';
   const key = stopNameKey_(canonical || name);
@@ -4177,8 +4317,6 @@ function stopSettings_(ss) {
     historyDays: num('стоплист_история_дней', STOP_DEFAULT_HISTORY_DAYS, 1, 365),
     gapBreaks: gapRaw ? featureOn_(gapRaw) : false,
     checks: {
-      zero: featureOn_(values['стоплист_проверять_нулевой_остаток']),
-      stock: featureOn_(values['стоплист_проверять_остаток_в_стопе']),
       long: featureOn_(values['стоплист_проверять_долго']),
       premature: featureOn_(values['стоплист_проверять_преждевременно']),
       catalog: featureOn_(values['стоплист_проверять_справочник']),
@@ -4265,6 +4403,7 @@ function stopGroupState_(g, dataDays, lastDataDay, today, settings) {
     name: stopPickName_(g.names, g.canonical),
     canonical: g.canonical || '',
     inCatalog: !!g.canonical,
+    fromStock: !!g.fromStock,
     days: current ? current.days : 0,
     since: current ? current.from : '',
     span: current ? current.span : 0,
@@ -4299,6 +4438,13 @@ function stopFloorState_(floor, rowsF, stockF, settings, today, dict) {
     if (!r.name) {
       if (r.source === STOP_SOURCE_UNREADABLE) {
         noData.push({ day: r.day, time: r.time, reason: r.note || 'не распознано', employee: r.employee });
+        return;
+      }
+      if (r.source === STOP_SOURCE_EMPTY) {
+        // Снимок прочитан, барных позиций в стопе нет: день с данными без позиций.
+        if (!seenDay[r.day]) { seenDay[r.day] = true; dataDays.push(r.day); }
+        photos++;
+        if (r.id) photoIds[r.id] = true;
       }
       return;
     }
@@ -4323,11 +4469,12 @@ function stopFloorState_(floor, rowsF, stockF, settings, today, dict) {
     const gkey = canonical ? 'c:' + stopNameKey_(canonical) : 'r:' + stopNameKey_(r.name);
     if (!gkey || gkey === 'r:') return;
     if (!groups[gkey]) {
-      groups[gkey] = { key: gkey, canonical: canonical, names: {}, days: {}, records: [], crossedDays: {} };
+      groups[gkey] = { key: gkey, canonical: canonical, names: {}, days: {}, records: [], crossedDays: {}, fromStock: false };
       order.push(gkey);
     }
     const g = groups[gkey];
     if (!g.canonical && canonical) g.canonical = canonical;
+    if (!g.fromStock && /из остатка 0/.test(r.note || '')) g.fromStock = true;
     const label = canonical || r.name;
     g.names[label] = (g.names[label] || 0) + 1;
     const d = g.days[r.day] || (g.days[r.day] = { present: false, crossed: false, records: 0 });
@@ -4341,51 +4488,12 @@ function stopFloorState_(floor, rowsF, stockF, settings, today, dict) {
   const current = positions.filter(p => p.days > 0)
     .sort((a, b) => (b.days - a.days) || String(a.name).localeCompare(String(b.name), 'ru'));
 
-  // Остатки по дням: последняя запись дня перекрывает предыдущую.
-  const stockByDay = {};
-  stockF.forEach(r => {
-    if (!r.name) return;
-    const map = stockByDay[r.day] || (stockByDay[r.day] = {});
-    const k = stopNameKey_(r.name);
-    if (k) map[k] = { name: r.name, qty: r.qty, key: k };
-  });
-  // Для сравнения остатков нужен индекс позиций стоп-листа по каждому дню.
-  const stopDayKeys = {};
-  rowsF.forEach(r => {
-    if (!r.name || r.crossed) return;
-    const map = stopDayKeys[r.day] || (stopDayKeys[r.day] = []);
-    map.push({ name: r.catalog || r.name });
-  });
-
-  const stockIssues = [];
-  if (settings.checks.zero || settings.checks.stock) {
-    Object.keys(stockByDay).sort().forEach(day => {
-      if (stopDayDiff_(day, today) > STOP_ISSUE_DAYS || stopDayDiff_(day, today) < -1) return;
-      const stockList = Object.keys(stockByDay[day]).map(k => stockByDay[day][k]);
-      const stopIndex = stopMakeIndex_(stopDayKeys[day] || []);
-      stockList.forEach(s => {
-        const hit = stopFindIn_(s.name, stopIndex);
-        if (settings.checks.zero && s.qty === 0 && !hit) {
-          stockIssues.push({ kind: 'zero', day: day, floor: floor, name: s.name, qty: 0 });
-        }
-        if (settings.checks.stock && s.qty !== null && s.qty > 0 && hit) {
-          stockIssues.push({ kind: 'stock', day: day, floor: floor, name: s.name, qty: s.qty, stopName: hit.name });
-        }
-      });
-    });
-  }
-  stockIssues.sort((a, b) => (a.day === b.day ? String(a.name).localeCompare(String(b.name), 'ru') : b.day.localeCompare(a.day)));
-
   const missingCatalog = current.filter(p => !p.inCatalog);
   const long = current.filter(p => p.long);
   const premature = positions.filter(p => p.premature);
   const returned = positions.filter(p => p.returned && p.days > 0);
-  const zeroIssues = stockIssues.filter(i => i.kind === 'zero');
-  const stockFlagged = stockIssues.filter(i => i.kind === 'stock');
 
   const issuesCount =
-    (settings.checks.zero ? zeroIssues.length : 0) +
-    (settings.checks.stock ? stockFlagged.length : 0) +
     (settings.checks.long ? long.length : 0) +
     (settings.checks.premature ? premature.length : 0) +
     (settings.checks.catalog ? missingCatalog.length : 0) +
@@ -4400,9 +4508,6 @@ function stopFloorState_(floor, rowsF, stockF, settings, today, dict) {
     missingCatalog: missingCatalog,
     returned: returned,
     noData: noData.slice(0, 10),
-    stockIssues: stockIssues.slice(0, 30),
-    zeroIssues: zeroIssues,
-    stockFlagged: stockFlagged,
     issuesCount: issuesCount,
     totals: {
       positions: positions.length,
@@ -4411,7 +4516,6 @@ function stopFloorState_(floor, rowsF, stockF, settings, today, dict) {
       photos: photos,
       photoShots: Object.keys(photoIds).length,
       manual: manual,
-      stockRows: stockF.length,
       unreadable: noData.length,
       lastDay: lastDataDay,
     },
@@ -4420,17 +4524,18 @@ function stopFloorState_(floor, rowsF, stockF, settings, today, dict) {
 
 /**
  * Полное состояние стоп-листа: по каждому этажу — текущий список с днями,
- * долгожители, «убрано преждевременно», «нет в справочнике», остатки,
- * «нет данных за смену».
+ * долгожители, «убрано преждевременно», «нет в справочнике», «нет данных».
+ * Остатки в расчёт не входят: нулевой остаток уже превратился в позицию
+ * стопа при записи снимка.
  */
 function stopListState_(ss) {
   const settings = stopSettings_(ss);
   const stopSh = ensureStopSheet_(ss);
-  // Лист остатков создаём заранее: владелец должен видеть его в таблице
-  // до первого снимка (ошибка создания не должна ломать чтение).
+  // Листы создаём заранее: владелец должен видеть их в таблице до первого
+  // снимка (ошибка создания не должна ломать чтение).
   try { ensureStopStockSheet_(ss); } catch (e) { log_('Стоп-лист', 'лист остатков не создан: ' + e); }
+  try { ensureKitchenSheet_(ss); } catch (e) { log_('Стоп-лист', 'лист «Кухня» не создан: ' + e); }
   const rows = stopRows_(stopSh);
-  const stockRows = stopStockRows_(ss);
   const today = stopDayKey_(new Date());
   const dict = stopDictionary_(ss);
 
@@ -4443,13 +4548,12 @@ function stopListState_(ss) {
   const byFloor = {};
   const order = [];
   const ensureFloor = function (f) {
-    if (!byFloor[f]) { byFloor[f] = { stop: [], stock: [] }; order.push(f); }
+    if (!byFloor[f]) { byFloor[f] = { stop: [] }; order.push(f); }
     return byFloor[f];
   };
   // Оба этажа показываем всегда: даже пустой стоп — это ответ.
   STOP_STANDARD_FLOORS.forEach(ensureFloor);
   rows.filter(inWindow).forEach(r => ensureFloor(r.floor).stop.push(r));
-  stockRows.filter(inWindow).forEach(r => ensureFloor(r.floor).stock.push(r));
 
   order.sort((a, b) => {
     const na = parseInt(a, 10), nb = parseInt(b, 10);
@@ -4459,9 +4563,9 @@ function stopListState_(ss) {
     return String(a).localeCompare(String(b), 'ru');
   });
 
-  const floors = order.map(f => stopFloorState_(f, byFloor[f].stop, byFloor[f].stock, settings, today, dict));
+  const floors = order.map(f => stopFloorState_(f, byFloor[f].stop, [], settings, today, dict));
   const history = {};
-  let positions = 0, inStop = 0, photos = 0, manual = 0, unreadable = 0, stockRowsCount = 0;
+  let positions = 0, inStop = 0, photos = 0, manual = 0, unreadable = 0;
   floors.forEach(fs => {
     history[fs.floor] = {};
     fs.positions.forEach(p => { history[fs.floor][p.name] = p.history; });
@@ -4470,7 +4574,6 @@ function stopListState_(ss) {
     photos += fs.totals.photos;
     manual += fs.totals.manual;
     unreadable += fs.totals.unreadable;
-    stockRowsCount += fs.totals.stockRows;
   });
 
   return {
@@ -4484,7 +4587,6 @@ function stopListState_(ss) {
       inStop: inStop,
       photos: photos,
       manual: manual,
-      stockRows: stockRowsCount,
       unreadable: unreadable,
     },
   };
@@ -4497,6 +4599,7 @@ function stopItemPublic_(p, floor) {
     name: p.name,
     canonical: p.canonical || '',
     inCatalog: !!p.inCatalog,
+    fromStock: !!p.fromStock,
     days: p.days,
     since: p.since,
     span: p.span,
@@ -4517,14 +4620,6 @@ function stopItemPublic_(p, floor) {
   };
 }
 
-/** Недочёт остатка для телефона. */
-function stopStockIssuePublic_(i) {
-  return {
-    kind: i.kind, day: i.day, floor: i.floor, name: i.name, qty: i.qty,
-    stopName: i.stopName || '',
-  };
-}
-
 /**
  * Ответ телефону. withHistory = true — отдельный запрос (?action=stopList),
  * false — компактная версия для config (история по позициям не влезает).
@@ -4539,7 +4634,6 @@ function stopListPublic_(state, withHistory) {
     missingCatalog: f.missingCatalog.map(p => stopItemPublic_(p, f.floor)),
     returned: f.returned.map(p => stopItemPublic_(p, f.floor)),
     noData: f.noData,
-    stockIssues: f.stockIssues.map(stopStockIssuePublic_),
     issuesCount: f.issuesCount,
     totals: f.totals,
   }));
@@ -4574,10 +4668,12 @@ function setupStopList() {
   const ss = ss_();
   const sh = ensureStopSheet_(ss);
   const stock = ensureStopStockSheet_(ss);
+  const kitchen = ensureKitchenSheet_(ss);
   ensureSettingsSheet_(ss);
   const msg = 'Стоп-лист: лист «' + SHEETS.stopList + '» ' +
     (sh.getLastRow() < 2 ? 'пустой' : 'строк: ' + (sh.getLastRow() - 1)) +
     '; остатки: ' + (stock.getLastRow() < 2 ? 'пусто' : 'строк: ' + (stock.getLastRow() - 1)) +
+    '; кухня: ' + Math.max(0, kitchen.getLastRow() - 1) + ' поз.' +
     '; ключ Gemini: ' + (PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY') ? 'есть' : 'НЕТ') + '.';
   Logger.log(msg);
   log_('Стоп-лист', msg);

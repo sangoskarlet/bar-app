@@ -92,6 +92,9 @@ class FakeSheet {
   getRange(row, col, numRows = 1, numCols = 1) { return new FakeRange(this, row, col, numRows, numCols); }
   insertRowsAfter() {}
   deleteRows() {}
+  deleteRow(row) {
+    if (row >= 1 && row <= this.cells.length) this.cells.splice(row - 1, 1);
+  }
   setFrozenRows() {}
   setColumnWidth() {}
   appendRow(values) {
@@ -353,7 +356,7 @@ function addStopRow(ss, o) {
   ]]);
 }
 
-/** Строка в «Стоп-лист — остатки». */
+/** Строка в «Стоп-лист — остатки» (архив количеств, на счёт дней не влияет). */
 function addStockRow(ss, o) {
   const sh = sandbox.ensureStopStockSheet_(ss);
   const day = o.day || today();
@@ -362,6 +365,23 @@ function addStockRow(ss, o) {
     o.floor || '1', o.name, o.qty === null || o.qty === undefined ? '' : o.qty,
     '', o.id ? "'" + o.id : '', day, o.model || 'gemini-flash-lite-latest',
   ]]);
+}
+
+/**
+ * Снимок стоп-листа «как с планшета» на нужный день: пишет объединение
+ * (правая колонка + нулевые остатки), отсекает кухню. Возвращает результат
+ * stopListSavePhotoRows_ — по нему проверяем, что попало в лист.
+ */
+function photoSave(ss, o) {
+  const day = o.day || today();
+  const created = new Date(day + 'T' + (o.time || '23:00') + ':00+03:00');
+  let n = (photoSave.seq = (photoSave.seq || 0) + 1);
+  return sandbox.stopListSavePhotoRows_(ss, { name: o.employee || 'Анна' },
+    o.id || 'photo-' + String(1000 + n) + '-abcd', created, '', o.floor || '1', {
+      ok: true, model: 'gemini-flash-lite-latest', unreadable: '', reason: '',
+      stop: (o.stop || []).map(name => ({ name: name })),
+      stock: (o.stock || []).map(x => ({ name: x[0], qty: x[1] })),
+    });
 }
 
 function setSetting(ss, key, value) {
@@ -533,10 +553,11 @@ test('дни: снимок второго этажа не двигает счё�
   const ss = makeSs();
   state.ss = ss;
   addStopRow(ss, { day: dayAgo(1), floor: '1', name: 'Лимоны', catalog: 'Лимоны' });
-  addStockRow(ss, { day: today(), floor: '2', name: 'Лимоны', qty: 1 });
+  photoSave(ss, { floor: '2', stop: ['Просекко'] });
   const st = sandbox.stopListState_(ss);
   assert.equal(floorOf(st, '1').current[0].days, 1);   // сегодня данных 1 этажа нет
-  assert.equal(floorOf(st, '2').current.length, 0);
+  assert.equal(floorOf(st, '2').current.length, 1);
+  assert.equal(floorOf(st, '2').current[0].name, 'Просекко');
 });
 
 test('дни: повторный снимок в тот же день не удваивает счётчик', () => {
@@ -639,82 +660,121 @@ test('недочёт «нет данных за смену»: нечитаемы
 });
 
 // =====================================================================
-//  E. ОСТАТКИ: «НЕПРАВИЛЬНО УБРАНО» И ОБРАТНАЯ ПРОВЕРКА
+//  E. АКТИВНЫЙ СТОП = ОБЪЕДИНЕНИЕ, КУХНЯ ОТСЕКАЕТСЯ
 // =====================================================================
-test('недочёт: остаток 0.00, а в стоп-листе позиции нет', () => {
+test('активный стоп: ноль слева сам по себе значит «в стопе»', () => {
   const ss = makeSs();
   state.ss = ss;
-  addStockRow(ss, { day: today(), floor: '1', name: 'Чиз-кейк "Нью-Йорк"', qty: 0 });
-  addStockRow(ss, { day: today(), floor: '1', name: 'Штрудель Яблочный', qty: 4 });
-  addStopRow(ss, { day: today(), floor: '1', name: '0,3 Курпфайц нефильтрованное' });
+  const saved = photoSave(ss, {
+    stock: [['Сидр Эйбрахолс', 0], ['Домен Брюне', 3]],
+  });
+  assert.equal(saved.stop.length, 1);
+  assert.equal(saved.stop[0].origin, 'stock');
   const f1 = floorOf(sandbox.stopListState_(ss), '1');
-  assert.equal(f1.zeroIssues.length, 1);
-  assert.equal(f1.zeroIssues[0].name, 'Чиз-кейк "Нью-Йорк"');
-  assert.equal(f1.zeroIssues[0].kind, 'zero');
-  assert.equal(f1.zeroIssues[0].qty, 0);
-  assert.equal(f1.stockFlagged.length, 0);
+  assert.equal(f1.current.length, 1);
+  assert.equal(f1.current[0].name, 'Сидр Эйбрахолс');
+  assert.equal(f1.current[0].days, 1);
 });
 
-test('недочёт: позиция в стопе, а остаток есть', () => {
+test('активный стоп: правая колонка и ноль слева объединяются, дубль не двоится', () => {
   const ss = makeSs();
   state.ss = ss;
-  addStopRow(ss, { day: today(), floor: '1', name: 'Вишневка 40мл' });
-  addStockRow(ss, { day: today(), floor: '1', name: 'Вишневка 40мл', qty: 2 });
+  const saved = photoSave(ss, {
+    stop: ['Вишневка 40мл'],
+    stock: [['Вишневка 40мл', 0], ['Сидр', 0]],
+  });
+  assert.equal(saved.stop.length, 2);
+  const byName = {};
+  saved.stop.forEach(i => { byName[i.name] = i; });
+  assert.equal(byName['Вишневка 40мл'].origin, 'stop');
+  assert.equal(byName['Сидр'].origin, 'stock');
   const f1 = floorOf(sandbox.stopListState_(ss), '1');
-  assert.equal(f1.stockFlagged.length, 1);
-  assert.equal(f1.stockFlagged[0].kind, 'stock');
-  assert.equal(f1.stockFlagged[0].qty, 2);
-  assert.equal(f1.zeroIssues.length, 0);
+  assert.equal(f1.current.length, 2);
 });
 
-test('остатки не попадают в текущий стоп-лист и не считают дни', () => {
+test('кухня отсекается и из правой колонки, и из нулевого остатка', () => {
   const ss = makeSs();
   state.ss = ss;
-  addStockRow(ss, { day: today(), floor: '1', name: 'Домен Брюне Шинон', qty: 3 });
-  addStockRow(ss, { day: dayAgo(1), floor: '1', name: 'Домен Брюне Шинон', qty: 1 });
+  const saved = photoSave(ss, {
+    stop: ['Равиоли с лососем', 'Вишневка 40мл'],
+    stock: [['Чиз-кейк "Нью-Йорк"', 0], ['Сидр', 0]],
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(saved.excluded)).sort(),
+    ['Равиоли с лососем', 'Чиз-кейк "Нью-Йорк"']);
+  assert.deepEqual(JSON.parse(JSON.stringify(saved.stop.map(i => i.name))).sort(),
+    ['Вишневка 40мл', 'Сидр']);
+  const f1 = floorOf(sandbox.stopListState_(ss), '1');
+  assert.deepEqual(JSON.parse(JSON.stringify(f1.current.map(p => p.name).sort())),
+    ['Вишневка 40мл', 'Сидр']);
+  assert.equal(f1.totals.daysWithData, 1);
+});
+
+test('кухня: сравнение по нормализованному названию — регистр, кавычки, пробелы', () => {
+  const ss = makeSs({ 'Кухня': [['позиция', 'активен', 'комментарий'], [
+    ['Торт Три Шоколада', 'вкл', ''],
+    ['Чиз-кейк "Нью-Йорк"', 'вкл', ''],
+  ]] });
+  state.ss = ss;
+  const kitchen = sandbox.stopKitchenSet_(ss);
+  assert.equal(sandbox.stopIsKitchen_('торт три шоколада', kitchen), true);
+  assert.equal(sandbox.stopIsKitchen_('ТОРТ   ТРИ ШОКОЛАДА', kitchen), true);
+  assert.equal(sandbox.stopIsKitchen_('Чиз-кейк Нью-Йорк', kitchen), true); // без кавычек
+  assert.equal(sandbox.stopIsKitchen_('Штрудель Яблочный', kitchen), false);
+});
+
+test('кухня: «выкл» возвращает позицию в стоп-лист', () => {
+  const ss = makeSs({ 'Кухня': [['позиция', 'активен', 'комментарий'], [
+    ['Торт Три Шоколада', 'выкл', 'ошиблись, это бар'],
+  ]] });
+  state.ss = ss;
+  assert.equal(sandbox.stopIsKitchen_('Торт Три Шоколада', sandbox.stopKitchenSet_(ss)), false);
+});
+
+test('кухня заводится сама: стартовый список и служебная строка кассы', () => {
+  const ss = makeSs();
+  state.ss = ss;
+  const kitchen = sandbox.stopKitchenSet_(ss);
+  assert.equal(sandbox.stopIsKitchen_('Комментарий на бар', kitchen), true);
+  assert.equal(sandbox.stopIsKitchen_('Утиное филе на гриле', kitchen), true);
+  assert.equal(sandbox.stopIsKitchen_('0,3 Курпфайц нефильтрованное', kitchen), false);
+  assert.ok(rowsOf(ss, 'Кухня').length >= 8);
+});
+
+test('пустой стоп после кухни: день остаётся данными и обрывает серию', () => {
+  const ss = makeSs();
+  state.ss = ss;
+  addStopRow(ss, { day: dayAgo(1), floor: '1', name: 'Вишневка 40мл', id: 'stop-0001-abcd' });
+  // Второй день: в обеих колонках только кухня — значит барный стоп пуст.
+  photoSave(ss, { stop: ['Равиоли с лососем'], stock: [['Чиз-кейк "Нью-Йорк"', 0]] });
+  const rows = rowsOf(ss, 'Стоп-лист');
+  const idx = {};
+  sandbox.STOP_HEADERS.forEach((h, i) => { idx[h] = i; });
+  const todayRows = rows.filter(r => r[idx['день']] === today());
+  assert.equal(todayRows.length, 1);
+  assert.equal(todayRows[0][idx['источник']], 'пустой стоп');
+  assert.equal(todayRows[0][idx['позиция']], '');
+
   const f1 = floorOf(sandbox.stopListState_(ss), '1');
   assert.equal(f1.current.length, 0);
-  assert.equal(f1.totals.stockRows, 2);
-  assert.equal(f1.totals.daysWithData, 0);
+  assert.equal(f1.totals.daysWithData, 2);
+  const pos = f1.positions.find(p => p.name === 'Вишневка 40мл');
+  assert.equal(pos.days, 0);
+  assert.equal(pos.totalDays, 1);
 });
 
-test('остаток и стоп сравниваются по названию с числами: «0,3» не равно «0,5»', () => {
+test('дни по объединению: день справа, день по нулевому остатку — два дня', () => {
   const ss = makeSs();
   state.ss = ss;
-  addStockRow(ss, { day: today(), floor: '1', name: '0,5 Курпфайц нефильтрованное', qty: 0 });
-  addStopRow(ss, { day: today(), floor: '1', name: '0,3 Курпфайц нефильтрованное' });
-  const f1 = floorOf(sandbox.stopListState_(ss), '1');
-  // 0,5 нет в стопе (там 0,3) — недочёт; 0,3 в стопе, остатка нет — не чего проверять.
-  assert.equal(f1.zeroIssues.length, 1);
-  assert.match(f1.zeroIssues[0].name, /0,5/);
+  photoSave(ss, { day: dayAgo(1), stop: ['Вишневка 40мл'] });
+  photoSave(ss, { stock: [['Вишневка 40мл', 0]] });
+  const p = floorOf(sandbox.stopListState_(ss), '1').current[0];
+  assert.equal(p.name, 'Вишневка 40мл');
+  assert.equal(p.days, 2);
 });
 
-test('остатки на разных этажах не смешиваются', () => {
+test('реальное фото: 13 стоп + 8 остатков → 9 барных в стопе, 8 кухни отсечено', () => {
   const ss = makeSs();
   state.ss = ss;
-  addStopRow(ss, { day: today(), floor: '1', name: 'Вишневка 40мл' });
-  addStockRow(ss, { day: today(), floor: '2', name: 'Вишневка 40мл', qty: 2 });
-  const st = sandbox.stopListState_(ss);
-  assert.equal(floorOf(st, '1').stockFlagged.length, 0);
-  assert.equal(floorOf(st, '2').stockFlagged.length, 0);
-});
-
-test('флаги проверок остатков выключают недочёт', () => {
-  const ss = makeSs();
-  state.ss = ss;
-  addStockRow(ss, { day: today(), floor: '1', name: 'Чиз-кейк', qty: 0 });
-  assert.equal(floorOf(sandbox.stopListState_(ss), '1').zeroIssues.length, 1);
-  assert.ok(setSetting(ss, 'стоплист_проверять_нулевой_остаток', 'выкл'));
-  const f1 = floorOf(sandbox.stopListState_(ss), '1');
-  assert.equal(f1.zeroIssues.length, 0);
-  assert.equal(f1.settings === undefined, true); // настройки живут на верхнем уровне
-  assert.equal(sandbox.stopListState_(ss).settings.checks.zero, false);
-});
-
-test('реальные списки с фото: 8 остатков и 13 стоп — ровно два недочёта по нулю', () => {
-  const ss = makeSs();
-  state.ss = ss;
-  const day = today();
   const stock = [
     ['0,150 Домен Брюне Шинон', 3],
     ['бут. Фрисленд Шираз/Гренаш', 1],
@@ -740,26 +800,47 @@ test('реальные списки с фото: 8 остатков и 13 сто
     'Хреновуха 40мл',
     'Черноплодная рябина 40мл',
   ];
-  stock.forEach(([name, qty]) => addStockRow(ss, { day, floor: '1', name, qty }));
-  stop.forEach(name => addStopRow(ss, { day, floor: '1', name }));
+  const saved = photoSave(ss, { stop: stop, stock: stock });
+  // 8 барных из правой колонки + «Сидр Эйбрахолс» с нулевым остатком.
+  assert.equal(saved.stop.length, 9);
+  assert.equal(saved.excluded.length, 8);
+  const names = saved.stop.map(p => p.name);
+  assert.ok(names.includes('бут.Сидр Эйбрахолс яблочный сух.'));
+  assert.ok(!names.includes('Чиз-кейк "Нью-Йорк"'));
+  assert.ok(!names.includes('Комментарий на бар'));
+  assert.ok(!names.includes('Равиоли с лососем'));
   const f1 = floorOf(sandbox.stopListState_(ss), '1');
-  assert.equal(f1.current.length, 13);
-  assert.equal(f1.totals.stockRows, 8);
-  assert.deepEqual(JSON.parse(JSON.stringify(f1.zeroIssues.map(i => i.name))),
-    ['бут.Сидр Эйбрахолс яблочный сух.', 'Чиз-кейк "Нью-Йорк"']);
-  assert.equal(f1.stockFlagged.length, 0);
+  assert.equal(f1.current.length, 9);
+  assert.equal(f1.totals.daysWithData, 1);
+});
+
+test('отменённые проверки остатков удаляются из «Настроек»', () => {
+  const ss = makeSs();
+  state.ss = ss;
+  const sh = sandbox.ensureSettingsSheet_(ss);
+  const rows = sh.cells.length;
+  sh.getRange(rows + 1, 1, 2, 3).setValues([
+    ['стоплист_проверять_нулевой_остаток', 'вкл', 'старое'],
+    ['стоплист_проверять_остаток_в_стопе', 'вкл', 'старое'],
+  ]);
+  sandbox.ensureSettingsSheet_(ss);
+  const keys = rowsOf(ss, 'Настройки').map(r => r[0]);
+  assert.equal(keys.indexOf('стоплист_проверять_нулевой_остаток'), -1);
+  assert.equal(keys.indexOf('стоплист_проверять_остаток_в_стопе'), -1);
+  assert.ok(keys.includes('стоплист_проверять_долго'));
 });
 
 // =====================================================================
 //  F. СНИМОК СТОП-ЛИСТА ЧЕРЕЗ SUBMIT
 // =====================================================================
-test('снимок: обе колонки и этаж пишутся, чистоты не проверяет', () => {
+test('снимок: объединение пишется, кухня отсекается, этаж сохраняется', () => {
   const ss = makeSs();
   state.ss = ss;
   state.fetchHandler = () => geminiOk({
     stock: [
       { name: '0,150 Домен Брюне Шинон', qty: 3 },
-      { name: 'Чиз-кейк "Нью-Йорк"', qty: 0 },
+      { name: 'бут.Сидр Эйбрахолс', qty: 0 },     // ноль слева → в стоп
+      { name: 'Чиз-кейк "Нью-Йорк"', qty: 0 },    // кухня → отсекается
     ],
     stop: [
       { name: '0,3 Курпфайц нефильтрованное' },
@@ -774,19 +855,19 @@ test('снимок: обе колонки и этаж пишутся, чисто
   const r = sandbox.submit_([rec]).results[0];
   assert.equal(r.status, 'saved');
   assert.equal(r.verdict.level, 'stoplist');
-  assert.match(r.verdict.notes, /стоп-лист: 2/);
-  assert.match(r.verdict.notes, /остатки: 2/);
+  assert.match(r.verdict.notes, /в стопе: 3/);
+  assert.match(r.verdict.notes, /из них по остатку 0: 1/);
+  assert.match(r.verdict.notes, /кухня отсечена: 1/);
   assert.equal(r.stoplist.floor, '2');
-  assert.equal(r.stoplist.stop.length, 2);
-  assert.equal(r.stoplist.stock.length, 2);
-  assert.equal(r.stoplist.stock[0].qty, 3);
-  assert.equal(r.stoplist.stock[1].qty, 0);
-  // Недочёт по этому же снимку: нулевой чиз-кейк не в стопе.
-  assert.equal(r.stoplist.issues.length, 1);
-  assert.equal(r.stoplist.issues[0].kind, 'zero');
+  assert.equal(r.stoplist.stop.length, 3);
+  assert.deepEqual(JSON.parse(JSON.stringify(r.stoplist.stop.map(i => i.origin))).sort(),
+    ['stock', 'stop', 'stop']);
+  assert.equal(r.stoplist.excluded.length, 1);
+  assert.equal(r.stoplist.excluded[0], 'Чиз-кейк "Нью-Йорк"');
+  assert.equal(r.stoplist.stock.length, 2);   // Домен и Сидр: чиз-кейк — кухня
 
   const stopRows = rowsOf(ss, 'Стоп-лист');
-  assert.equal(stopRows.length, 2);
+  assert.equal(stopRows.length, 3);
   const idx = {};
   sandbox.STOP_HEADERS.forEach((h, i) => { idx[h] = i; });
   stopRows.forEach(row => {
@@ -795,13 +876,16 @@ test('снимок: обе колонки и этаж пишутся, чисто
     assert.equal(row[idx['id']], 'photo-1001-abcd');
     assert.equal(row[idx['день']], today());
   });
+  const sidr = stopRows.find(row => /Сидр/.test(String(row[idx['позиция']])));
+  assert.match(String(sidr[idx['заметка']]), /из остатка 0/);
+
   const stockRows = rowsOf(ss, 'Стоп-лист — остатки');
   assert.equal(stockRows.length, 2);
   const sidx = {};
   sandbox.STOP_STOCK_HEADERS.forEach((h, i) => { sidx[h] = i; });
   assert.equal(stockRows[0][sidx['этаж']], '2');
-  assert.equal(stockRows[0][sidx['количество']], 3);
-  assert.equal(stockRows[1][sidx['количество']], 0);
+  const qty = stockRows.map(x => x[sidx['количество']]).sort((a, b) => a - b);
+  assert.deepEqual(JSON.parse(JSON.stringify(qty)), [0, 3]);
 
   // Промпт — про две колонки, а не про чистоту зоны.
   assert.match(promptOf(0), /Блюда на остатке/);
@@ -959,21 +1043,32 @@ test('ручной ввод: без позиции — отказ; админу 
   assert.equal(rowsOf(ss, 'Стоп-лист').length, 0);
 });
 
+test('ручной ввод: кухонную позицию не принимаем и говорим почему', () => {
+  const ss = makeSs();
+  state.ss = ss;
+  const r = sandbox.submit_([{
+    id: 'manual-1009-abcd', type: 'stoplist', name: 'Анна', pin: '1234',
+    createdAt: new Date().toISOString(), item: 'торт три шоколада', floor: '1',
+  }]).results[0];
+  assert.equal(r.status, 'error');
+  assert.match(r.error, /кухн/i);
+  assert.equal(rowsOf(ss, 'Стоп-лист').length, 0);
+});
+
 // =====================================================================
 //  H. CONFIG И action=stopList
 // =====================================================================
-test('config.stopList: этажи, дни, недочёты — без истории', () => {
+test('config.stopList: этажи, дни по объединению, без истории', () => {
   const ss = makeSs();
   state.ss = ss;
-  addStopRow(ss, { day: today(), floor: '1', name: 'Вишневка 40мл' });
-  addStopRow(ss, { day: today(), floor: '2', name: 'Просекко', catalog: 'Просекко' });
-  addStockRow(ss, { day: today(), floor: '1', name: 'Чиз-кейк', qty: 0 });
+  photoSave(ss, { floor: '1', stop: ['Вишневка 40мл'], stock: [['Сидр', 0]] });
+  photoSave(ss, { floor: '2', stop: ['Просекко'] });
   const cfg = sandbox.getConfig_(ss);
   assert.ok(cfg.stopList && cfg.stopList.ok);
   assert.equal(cfg.stopList.floors.length, 2);
   const f1 = cfg.stopList.floors.find(f => f.floor === '1');
-  assert.equal(f1.current[0].name, 'Вишневка 40мл');
-  assert.equal(f1.stockIssues[0].kind, 'zero');
+  assert.deepEqual(JSON.parse(JSON.stringify(f1.current.map(p => p.name).sort())),
+    ['Вишневка 40мл', 'Сидр']);
   assert.equal(cfg.stopList.history, undefined);
   assert.equal(cfg.stopList.summary.length, 2);
   assert.equal(typeof cfg.features.stoplist, 'boolean');

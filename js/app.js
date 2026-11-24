@@ -1034,7 +1034,7 @@ function screenPhoto(initialArg) {
   const modeBox = h('div', { class: 'chips photo-mode' }, modeZoneBtn, modeStopBtn);
   const stopHint = h('section', { class: 'photo-step photo-stop-hint', hidden: true },
     h('p', { class: 'label' }, 'Стоп-лист'),
-    h('p', { class: 'muted' }, 'Сфотографируйте экран планшета с двумя колонками — «Блюда на остатке» и «СТОП-ЛИСТ». Проверки чистоты не будет: распознаем обе колонки, посчитаем дни в стопе и покажем недочёты по остатку.'));
+    h('p', { class: 'muted' }, 'Сфотографируйте экран планшета с двумя колонками — «Блюда на остатке» и «СТОП-ЛИСТ». В стоп пойдёт объединение: позиции из правой колонки и всё, где слева остаток 0. Кухня и служебные строки отсекаются по листу «Кухня».'));
 
   const stopFloorBox = h('div', { class: 'chips stop-floor-chips' });
   const stopFloorStep = h('section', { class: 'photo-step', hidden: true },
@@ -1501,9 +1501,10 @@ function stopListStateNow() {
   return stopNormalizeState(config && config.stopList);
 }
 
-/** Теги позиции: долго, нет в справочнике, была и вернулась, убрано рано. */
+/** Теги позиции: по остатку, долго, нет в справочнике, возврат. */
 function stopTags(p) {
   const tags = [];
+  if (p.fromStock) tags.push(['stock', 'по остатку 0']);
   if (p.long) tags.push(['long', 'долго в стопе']);
   if (!p.inCatalog) tags.push(['catalog', 'нет в справочнике']);
   if (p.premature) tags.push(['premature', 'убрано преждевременно']);
@@ -1511,21 +1512,10 @@ function stopTags(p) {
   return tags;
 }
 
-/** Строки недочётов по этажу: остатки, дни, справочник, данные. */
+/** Строки недочётов по этажу: дни, справочник, данные. Остатки не сравниваем. */
 function stopFloorIssues(f, settings) {
   const checks = (settings && settings.checks) || {};
   const out = [];
-  // Нулевой остаток без стопа — главный недочёт, показываем по позициям.
-  if (checks.zero) {
-    (f.stockIssues || []).filter(i => i.kind === 'zero').forEach(i => {
-      out.push(['zero', `${i.name} — остаток 0, в стоп-листе нет (${fmtDay(i.day)})`]);
-    });
-  }
-  if (checks.stock) {
-    (f.stockIssues || []).filter(i => i.kind === 'stock').forEach(i => {
-      out.push(['stock', `${i.name} — в стопе, а остаток ${fmtQty(i.qty)} (${fmtDay(i.day)})`]);
-    });
-  }
   // Долгожители и «нет в справочнике» — сводкой: иначе на большом списке
   // это стена строк, а те же сведения есть в тегах у каждой позиции.
   if (checks.long) {
@@ -1810,20 +1800,22 @@ async function waitStopListResults_(records, timeoutMs) {
   return out;
 }
 
-/** Что распозналось на снимках: стоп-лист, остатки и недочёты по остатку. */
+/** Что попало в активный стоп: объединение колонки и нулевых остатков. */
 function screenStopListResult(results, photoCount) {
   const ok = results.filter(r => r && r.ok);
   const bad = results.filter(r => !r || !r.ok);
   const stopItems = ok.flatMap(r => r.stop || []);
   const stockItems = ok.flatMap(r => r.stock || []);
-  const issues = ok.flatMap(r => r.issues || []);
+  const excluded = ok.flatMap(r => r.excluded || []);
   const unknown = stopItems.filter(i => !i.inCatalog);
+  const fromStock = stopItems.filter(i => i.origin === 'stock');
   const floors = [...new Set(ok.map(r => r.floor).filter(Boolean))];
 
   const stopRowEl = (it) => h('div', { class: 'stop-result-item' },
     h('span', { class: 'stop-result-name' }, it.name),
     it.canonical && it.canonical !== it.name
       ? h('span', { class: 'stop-result-canon' }, '→ ' + it.canonical) : null,
+    it.origin === 'stock' ? h('span', { class: 'stop-tag stock' }, 'по остатку 0') : null,
     it.inCatalog ? null : h('span', { class: 'stop-tag catalog' }, 'нет в справочнике'));
 
   const stockRowEl = (it) => h('div', { class: 'stop-result-item' },
@@ -1838,26 +1830,23 @@ function screenStopListResult(results, photoCount) {
         ok.length ? (floors.length ? floors.map(stopFloorText).join(' · ') + ': распознано' : 'Стоп-лист распознан') : 'Не удалось распознать'),
       h('p', { class: 'photo-verdict-lead' },
         ok.length
-          ? `Стоп-лист: ${stopItems.length}${unknown.length ? ` (нет в справочнике: ${unknown.length})` : ''}; остатки: ${stockItems.length}.`
+          ? `В стопе: ${stopItems.length}${fromStock.length ? ` (из них по остатку 0: ${fromStock.length})` : ''}; остатки: ${stockItems.length}${excluded.length ? `; кухня отсечена: ${excluded.length}` : ''}${unknown.length ? `; нет в справочнике: ${unknown.length}` : ''}.`
           : 'Снимок сохранён. Позиции можно добавить руками — они попадут в тот же учёт.'),
-      issues.length
-        ? h('div', { class: 'stop-issues stop-result-issues' },
-          h('p', { class: 'label' }, 'Недочёты по остатку'),
-          h('div', { class: 'stop-issue-list' }, issues.map(i => h('div', { class: 'stop-issue ' + (i.kind === 'zero' ? 'zero' : 'stock') },
-            h('span', { class: 'stop-issue-dot' }),
-            h('span', {}, i.kind === 'zero'
-              ? `${i.name} — остаток 0, в стоп-листе нет`
-              : `${i.name} — в стопе, а остаток ${fmtQty(i.qty)}`)))))
-        : null,
       stopItems.length
         ? h('div', { class: 'stop-result-list' },
-          h('p', { class: 'label' }, 'В стоп-листе'),
+          h('p', { class: 'label' }, 'В стопе'),
           stopItems.map(stopRowEl))
-        : null,
+        : (ok.length ? h('p', { class: 'photo-verdict-meta' }, 'Барных позиций в стопе нет.') : null),
       stockItems.length
         ? h('div', { class: 'stop-result-list' },
           h('p', { class: 'label' }, 'Блюда на остатке'),
           stockItems.map(stockRowEl))
+        : null,
+      excluded.length
+        ? h('div', { class: 'stop-result-list' },
+          h('p', { class: 'label' }, 'Кухня и служебные — не в стоп-лист бара'),
+          excluded.map(name => h('div', { class: 'stop-result-item muted-item' },
+            h('span', { class: 'stop-result-name' }, name))))
         : null,
       bad.map(r => h('p', { class: 'photo-verdict-meta' },
         'Не распознано: ' + (r && r.reason ? r.reason : 'причина неизвестна'))),

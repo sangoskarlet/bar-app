@@ -6,7 +6,7 @@
 //  не попадает (лежит в tools/), на боевой бэкенд не влияет.
 //
 //  Запуск: node tools/demo-server.mjs  (порт 8799)
-//  Управление флагами: GET /__state?quiz=off&duel=off&pairs=off
+//  Управление флагами: GET /__state?quiz=off&duel=off&pairs=off&stoplist=off
 //  Журнал POST-запросов: GET /__log
 // =====================================================================
 
@@ -21,11 +21,123 @@ const PORT = Number(process.env.PORT || 8799);
 const state = {
   features: {
     quiz: true, duel: true, checklists: true, acts: true, photo: true,
-    inventory: true, ttk: true, transfer: true, writeoff: true,
+    stoplist: true, inventory: true, ttk: true, transfer: true, writeoff: true,
   },
   pairsOn: true,
   posts: [],
 };
+
+/** Дни назад в формате «2026-11-24» (для демо-стоп-листа). */
+function dayAgo(n) {
+  const d = new Date(Date.now() - n * 86400000);
+  const p = x => String(x).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/** Позиция демо-стоп-листа: дни, отрезки, теги. */
+function demoStopItem(o) {
+  const days = o.days || 0;
+  const streaks = o.streaks || (days ? [{ from: o.since, to: dayAgo(0), days: days, gaps: o.gaps || 0 }] : []);
+  return {
+    name: o.name, canonical: o.canonical === undefined ? o.name : o.canonical,
+    inCatalog: o.canonical === undefined ? true : !!o.canonical,
+    fromStock: !!o.fromStock,
+    days: days, since: o.since || '', span: o.span || days, gaps: o.gaps || 0,
+    long: !!o.long, streaks: streaks,
+    wasCrossed: !!o.wasCrossed, removedAt: o.removedAt || '',
+    premature: o.premature || null, returned: !!o.returned,
+    lastReturnAt: o.lastReturnAt || '', totalDays: o.totalDays || days,
+    lastSeen: o.lastSeen || dayAgo(0), records: o.records || days,
+  };
+}
+
+/**
+ * Демо-стоп-лист: два этажа, долгожитель, возврат после «убрали»,
+ * позиция не из справочника, одна позиция пришла из нулевого остатка.
+ */
+function demoStopList(withHistory) {
+  const f1current = [
+    demoStopItem({
+      name: '0,3 Курпфайц нефильтрованное', days: 4, since: dayAgo(3), long: true,
+      totalDays: 4, records: 4,
+    }),
+    demoStopItem({
+      name: 'Вишневка 40мл', days: 2, since: dayAgo(1), totalDays: 2, records: 2,
+    }),
+    demoStopItem({
+      name: 'Просекко', days: 1, since: dayAgo(0), totalDays: 3, records: 4,
+      wasCrossed: true, removedAt: dayAgo(1), returned: true, lastReturnAt: dayAgo(0),
+      premature: { removedAt: dayAgo(1), returnedAt: dayAgo(0), gapDays: 1, beforeDays: 2 },
+      streaks: [{ from: dayAgo(3), to: dayAgo(2), days: 2, gaps: 0 }, { from: dayAgo(0), to: dayAgo(0), days: 1, gaps: 0 }],
+    }),
+    demoStopItem({ name: 'Саке', canonical: '', days: 1, since: dayAgo(0), totalDays: 1, records: 1 }),
+    demoStopItem({
+      name: 'бут.Сидр Эйбрахолс яблочный сух.', fromStock: true,
+      days: 1, since: dayAgo(0), totalDays: 1, records: 1,
+    }),
+  ];
+  const f2current = [
+    demoStopItem({ name: 'бут. Лондон Прайд', days: 3, since: dayAgo(2), totalDays: 3, records: 3 }),
+    demoStopItem({ name: 'Торт Три Шоколада', days: 1, since: dayAgo(0), totalDays: 1, records: 1 }),
+  ];
+
+  const makeFloor = (floor, current) => ({
+    floor: floor,
+    label: floor === '1' ? '1 этаж' : '2 этаж',
+    current: current,
+    long: current.filter(p => p.long),
+    premature: current.filter(p => p.premature),
+    missingCatalog: current.filter(p => !p.inCatalog),
+    returned: current.filter(p => p.returned),
+    noData: floor === '2' ? [{ day: dayAgo(1), time: '23:40', reason: 'квота Gemini (429)', employee: 'Анна' }] : [],
+    issuesCount: current.filter(p => p.long).length + current.filter(p => p.premature).length +
+      current.filter(p => !p.inCatalog).length + (floor === '2' ? 1 : 0),
+    totals: {
+      positions: current.length, inStop: current.length, daysWithData: 4,
+      photos: 6, photoShots: 4, manual: 1, unreadable: floor === '2' ? 1 : 0, lastDay: dayAgo(0),
+    },
+  });
+
+  const floors = [makeFloor('1', f1current), makeFloor('2', f2current)];
+  const out = {
+    ok: true,
+    today: dayAgo(0),
+    updatedAt: new Date().toISOString(),
+    settings: {
+      longDays: 3, prematureDays: 2, historyDays: 30, gapBreaks: false,
+      checks: { long: true, premature: true, catalog: true, data: true },
+    },
+    floors: floors,
+    summary: floors.map(f => ({ floor: f.floor, label: f.label, inStop: f.current.length, long: f.long.length, issues: f.issuesCount })),
+    totals: { floors: 2, positions: 7, inStop: 7, photos: 12, manual: 1, unreadable: 1 },
+  };
+  if (withHistory) {
+    out.history = {
+      '1': {
+        '0,3 Курпфайц нефильтрованное': [0, 1, 2, 3].map(n => ({ day: dayAgo(n), crossed: false, source: 'фото', name: '0,3 Курпфайц нефильтрованное' })),
+        'Вишневка 40мл': [0, 1].map(n => ({ day: dayAgo(n), crossed: false, source: 'фото', name: 'Вишневка 40мл' })),
+        'Просекко': [
+          { day: dayAgo(3), crossed: false, source: 'фото', name: 'Просекко' },
+          { day: dayAgo(2), crossed: false, source: 'фото', name: 'Просекко' },
+          { day: dayAgo(1), crossed: true, source: 'фото', name: 'Просекко' },
+          { day: dayAgo(0), crossed: false, source: 'фото', name: 'Просекко' },
+        ],
+        'Саке': [{ day: dayAgo(0), crossed: false, source: 'ручной ввод', name: 'Саке' }],
+        'бут.Сидр Эйбрахолс яблочный сух.': [{ day: dayAgo(0), crossed: false, source: 'фото', name: 'бут.Сидр Эйбрахолс яблочный сух.' }],
+        'Апероль': [
+          { day: dayAgo(6), crossed: false, source: 'фото', name: 'Апероль' },
+          { day: dayAgo(7), crossed: false, source: 'фото', name: 'Апероль' },
+        ],
+      },
+      '2': {
+        'бут. Лондон Прайд': [0, 1, 2].map(n => ({ day: dayAgo(n), crossed: false, source: 'фото', name: 'бут. Лондон Прайд' })),
+        'Торт Три Шоколада': [{ day: dayAgo(0), crossed: false, source: 'фото', name: 'Торт Три Шоколада' }],
+      },
+    };
+  }
+  return out;
+}
+
 
 const acts = [
   {
@@ -54,6 +166,14 @@ function config() {
     items: [
       { name: 'Мята', unit: 'г', category: 'Зелень' },
       { name: 'Лимоны', unit: 'г', category: 'Фрукты' },
+      { name: 'Джин Монки 47', unit: 'мл', category: 'Крепкий алкоголь' },
+      { name: 'Просекко', unit: 'мл', category: 'Игристое' },
+      { name: 'Апероль', unit: 'мл', category: 'Ликёр' },
+      { name: 'Саке', unit: 'мл', category: 'Крепкий алкоголь' },
+      { name: 'Лайм', unit: 'шт', category: 'Фрукты' },
+      { name: 'Клюква', unit: 'г', category: 'Ягоды' },
+      { name: 'Сливки', unit: 'мл', category: 'Молочное' },
+      { name: 'Тоник', unit: 'мл', category: 'Безалкогольное' },
     ],
     reasons: ['Бой', 'Порча', 'Пролив'],
     zones: ['Окно', 'Дверь', 'Склад', 'Бар', 'Холодильники', 'За баром'],
@@ -98,6 +218,7 @@ function config() {
     pairs: state.pairsOn ? [
       { a: 'Мята (листья)', b: 'Мята (ветки)', shareA: 0.6, shareB: 0.4, comment: 'демо' },
     ] : [],
+    stopList: demoStopList(false),
     directions: ['Кухня → Бар', 'Бар → Кухня'],
     units: ['г', 'мл', 'шт', 'кг', 'л'],
   };
@@ -139,12 +260,53 @@ const server = http.createServer((req, res) => {
           return json(res, { ok: true, duplicate: false, results: [{ id: b.id, status: 'saved' }] });
         }
         if (b.action === 'submit') {
-          return json(res, { ok: true, results: (b.records || []).map(r => ({ id: r.id, status: 'saved' })) });
+          // Снимок стоп-листа: отдаём то, что «распознала» модель (обе
+          // колонки), чтобы экран результата было на чём проверить.
+          const results = (b.records || []).map(r => {
+            if (r.type === 'photo' && (r.stopList === true || r.zone === 'Стоп-лист')) {
+              const floor = String(r.floor || '1');
+              return {
+                id: r.id, status: 'saved',
+                verdict: {
+                  level: 'stoplist', verdict: 'стоп-лист', confidence: null,
+                  notes: 'стоп-лист: 13, остатки: 8, недочётов: 2',
+                  items: [], model: 'gemini-flash-lite-latest',
+                  checkedAt: new Date().toISOString(), reference: '', references: [], error: '',
+                },
+                stoplist: {
+                  ok: true, reason: '', unreadable: '', model: 'gemini-flash-lite-latest',
+                  day: dayAgo(0), floor: floor,
+                  summary: 'в стопе: 5, из них по остатку 0: 1, остатки: 4, кухня отсечена: 3',
+                  stop: [
+                    { name: '0,3 Курпфайц нефильтрованное', canonical: '', inCatalog: false, origin: 'stop' },
+                    { name: '0,5 Курпфайц нефильтрованное', canonical: '', inCatalog: false, origin: 'stop' },
+                    { name: 'бут. Бридог ИПА 0,33', canonical: '', inCatalog: false, origin: 'stop' },
+                    { name: 'Вишневка 40мл', canonical: '', inCatalog: false, origin: 'stop' },
+                    { name: 'бут.Сидр Эйбрахолс яблочный сух.', canonical: '', inCatalog: false, origin: 'stock' },
+                  ],
+                  stock: [
+                    { name: '0,150 Домен Брюне Шинон', qty: 3 },
+                    { name: 'бут.Сидр Эйбрахолс яблочный сух.', qty: 0 },
+                    { name: 'Штрудель Яблочный', qty: 4 },
+                    { name: 'Настойка черная смородина 40мл', qty: 7 },
+                  ],
+                  excluded: [
+                    'Комментарий на бар',
+                    'Равиоли с лососем',
+                    'Чиз-кейк "Нью-Йорк"',
+                  ],
+                },
+              };
+            }
+            return { id: r.id, status: 'saved' };
+          });
+          return json(res, { ok: true, results });
         }
         return json(res, { ok: true });
       }
       const action = url.searchParams.get('action') || '';
       if (action === 'config') return json(res, config());
+      if (action === 'stopList') return json(res, demoStopList(true));
       if (action === 'openActs') return json(res, { ok: true, acts: [] });
       if (action === 'photos') return json(res, { ok: true, photos: [] });
       if (action === 'questions') return json(res, { ok: true, questions: [], version: 'demo' });

@@ -160,8 +160,13 @@ async function sendBatch(records, timeoutMs) {
       // PIN и сами фото в историю не сохраняем. У чек-листа ещё и пункты
       // с data-URL: для истории достаточно marked/done/total.
       // server.verdict — вердикт проверки фото (если сервер его вернул).
+      // server.stoplist — что распозналось на снимке стоп-листа: вердикт
+      // лежит отдельно, а результат распознавания нужен экрану стоп-листа.
       const { pin, image, items, ...forHistory } = r;
-      await db.put('sent', { ...forHistory, sentAt: new Date().toISOString(), server: result.verdict || null });
+      const server = result.verdict
+        ? Object.assign({}, result.verdict, result.stoplist ? { stoplist: result.stoplist } : {})
+        : null;
+      await db.put('sent', { ...forHistory, sentAt: new Date().toISOString(), server });
       await db.del('queue', r.id);
     } else if (result.retry || result.code === 'locked') {
       await db.put('queue', { ...r, attempts: r.attempts + 1, error: result.error });

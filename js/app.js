@@ -144,7 +144,7 @@ function header(title, { showBack = true } = {}) {
 // ---------------------------------------------------------------------
 const FEATURE_DEFAULT = {
   quiz: true, duel: true, checklists: true, acts: true, photo: true,
-  inventory: true, ttk: true, transfer: true, writeoff: true,
+  stoplist: true, inventory: true, ttk: true, transfer: true, writeoff: true,
 };
 
 /** {quiz:true, ...}: всё, чего нет в config.features, считаем включённым. */
@@ -169,6 +169,8 @@ function screenFeature(screen, args) {
       screen === screenLabel || screen === screenCloseAct) return 'acts';
   if (screen === screenPhoto || screen === screenPhotoChecking || screen === screenPhotoSent ||
       screen === screenPhotoVerdict || screen === screenPhotoHistory) return 'photo';
+  if (screen === screenStopList || screen === screenStopListPhoto ||
+      screen === screenStopListResult || screen === screenStopListManual) return 'stoplist';
   if (screen === screenChecklists || screen === screenChecklistRun || screen === screenChecklistDone) return 'checklists';
   if (screen === screenTtkList || screen === screenTtkCard) return 'ttk';
   if (screen === screenInventory || screen === screenInvItems || screen === screenInvCount ||
@@ -385,6 +387,7 @@ function screenHome() {
       sectionOn('transfer') ? tile('transfer', 'Перенос', 'кухня ⇄ бар', () => go(screenItemsForm, 'transfer')) : null,
       sectionOn('writeoff') ? tile('writeoff', 'Списание', 'бой, порча, проливы', () => go(screenItemsForm, 'writeoff')) : null,
       sectionOn('photo') ? tile('photo', 'Фото уборки', 'зоны после смены', () => go(screenPhoto)) : null,
+      sectionOn('stoplist') ? tile('stoplist', 'Стоп-лист', 'что закончилось', () => go(screenStopList)) : null,
       sectionOn('checklists') ? tile('checklist', 'Чек-листы', 'смены и заготовки', () => go(screenChecklists)) : null,
       sectionOn('ttk') ? tile('ttk', 'ТТК', 'рецептуры', () => go(screenTtkList)) : null,
       sectionOn('inventory') ? tile('inv', 'Инвентаризация', 'подсчёт остатков', () => go(screenInventory)) : null,
@@ -990,13 +993,23 @@ function zonesWord(n) {
   return 'зон';
 }
 
-function screenPhoto(initialZone) {
-  const form = { floor: null, floorPicked: false, zone: initialZone || '', comment: '', photos: [] };
+function screenPhoto(initialArg) {
+  // Можно войти строкой (зона для «переснять») или объектом {stop, floor}.
+  const opts = (initialArg && typeof initialArg === 'object') ? initialArg : {};
+  const stopMode = opts.stop === true || String(initialArg || '') === STOP_ZONE_NAME;
+  const form = {
+    mode: stopMode ? 'stop' : 'zone',
+    floor: null, floorPicked: false,
+    stopFloor: String(opts.floor || '1'),
+    zone: stopMode ? STOP_ZONE_NAME : (typeof initialArg === 'string' ? initialArg : ''),
+    comment: '', photos: [],
+  };
+  if (STOP_FLOORS_UI.indexOf(form.stopFloor) < 0) form.stopFloor = '1';
   const all = photoZoneGroups();
 
   // «Переснять» приносит уже выбранную зону: находим её этаж и сразу
   // показываем форму. Если зоны нет в списке — относим её к 1 этажу.
-  if (form.zone) {
+  if (form.zone && form.mode === 'zone') {
     const found = [...all.groups.entries()].find(([, zs]) => zs.includes(form.zone));
     form.floor = found ? found[0] : '1';
     form.floorPicked = true;
@@ -1013,6 +1026,37 @@ function screenPhoto(initialZone) {
   const zoneStep = h('section', { class: 'photo-step', hidden: true },
     h('p', { class: 'label' }, 'Зона этого этажа'), zoneBox);
 
+  // Переключатель «фото зоны / стоп-лист». Стоп-лист — отдельный режим:
+  // зона и проверка чистоты ему не нужны, но этаж обязателен: стоп-лист
+  // свой на каждом этаже, и дни считаются в разрезе этаж + позиция.
+  const modeZoneBtn = h('button', { class: 'chip', type: 'button', 'aria-pressed': 'false', onclick: () => setMode('zone') }, '📷 Фото зоны');
+  const modeStopBtn = h('button', { class: 'chip', type: 'button', 'aria-pressed': 'false', onclick: () => setMode('stop') }, '📋 Стоп-лист');
+  const modeBox = h('div', { class: 'chips photo-mode' }, modeZoneBtn, modeStopBtn);
+  const stopHint = h('section', { class: 'photo-step photo-stop-hint', hidden: true },
+    h('p', { class: 'label' }, 'Стоп-лист'),
+    h('p', { class: 'muted' }, 'Сфотографируйте экран планшета с двумя колонками — «Блюда на остатке» и «СТОП-ЛИСТ». В стоп пойдёт объединение: позиции из правой колонки и всё, где слева остаток 0. Кухня и служебные строки отсекаются по листу «Кухня».'));
+
+  const stopFloorBox = h('div', { class: 'chips stop-floor-chips' });
+  const stopFloorStep = h('section', { class: 'photo-step', hidden: true },
+    h('p', { class: 'label' }, 'Этаж стоп-листа'),
+    h('p', { class: 'muted photo-floor-hint' }, 'Стоп-лист свой на каждом этаже — выберите этаж до снимка.'),
+    stopFloorBox);
+
+  function drawStopFloors() {
+    stopFloorBox.replaceChildren(...STOP_FLOORS_UI.map(f => {
+      const on = f === form.stopFloor;
+      return h('button', {
+        class: 'chip' + (on ? ' on' : ''), type: 'button', 'aria-pressed': on ? 'true' : 'false',
+        onclick: () => { form.stopFloor = f; drawStopFloors(); drawMode(); },
+      }, stopFloorText(f));
+    }));
+  }
+
+  const floorsStep = h('section', { class: 'photo-step' },
+    h('p', { class: 'label' }, 'Этаж'),
+    h('p', { class: 'muted photo-floor-hint' }, 'Сначала этаж, потом зона этого этажа.'),
+    floorBox);
+
   function drawFloors() {
     floorBox.replaceChildren(...all.floors.map(f => {
       const count = (all.groups.get(f) || []).length;
@@ -1027,7 +1071,7 @@ function screenPhoto(initialZone) {
           form.zone = '';
           drawFloors();
           drawZones();
-          formStep.hidden = true;
+          drawMode();
         },
       },
         h('span', { class: 'floor-name' }, floorLabel(f)),
@@ -1046,15 +1090,48 @@ function screenPhoto(initialZone) {
         onclick: () => chooseZone(z),
       }, z);
     }));
-    zoneStep.hidden = !form.floorPicked;
+    zoneStep.hidden = form.mode === 'stop' || !form.floorPicked;
   }
 
   function chooseZone(z) {
     form.zone = z;
     drawZones();
-    zoneCaption.replaceChildren('Зона: ', h('b', {}, z));
-    formStep.hidden = false;
+    drawMode();
     setTimeout(() => { if (document.body.contains(formStep)) formStep.scrollIntoView({ block: 'nearest' }); }, 30);
+  }
+
+  function drawMode() {
+    const stop = form.mode === 'stop';
+    modeZoneBtn.classList.toggle('on', !stop);
+    modeStopBtn.classList.toggle('on', stop);
+    modeZoneBtn.setAttribute('aria-pressed', stop ? 'false' : 'true');
+    modeStopBtn.setAttribute('aria-pressed', stop ? 'true' : 'false');
+    floorsStep.hidden = stop;
+    stopFloorStep.hidden = !stop;
+    stopHint.hidden = !stop;
+    zoneStep.hidden = stop || !form.floorPicked;
+    if (stop) {
+      zoneCaption.replaceChildren('Зона: ', h('b', {}, STOP_ZONE_NAME + ' · ' + stopFloorText(form.stopFloor)));
+      formStep.hidden = false;
+    } else {
+      zoneCaption.replaceChildren(...(form.zone ? ['Зона: ', h('b', {}, form.zone)] : ['Зона не выбрана']));
+      formStep.hidden = !form.zone;
+    }
+  }
+
+  function setMode(m) {
+    if (form.mode === m) return;
+    form.mode = m;
+    if (m === 'stop') {
+      form.zone = STOP_ZONE_NAME;
+    } else if (form.zone === STOP_ZONE_NAME) {
+      form.zone = '';
+      form.floorPicked = false;
+      form.floor = null;
+      drawFloors();
+      drawZones();
+    }
+    drawMode();
   }
 
   const previews = h('div', { class: 'previews' });
@@ -1085,17 +1162,36 @@ function screenPhoto(initialZone) {
   const comment = h('textarea', { rows: '2', placeholder: 'Комментарий (необязательно)', oninput: e => { form.comment = e.target.value; } });
   const saveBtn = h('button', { class: 'primary' }, 'Сохранить');
   saveBtn.addEventListener('click', async () => {
-    if (!form.zone) return toast('Выберите зону', 'bad');
-    if (form.photos.length === 0) return toast('Добавьте фото', 'bad');
+    const stop = form.mode === 'stop';
+    if (!stop && !form.zone) return toast('Выберите зону', 'bad');
+    if (form.photos.length === 0) return toast(stop ? 'Добавьте фото стоп-листа' : 'Добавьте фото', 'bad');
     saveBtn.disabled = true;
     const records = [];
     try {
       for (const image of form.photos) {
-        records.push(await enqueue({ type: 'photo', name: session.name, pin: session.pin, zone: form.zone, image, comment: form.comment.trim() }));
+        const rec = {
+          type: 'photo', name: session.name, pin: session.pin,
+          zone: stop ? STOP_ZONE_NAME : form.zone, image, comment: form.comment.trim(),
+        };
+        if (stop) {
+          rec.stopList = true;          // сервер: не проверять чистоту, распознать обе колонки
+          rec.floor = form.stopFloor;   // стоп-лист свой на каждом этаже
+        }
+        records.push(await enqueue(rec));
       }
     } catch (e) {
       saveBtn.disabled = false;
       return toast('Не удалось сохранить фото', 'bad');
+    }
+    if (stop) {
+      // Стоп-лист: показываем, что распозналось, и текущий список.
+      if (!navigator.onLine) {
+        toast('Снимок сохранён — распознаем, когда появится связь');
+        resetTo(screenStopList);
+        return;
+      }
+      resetTo(screenStopListPhoto, records);
+      return;
     }
     if (!navigator.onLine) { resetTo(screenPhotoSent, records, form.zone); return; }
     resetTo(screenPhotoChecking, records, form.zone);
@@ -1111,18 +1207,20 @@ function screenPhoto(initialZone) {
 
   root.append(
     h('section', { class: 'photo-step' },
-      h('p', { class: 'label' }, 'Этаж'),
-      h('p', { class: 'muted photo-floor-hint' }, 'Сначала этаж, потом зона этого этажа.'),
-      floorBox),
-    zoneStep, formStep,
+      h('p', { class: 'label' }, 'Что фотографируем'),
+      modeBox),
+    floorsStep, stopFloorStep, stopHint, zoneStep, formStep,
     h('button', { class: 'link photo-history-link', onclick: () => go(screenPhotoHistory) }, 'История снимков'),
   );
 
   drawFloors();
-  if (form.floorPicked) {
+  drawStopFloors();
+  if (form.floorPicked && form.mode !== 'stop') {
     drawZones();
     if (form.zone) chooseZone(form.zone);
   }
+  drawMode();
+  drawPreviews();
   return root;
 }
 
@@ -1325,7 +1423,7 @@ function photoHistRow(p) {
   const level = p.level || '';
   const cls = level === 'unchecked' ? 'unclear' : (level || 'unclear');
   const label = { ok: 'чисто', warn: 'замечания', crit: 'критично', unclear: 'не проверено',
-    unchecked: 'не проверено', pending: 'ждёт отправки', '': 'без вердикта' }[level] || level;
+    unchecked: 'не проверено', pending: 'ждёт отправки', stoplist: 'стоп-лист', '': 'без вердикта' }[level] || level;
   return h('div', { class: 'photo-hist-row ' + cls },
     h('div', { class: 'photo-hist-head' },
       h('b', {}, p.zone || 'Зона'),
@@ -1333,6 +1431,507 @@ function photoHistRow(p) {
     h('p', { class: 'photo-hist-date' }, fmtDateTime(p.at) + (p.local ? ' · ждёт отправки' : '')),
     p.notes ? h('p', { class: 'photo-hist-notes' }, p.notes) : null,
   );
+}
+
+// =====================================================================
+//  ЭКРАН: СТОП-ЛИСТ — по этажам, дни в стопе, остатки, недочёты
+// =====================================================================
+//  Сервер отдаёт по каждому этажу: текущий список с днями, долгожителей,
+//  «убрано преждевременно», «нет в справочнике», недочёты по остаткам
+//  (остаток 0.00, а в стопе нет; в стопе, а остаток есть) и «нет данных».
+//  Ответ: config.stopList (без истории) и ?action=stopList (с историей).
+//  Старый кэш до этажей приводим к тому же виду одной «плоскостью».
+const STOP_HISTORY_CACHE = 'stopList';
+// Имя зоны для снимка стоп-листа: так он и записывается в «Фото уборки».
+// Совпадает с STOP_ZONE на сервере — сервер понимает и флаг stopList, и зону.
+const STOP_ZONE_NAME = 'Стоп-лист';
+const STOP_FLOORS_UI = ['1', '2'];
+const STOP_ALL_FLOORS = 'all';
+
+function stopFloorText(floor) {
+  const f = String(floor || '').trim();
+  if (!f) return 'Без этажа';
+  return /^\d+$/.test(f) ? f + ' этаж' : f;
+}
+
+/** «2026-11-24» → «24.11». */
+function fmtDay(day) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(day || ''));
+  return m ? `${m[3]}.${m[2]}` : '';
+}
+
+/** «2026-11-24» → «24.11.2026». */
+function fmtDayFull(day) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(day || ''));
+  return m ? `${m[3]}.${m[2]}.${m[1]}` : '';
+}
+
+function daysWord(n) {
+  const d = n % 10, dd = n % 100;
+  if (d === 1 && dd !== 11) return 'день';
+  if (d >= 2 && d <= 4 && (dd < 12 || dd > 14)) return 'дня';
+  return 'дней';
+}
+
+/** «3 дня», «1 день», «12 дней». */
+function daysLabel(n) {
+  const v = Number(n) || 0;
+  return `${v} ${daysWord(v)}`;
+}
+
+/** Старое состояние (без этажей) приводим к виду с этажами. */
+function stopNormalizeState(raw) {
+  if (!raw || !raw.ok) return null;
+  if (Array.isArray(raw.floors)) return raw;
+  const legacy = {
+    floor: '', label: 'Без этажа',
+    current: raw.current || [], long: raw.long || [], premature: raw.premature || [],
+    missingCatalog: raw.missingCatalog || [], returned: raw.returned || [],
+    noData: raw.noData || [], stockIssues: [],
+    issuesCount: (raw.long || []).length + (raw.missingCatalog || []).length,
+    totals: raw.totals || {},
+  };
+  return Object.assign({}, raw, {
+    floors: [legacy],
+    summary: [{ floor: '', label: 'Без этажа', inStop: legacy.current.length, long: legacy.long.length, issues: legacy.issuesCount }],
+  });
+}
+
+function stopListStateNow() {
+  return stopNormalizeState(config && config.stopList);
+}
+
+/** Теги позиции: по остатку, долго, нет в справочнике, возврат. */
+function stopTags(p) {
+  const tags = [];
+  if (p.fromStock) tags.push(['stock', 'по остатку 0']);
+  if (p.long) tags.push(['long', 'долго в стопе']);
+  if (!p.inCatalog) tags.push(['catalog', 'нет в справочнике']);
+  if (p.premature) tags.push(['premature', 'убрано преждевременно']);
+  else if (p.returned) tags.push(['returned', 'была в стопе раньше']);
+  return tags;
+}
+
+/** Строки недочётов по этажу: дни, справочник, данные. Остатки не сравниваем. */
+function stopFloorIssues(f, settings) {
+  const checks = (settings && settings.checks) || {};
+  const out = [];
+  // Долгожители и «нет в справочнике» — сводкой: иначе на большом списке
+  // это стена строк, а те же сведения есть в тегах у каждой позиции.
+  if (checks.long) {
+    const long = f.long || [];
+    if (long.length) {
+      const names = long.slice(0, 4).map(p => p.name).join(', ');
+      out.push(['long', `${long.length} ${positionsWord(long.length)} в стопе ≥ ${(settings && settings.longDays) || 3} дн.: ${names}${long.length > 4 ? '…' : ''}`]);
+    }
+  }
+  if (checks.premature) {
+    (f.premature || []).forEach(p => out.push(['premature',
+      `${p.name} — убрали ${fmtDay(p.premature.removedAt)} и вернули ${fmtDay(p.premature.returnedAt)}`]));
+  }
+  if (checks.catalog) {
+    const missing = f.missingCatalog || [];
+    if (missing.length) {
+      const names = missing.slice(0, 4).map(p => p.name).join(', ');
+      out.push(['catalog', `Нет в справочнике: ${missing.length} — ${names}${missing.length > 4 ? '…' : ''}`]);
+    }
+  }
+  if (checks.data) {
+    (f.noData || []).forEach(n => out.push(['data',
+      `${fmtDay(n.day)} — снимок не распознан${n.reason ? ': ' + n.reason : ''}`]));
+  }
+  return out;
+}
+
+function positionsWord(n) {
+  const d = n % 10, dd = n % 100;
+  if (d === 1 && dd !== 11) return 'позиция';
+  if (d >= 2 && d <= 4 && (dd < 12 || dd > 14)) return 'позиции';
+  return 'позиций';
+}
+
+function fmtQty(v) {
+  const n = Number(v);
+  if (!isFinite(n)) return String(v);
+  return n.toLocaleString('ru-RU', { maximumFractionDigits: 3 });
+}
+
+function screenStopList() {
+  const root = h('main', { class: 'screen stop-screen' }, header('Стоп-лист'));
+  const tools = h('div', { class: 'photo-hist-tools' },
+    h('button', { class: 'link', onclick: () => load(true) }, 'Обновить'));
+  const body = h('div', { class: 'stop-body' }, h('p', { class: 'muted' }, 'Загрузка…'));
+  let data = stopListStateNow();
+  let picked = STOP_ALL_FLOORS;
+
+  async function load(fresh) {
+    if (fresh && navigator.onLine) {
+      try {
+        const res = await apiGet({ action: 'stopList' }, 20000);
+        const norm = stopNormalizeState(res);
+        if (norm) {
+          data = norm;
+          await db.put('kv', res, STOP_HISTORY_CACHE);
+        }
+      } catch (e) { /* нет сети — останемся на кэше */ }
+    }
+    if (!data) data = stopNormalizeState(await db.get('kv', STOP_HISTORY_CACHE));
+    if (!document.body.contains(root)) return;
+    draw();
+  }
+
+  function draw() {
+    const s = data;
+    const footer = h('div', { class: 'stop-actions' },
+      h('button', { class: 'primary', onclick: () => go(screenPhoto, { stop: true, floor: picked === STOP_ALL_FLOORS ? '1' : picked }) }, '📷 Снять стоп-лист'),
+      h('button', { class: 'secondary', onclick: () => go(screenStopListManual, picked === STOP_ALL_FLOORS ? '1' : picked) }, '✏️ Ввести позицию'),
+      h('button', { class: 'link stop-history-link', onclick: () => go(screenPhotoHistory) }, 'История фото'));
+
+    if (!s) {
+      body.replaceChildren(
+        h('p', { class: 'hint' }, navigator.onLine
+          ? 'Стоп-лист пока пуст: снимите фото в конце смены или введите позицию руками.'
+          : 'Нет сети и нет сохранённых данных стоп-листа.'),
+        footer);
+      return;
+    }
+
+    const settings = s.settings || {};
+    const floors = (s.floors || []).slice();
+    // Если выбранного этажа в данных нет — показываем «Оба этажа».
+    const shown = picked === STOP_ALL_FLOORS ? floors : floors.filter(f => f.floor === picked);
+    const allIssues = [];
+    floors.forEach(f => stopFloorIssues(f, settings).forEach(i => allIssues.push(i)));
+    const inStop = picked === STOP_ALL_FLOORS
+      ? floors.reduce((a, f) => a + (f.current || []).length, 0)
+      : (shown[0] ? (shown[0].current || []).length : 0);
+    const longCount = picked === STOP_ALL_FLOORS
+      ? floors.reduce((a, f) => a + (f.long || []).length, 0)
+      : (shown[0] ? (shown[0].long || []).length : 0);
+    const issuesCount = picked === STOP_ALL_FLOORS
+      ? allIssues.length
+      : (shown[0] ? stopFloorIssues(shown[0], settings).length : 0);
+
+    const summary = h('div', { class: 'stop-summary' },
+      h('span', { class: 'stop-count' }, h('b', {}, String(inStop)), ' в стопе'),
+      h('span', { class: 'stop-count' + (longCount ? ' alert' : '') }, h('b', {}, String(longCount)), ' долго'),
+      h('span', { class: 'stop-count' + (issuesCount ? ' warn' : '') }, h('b', {}, String(issuesCount)),
+        ' недочёт' + (issuesCount === 1 ? '' : (issuesCount >= 2 && issuesCount <= 4 ? 'а' : 'ов'))));
+
+    const floorChips = h('div', { class: 'chips stop-floors' },
+      h('button', {
+        class: 'chip' + (picked === STOP_ALL_FLOORS ? ' on' : ''), type: 'button',
+        onclick: () => { picked = STOP_ALL_FLOORS; draw(); },
+      }, 'Оба этажа'),
+      floors.map(f => h('button', {
+        class: 'chip' + (picked === f.floor ? ' on' : ''), type: 'button',
+        onclick: () => { picked = f.floor; draw(); },
+      }, f.label)));
+
+    const blocks = [];
+    shown.forEach(f => {
+      const issues = stopFloorIssues(f, settings);
+      const current = f.current || [];
+      const list = h('div', { class: 'stop-list' });
+      if (!current.length) list.append(h('p', { class: 'stop-empty' }, 'Сейчас в стопе ничего нет'));
+      else current.forEach(p => list.append(stopRow(p, f, s)));
+
+      blocks.push(h('section', { class: 'stop-floor-block' },
+        h('div', { class: 'stop-floor-head' },
+          h('p', { class: 'label stop-floor-label' }, f.label),
+          (f.totals && f.totals.lastDay ? h('span', { class: 'stop-floor-day' }, 'данные: ' + fmtDayFull(f.totals.lastDay)) : null)),
+        issues.length
+          ? h('div', { class: 'stop-issue-list' }, issues.map(([kind, text]) =>
+            h('div', { class: 'stop-issue ' + kind }, h('span', { class: 'stop-issue-dot' }), h('span', {}, text))))
+          : null,
+        list));
+    });
+
+    // Позиции, которые были в стопе, а сейчас нет: вход в историю.
+    const history = s.history || {};
+    const past = [];
+    shown.forEach(f => {
+      const hist = history[f.floor] || {};
+      Object.keys(hist).forEach(name => {
+        if ((f.current || []).some(p => p.name === name)) return;
+        const rows = hist[name] || [];
+        if (rows.length) past.push({ floor: f.floor, name: name, last: rows[rows.length - 1].day });
+      });
+    });
+    past.sort((a, b) => String(b.last).localeCompare(String(a.last)));
+    const pastSection = past.length
+      ? h('section', { class: 'stop-past' },
+        h('p', { class: 'label' }, 'Были в стопе раньше'),
+        h('div', { class: 'chips' }, past.slice(0, 12).map(x =>
+          h('button', {
+            class: 'chip', type: 'button',
+            onclick: () => openStopHistory(x.name, null, history[x.floor] || null, x.floor),
+          }, `${x.name} · ${fmtDay(x.last)}`))))
+      : null;
+
+    body.replaceChildren(
+      summary,
+      floorChips,
+      h('p', { class: 'muted stop-updated' }, s.updatedAt ? 'Обновлено ' + fmtDateTime(s.updatedAt) : ''),
+      ...blocks,
+      pastSection,
+      footer);
+  }
+
+  function stopRow(p, f, s) {
+    const tags = stopTags(p);
+    const sub = [];
+    if (p.since) sub.push('с ' + fmtDay(p.since));
+    if (p.gaps) sub.push(`без данных ${p.gaps}`);
+    if (p.totalDays > p.days) sub.push(`всего ${daysLabel(p.totalDays)}`);
+    return h('button', {
+      class: 'stop-row' + (p.long ? ' long' : '') + (p.inCatalog ? '' : ' unknown'),
+      type: 'button',
+      onclick: () => openStopHistory(p.name, p, (s.history || {})[f.floor] || null, f.floor),
+    },
+      h('span', { class: 'stop-row-main' },
+        h('span', { class: 'stop-row-name' }, p.name),
+        sub.length ? h('span', { class: 'stop-row-sub' }, sub.join(' · ')) : null,
+        tags.length ? h('span', { class: 'stop-row-tags' },
+          tags.map(([kind, text]) => h('span', { class: 'stop-tag ' + kind }, text))) : null),
+      h('span', { class: 'stop-days' + (p.long ? ' long' : '') },
+        h('span', { class: 'stop-days-num' }, String(p.days)),
+        h('span', { class: 'stop-days-word' }, daysWord(p.days))));
+  }
+
+  load(false);
+  if (navigator.onLine) load(true);
+  root.append(tools, body);
+  return root;
+}
+
+/** История одной позиции: отрезки в стопе, когда убрали, записи по дням. */
+function openStopHistory(name, position, historyMap, floor) {
+  const overlay = h('div', { class: 'overlay' });
+  const close = () => overlay.remove();
+  const rows = (historyMap && historyMap[name]) || [];
+  const p = position || null;
+  const parts = [];
+
+  parts.push(h('p', { class: 'stop-hist-lead' }, floor ? stopFloorText(floor) : ''));
+  if (p) {
+    parts.push(h('p', { class: 'stop-hist-lead' },
+      p.days ? `Сейчас в стопе ${daysLabel(p.days)}${p.since ? ', с ' + fmtDayFull(p.since) : ''}.`
+        : `Сейчас не в стопе${p.lastSeen ? ', последний раз ' + fmtDayFull(p.lastSeen) : ''}.`));
+    if (p.premature) {
+      parts.push(h('p', { class: 'stop-hist-warn' },
+        `Убрали ${fmtDayFull(p.premature.removedAt)}, вернули ${fmtDayFull(p.premature.returnedAt)} — преждевременно.`));
+    }
+    if (!p.inCatalog) {
+      parts.push(h('p', { class: 'stop-hist-warn' }, 'Этой позиции нет в справочнике — добавьте её в лист «Справочник».'));
+    }
+    const streaks = p.streaks || [];
+    if (streaks.length) {
+      parts.push(h('p', { class: 'label' }, 'Отрезки в стопе'));
+      parts.push(h('ul', { class: 'stop-hist-streaks' }, streaks.slice().reverse().map(st =>
+        h('li', {},
+          h('b', {}, st.days === 1 ? fmtDayFull(st.from) : `${fmtDayFull(st.from)} — ${fmtDayFull(st.to)}`),
+          h('span', {}, `${daysLabel(st.days)}${st.gaps ? ` · без данных ${st.gaps}` : ''}`)))));
+    }
+    parts.push(h('p', { class: 'stop-hist-total' },
+      `Всего: ${daysLabel(p.totalDays)} в стопе, отрезков: ${streaks.length}.`));
+  }
+
+  if (rows.length) {
+    parts.push(h('p', { class: 'label' }, 'Записи по дням'));
+    parts.push(h('div', { class: 'stop-hist-days' }, rows.slice().reverse().map(r =>
+      h('div', { class: 'stop-hist-day' + (r.crossed ? ' crossed' : '') },
+        h('span', { class: 'stop-hist-day-date' }, fmtDayFull(r.day)),
+        h('span', { class: 'stop-hist-day-what' }, r.crossed ? 'перечёркнута' : 'в стопе'),
+        h('span', { class: 'stop-hist-day-src' }, r.source === 'ручной ввод' ? 'руками' : 'фото')))));
+  } else if (!p) {
+    parts.push(h('p', { class: 'hint' }, 'Нет записей за выбранный период.'));
+  }
+
+  overlay.append(h('div', { class: 'sheet sheet-auto' },
+    h('div', { class: 'sheet-head' },
+      h('p', { class: 'label stop-hist-title' }, name),
+      h('button', { class: 'x', onclick: close, 'aria-label': 'Закрыть' }, '✕')),
+    h('div', { class: 'stop-hist-body' }, parts)));
+  overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+  document.body.append(overlay);
+}
+
+/** «Распознаём стоп-лист…» — ждём ответ сервера по нашим записям. */
+function screenStopListPhoto(records) {
+  const root = h('main', { class: 'screen' }, header('Стоп-лист', { showBack: false }),
+    h('div', { class: 'photo-checking' },
+      h('div', { class: 'photo-spinner', 'aria-hidden': 'true' }),
+      h('p', { class: 'photo-checking-title' }, 'Распознаём стоп-лист…'),
+      h('p', { class: 'muted' }, 'Обычно занимает 2–5 секунд'),
+    ));
+  (async () => {
+    const results = await waitStopListResults_(records, 25000);
+    if (!document.body.contains(root)) return;
+    resetTo(screenStopListResult, results, records.length);
+  })();
+  return root;
+}
+
+/** Ответы по снимкам стоп-листа: из истории отправки (server.stoplist). */
+async function waitStopListResults_(records, timeoutMs) {
+  const out = [];
+  const pending = new Set(records.map(r => r.id));
+  const started = Date.now();
+  while (pending.size && Date.now() - started < timeoutMs) {
+    for (const id of [...pending]) {
+      const sent = await db.get('sent', id);
+      const srv = sent && sent.server;
+      if (srv && srv.stoplist) {
+        out.push(srv.stoplist);
+        pending.delete(id);
+        continue;
+      }
+      const q = await db.get('queue', id);
+      if (q && q.status === 'rejected') {
+        out.push({ ok: false, reason: q.error || 'запись отклонена', stop: [], stock: [] });
+        pending.delete(id);
+      }
+    }
+    if (!pending.size) break;
+    if (!navigator.onLine) break;
+    await sleep(600);
+  }
+  return out;
+}
+
+/** Что попало в активный стоп: объединение колонки и нулевых остатков. */
+function screenStopListResult(results, photoCount) {
+  const ok = results.filter(r => r && r.ok);
+  const bad = results.filter(r => !r || !r.ok);
+  const stopItems = ok.flatMap(r => r.stop || []);
+  const stockItems = ok.flatMap(r => r.stock || []);
+  const excluded = ok.flatMap(r => r.excluded || []);
+  const unknown = stopItems.filter(i => !i.inCatalog);
+  const fromStock = stopItems.filter(i => i.origin === 'stock');
+  const floors = [...new Set(ok.map(r => r.floor).filter(Boolean))];
+
+  const stopRowEl = (it) => h('div', { class: 'stop-result-item' },
+    h('span', { class: 'stop-result-name' }, it.name),
+    it.canonical && it.canonical !== it.name
+      ? h('span', { class: 'stop-result-canon' }, '→ ' + it.canonical) : null,
+    it.origin === 'stock' ? h('span', { class: 'stop-tag stock' }, 'по остатку 0') : null,
+    it.inCatalog ? null : h('span', { class: 'stop-tag catalog' }, 'нет в справочнике'));
+
+  const stockRowEl = (it) => h('div', { class: 'stop-result-item' },
+    h('span', { class: 'stop-result-name' }, it.name),
+    h('span', { class: 'stop-result-qty' + (it.qty === 0 ? ' zero' : '') },
+      it.qty === null || it.qty === undefined ? 'кол-во ?' : fmtQty(it.qty)));
+
+  const card = results.length
+    ? h('section', { class: 'photo-verdict ' + (ok.length ? 'ok' : 'unclear') },
+      h('h2', { class: 'photo-verdict-head' },
+        h('span', { class: 'photo-verdict-icon', 'aria-hidden': 'true' }, ok.length ? '📋' : '?'),
+        ok.length ? (floors.length ? floors.map(stopFloorText).join(' · ') + ': распознано' : 'Стоп-лист распознан') : 'Не удалось распознать'),
+      h('p', { class: 'photo-verdict-lead' },
+        ok.length
+          ? `В стопе: ${stopItems.length}${fromStock.length ? ` (из них по остатку 0: ${fromStock.length})` : ''}; остатки: ${stockItems.length}${excluded.length ? `; кухня отсечена: ${excluded.length}` : ''}${unknown.length ? `; нет в справочнике: ${unknown.length}` : ''}.`
+          : 'Снимок сохранён. Позиции можно добавить руками — они попадут в тот же учёт.'),
+      stopItems.length
+        ? h('div', { class: 'stop-result-list' },
+          h('p', { class: 'label' }, 'В стопе'),
+          stopItems.map(stopRowEl))
+        : (ok.length ? h('p', { class: 'photo-verdict-meta' }, 'Барных позиций в стопе нет.') : null),
+      stockItems.length
+        ? h('div', { class: 'stop-result-list' },
+          h('p', { class: 'label' }, 'Блюда на остатке'),
+          stockItems.map(stockRowEl))
+        : null,
+      excluded.length
+        ? h('div', { class: 'stop-result-list' },
+          h('p', { class: 'label' }, 'Кухня и служебные — не в стоп-лист бара'),
+          excluded.map(name => h('div', { class: 'stop-result-item muted-item' },
+            h('span', { class: 'stop-result-name' }, name))))
+        : null,
+      bad.map(r => h('p', { class: 'photo-verdict-meta' },
+        'Не распознано: ' + (r && r.reason ? r.reason : 'причина неизвестна'))),
+      ok.map(r => (r.unreadable
+        ? h('p', { class: 'photo-verdict-meta' }, 'Не прочитано: ' + r.unreadable) : null)))
+    : h('section', { class: 'photo-verdict unclear' },
+      h('h2', { class: 'photo-verdict-head' },
+        h('span', { class: 'photo-verdict-icon', 'aria-hidden': 'true' }, '⏳'),
+        'Проверка идёт дольше обычного'),
+      h('p', { class: 'photo-verdict-lead' }, 'Снимок сохранён. Результат появится в стоп-листе, как только будет готов.'),
+      h('p', { class: 'photo-verdict-meta' }, `Снимков: ${photoCount}`));
+
+  return h('main', { class: 'screen' }, header('Стоп-лист', { showBack: false }),
+    card,
+    h('div', { class: 'photo-verdict-actions' },
+      h('button', { class: 'primary', onclick: () => resetTo(screenStopList) }, 'К стоп-листу'),
+      h('button', { class: 'secondary', onclick: () => go(screenStopListManual, (ok[0] && ok[0].floor) || '1') }, '✏️ Добавить позицию'),
+      h('button', { class: 'link', onclick: () => resetTo(screenHome) }, 'На главную')));
+}
+
+/** Ручной ввод позиции: когда фото не читается — иначе учёт развалится. */
+function screenStopListManual(initialFloor) {
+  const root = h('main', { class: 'screen' }, header('Позиция в стоп-листе'));
+  const input = h('input', { type: 'text', placeholder: 'Например: 0,3 Курпфайц нефильтрованное', autocomplete: 'off' });
+  const sugg = h('div', { class: 'stop-suggest' });
+  const crossed = h('input', { type: 'checkbox', class: 'check-box' });
+  const saveBtn = h('button', { class: 'primary' }, 'Добавить в стоп-лист');
+  const items = (config && Array.isArray(config.items)) ? config.items : [];
+  let floor = String(initialFloor || '1');
+  if (STOP_FLOORS_UI.indexOf(floor) < 0) floor = '1';
+
+  const floorChips = h('div', { class: 'chips' }, STOP_FLOORS_UI.map(f =>
+    h('button', {
+      class: 'chip' + (f === floor ? ' on' : ''), type: 'button',
+      onclick: (e) => {
+        floor = f;
+        [...floorChips.children].forEach(c => c.classList.remove('on'));
+        e.currentTarget.classList.add('on');
+      },
+    }, stopFloorText(f))));
+
+  function drawSuggest() {
+    const q = input.value.trim().toLowerCase();
+    const found = items
+      .filter(it => it && it.name && (!q || it.name.toLowerCase().includes(q)))
+      .slice(0, 8);
+    sugg.replaceChildren(...found.map(it =>
+      h('button', {
+        class: 'chip', type: 'button',
+        onclick: () => { input.value = it.name; drawSuggest(); },
+      }, it.name)));
+  }
+  input.addEventListener('input', drawSuggest);
+
+  saveBtn.addEventListener('click', async () => {
+    const item = input.value.trim();
+    if (!item) return toast('Введите позицию', 'bad');
+    saveBtn.disabled = true;
+    try {
+      await enqueue({
+        type: 'stoplist', name: session.name, pin: session.pin,
+        item, crossedOut: crossed.checked, floor: floor,
+      });
+      if (navigator.onLine) await syncNow();
+    } catch (e) {
+      saveBtn.disabled = false;
+      return toast('Не удалось сохранить', 'bad');
+    }
+    toast(crossed.checked ? 'Позиция отмечена как убранная' : 'Добавлено: ' + stopFloorText(floor));
+    back();
+  });
+
+  root.append(
+    h('p', { class: 'muted' }, 'Если на фото ничего не разобрать — впишите позицию руками. Она попадёт в тот же учёт дней.'),
+    h('p', { class: 'label' }, 'Этаж'),
+    floorChips,
+    h('p', { class: 'label' }, 'Позиция'),
+    input,
+    h('p', { class: 'muted stop-suggest-hint' }, 'Подсказки из справочника:'),
+    sugg,
+    h('label', { class: 'stop-crossed' }, crossed, h('span', {}, 'Её уже убрали со стопа (перечёркнута)')),
+    saveBtn,
+  );
+  drawSuggest();
+  return root;
 }
 
 /**
@@ -3856,7 +4455,8 @@ function screenDuelResult({ duelId, initialState }) {
 function describe(r) {
   if (r.type === 'transfer') return `Перенос · ${r.direction} · ${r.item} ${r.qty} ${r.unit}`;
   if (r.type === 'writeoff') return `Списание · ${r.item} ${r.qty} ${r.unit} · ${r.reason}`;
-  if (r.type === 'photo') return `Фото уборки · ${r.zone}`;
+  if (r.type === 'photo') return r.stopList ? `Фото стоп-листа · ${stopFloorText(r.floor || '1')}` : `Фото уборки · ${r.zone}`;
+  if (r.type === 'stoplist') return `Стоп-лист · ${stopFloorText(r.floor || '1')} · ${r.item}${r.crossedOut ? ' · убрали' : ''}`;
   if (r.type === 'checklist') {
     const done = Number(r.done) || (r.marked || []).length;
     const total = Number(r.total) || (r.items || []).length;

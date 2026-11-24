@@ -170,6 +170,9 @@ const sandbox = {
 vm.createContext(sandbox);
 vm.runInContext(CODE, sandbox, { filename: 'Код.gs' });
 sandbox.log_ = (event, details) => state.log.push(event + ': ' + details);
+// const в vm не попадает в контекст — берём списки из самого кода.
+sandbox.FEATURE_KEYS = vm.runInContext('FEATURE_KEYS', sandbox);
+sandbox.STOP_SETTINGS = vm.runInContext('STOP_SETTINGS', sandbox);
 
 const HEADERS = {
   staff: ['Имя', 'PIN (4–6 цифр)', 'Роль', 'Активен'],
@@ -248,9 +251,9 @@ test('config отдаёт одновременно features, 6 зон с эта�
   const cfg = sandbox.getConfig_(ss);
   assert.equal(cfg.ok, true);
 
-  // 1) Флаги разделов (ветка 17): все девять полей.
+  // 1) Флаги разделов (ветка 17): все поля из FEATURE_KEYS (включая «стоп-лист»).
   assert.equal(typeof cfg.features, 'object');
-  assert.equal(Object.keys(cfg.features).length, 9);
+  assert.equal(Object.keys(cfg.features).length, sandbox.FEATURE_KEYS.length);
   Object.values(cfg.features).forEach(v => assert.equal(typeof v, 'boolean'));
 
   // 2) Зоны с этажами (ветка 16): старое поле zones не пропало, новое — с этажами.
@@ -272,7 +275,7 @@ test('config отдаёт одновременно features, 6 зон с эта�
   const settings = ss.getSheetByName('Настройки');
   assert.ok(settings, 'лист «Настройки» создан');
   assert.deepEqual(Array.from(settings.cells[0]), ['ключ', 'значение', 'комментарий']);
-  assert.equal(rowsOf(ss, 'Настройки').length, 9);
+  assert.equal(rowsOf(ss, 'Настройки').length, sandbox.FEATURE_KEYS.length + sandbox.STOP_SETTINGS.length);
   assert.ok(ss.getSheetByName('Пары позиций'), 'лист «Пары позиций» создан');
   assert.ok(ss.getSheetByName('Эталоны — фото'), 'лист «Эталоны — фото» создан');
   // «Эталоны уборки» остались в новой схеме и не получили вторую «этаж».

@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Стоп-лист — печатный образец</title>
+<!--
+  Тестовый образец «печатный стоп-лист»: картинка для проверки распознавания
+  (docs/stop-list/test/printed.png). Не часть приложения.
+-->
+<style>
+  html, body { margin: 0; padding: 0; background: #d8d4cc; }
+  body { display: flex; justify-content: center; padding: 28px; }
+  .paper {
+    width: 760px; background: #fdfbf5; padding: 34px 46px 40px;
+    box-shadow: 0 10px 30px rgba(0,0,0,.18); border: 1px solid #e6e1d5;
+    font-family: "Segoe UI", Arial, sans-serif; color: #16161a;
+  }
+  h1 { margin: 0 0 2px; font-size: 30px; letter-spacing: .18em; text-align: center; }
+  .meta { text-align: center; font-size: 15px; color: #4a4a52; margin: 0 0 18px; }
+  hr { border: 0; border-top: 1px solid #c9c4b8; margin: 14px 0 18px; }
+  ol { margin: 0; padding-left: 34px; font-size: 21px; line-height: 1.62; }
+  li { margin: 2px 0; }
+  .crossed { text-decoration: line-through; text-decoration-thickness: 2px; color: #55555e; position: relative; display: inline-block; }
+  .crossed::after {
+    content: ""; position: absolute; left: -6px; right: -6px; top: 52%;
+    height: 2px; background: #16161a; transform: rotate(-1.4deg);
+  }
+  .note { margin-top: 20px; font-size: 14px; color: #55555e; }
+</style>
+</head>
+<body>
+  <div class="paper">
+    <h1>СТОП-ЛИСТ</h1>
+    <p class="meta">Дата: 24.11.2026 · смена вечерняя · бар</p>
+    <hr>
+    <ol>
+      <li>Джин Монки 47 0,5</li>
+      <li>Просекко</li>
+      <li>Лимоны</li>
+      <li>Мята (листья)</li>
+      <li><span class="crossed">Апероль</span></li>
+      <li>Саке</li>
+      <li>Лайм</li>
+      <li>Клюква с/м</li>
+      <li><span class="crossed">Сливки 33%</span></li>
+      <li>Тоник</li>
+    </ol>
+    <p class="note">Перечёркнутое — уже привезли, со стопа снято.</p>
+  </div>
+</body>
+</html>

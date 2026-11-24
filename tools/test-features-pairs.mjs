@@ -168,6 +168,10 @@ vm.createContext(sandbox);
 vm.runInContext(CODE, sandbox, { filename: 'Код.gs' });
 // Лог пишем в память, а не в лист.
 sandbox.log_ = (event, details) => state.log.push(event + ': ' + details);
+// const/let в vm не становятся полями контекста — забираем константы явно,
+// чтобы тесты не держали у себя числа «9 разделов» вручную.
+sandbox.FEATURE_KEYS = vm.runInContext('FEATURE_KEYS', sandbox);
+sandbox.STOP_SETTINGS = vm.runInContext('STOP_SETTINGS', sandbox);
 
 const HEADERS = {
   staff: ['Имя', 'PIN (4–6 цифр)', 'Роль', 'Активен'],
@@ -228,23 +232,26 @@ const values = (ss, name, col) => rowsOf(ss, name).map(r => r[col]);
 //  A. ФЛАГИ РАЗДЕЛОВ
 // =====================================================================
 
-test('нет листа «Настройки» — все разделы включены, лист создаётся с 9 ключами', () => {
+test('нет листа «Настройки» — все разделы включены, лист создаётся с ключами разделов', () => {
   const ss = makeSs();
   state.ss = ss;
   const f = sandbox.features_(ss);
-  assert.deepEqual(Object.keys(f), ['quiz', 'duel', 'checklists', 'acts', 'photo', 'inventory', 'ttk', 'transfer', 'writeoff']);
+  assert.deepEqual(Object.keys(f), ['quiz', 'duel', 'checklists', 'acts', 'photo', 'stoplist', 'inventory', 'ttk', 'transfer', 'writeoff']);
   Object.values(f).forEach(v => assert.equal(v, true));
   const sh = ss.getSheetByName('Настройки');
   assert.ok(sh, 'лист «Настройки» создан');
   assert.deepEqual(sh.cells[0], ['ключ', 'значение', 'комментарий']);
-  assert.equal(sh.cells.length - 1, 9);
-  assert.equal(values(ss, 'Настройки', 0).length, 9);
+  // Разделы + настройки стоп-листа (числа и флаги проверок) — все строки на месте.
+  assert.equal(sh.cells.length - 1, sandbox.FEATURE_KEYS.length + sandbox.STOP_SETTINGS.length);
+  assert.equal(values(ss, 'Настройки', 0).length, sandbox.FEATURE_KEYS.length + sandbox.STOP_SETTINGS.length);
+  assert.ok(values(ss, 'Настройки', 0).includes('стоплист_долго_дней'), 'настройка стоп-листа есть');
+  assert.ok(values(ss, 'Настройки', 0).includes('раздел_стоплист'), 'флаг раздела стоп-листа есть');
 });
 
 test('«выкл» в разных видах выключает, пусто и «вкл» — включает', () => {
   const ss = makeSs();
   state.ss = ss;
-  sandbox.features_(ss); // создаёт лист с 9 ключами
+  sandbox.features_(ss); // создаёт лист с ключами разделов
   const sh = ss.getSheetByName('Настройки');
   const set = (key, value) => {
     for (let r = 2; r <= sh.cells.length; r++) {
@@ -296,13 +303,13 @@ test('непонятное значение не выключает раздел
   assert.ok(state.log.some(x => x.includes('непонятное значение') && x.includes('раздел_викторина')));
 });
 
-test('config.features — объект с 9 булевыми полями; config.pairs — массив пар', () => {
+test('config.features — объект со всеми булевыми полями; config.pairs — массив пар', () => {
   const ss = makeSs();
   state.ss = ss;
   const cfg = sandbox.getConfig_(ss);
   assert.equal(cfg.ok, true);
   assert.equal(typeof cfg.features, 'object');
-  assert.equal(Object.keys(cfg.features).length, 9);
+  assert.equal(Object.keys(cfg.features).length, sandbox.FEATURE_KEYS.length);
   Object.values(cfg.features).forEach(v => assert.equal(typeof v, 'boolean'));
   assert.ok(Array.isArray(cfg.pairs));
   assert.equal(cfg.pairs.length, 1);

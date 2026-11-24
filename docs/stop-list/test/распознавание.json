@@ -1,0 +1,260 @@
+{
+  "printed": {
+    "httpStatus": 200,
+    "wallMs": 9309,
+    "image": "docs/stop-list/test/printed.png",
+    "ok": true,
+    "bytes": 36355,
+    "elapsedMs": 5211,
+    "result": {
+      "ok": true,
+      "items": [
+        {
+          "name": "1. Джин Монки 47 0,5",
+          "crossed": false,
+          "confidence": 0.99
+        },
+        {
+          "name": "2. Просекко",
+          "crossed": false,
+          "confidence": 0.99
+        },
+        {
+          "name": "3. Лимоны",
+          "crossed": false,
+          "confidence": 0.99
+        },
+        {
+          "name": "4. Мята (листья)",
+          "crossed": false,
+          "confidence": 0.99
+        },
+        {
+          "name": "5. Апероль",
+          "crossed": true,
+          "confidence": 0.99
+        },
+        {
+          "name": "6. Саке",
+          "crossed": false,
+          "confidence": 0.99
+        },
+        {
+          "name": "7. Лайм",
+          "crossed": false,
+          "confidence": 0.99
+        },
+        {
+          "name": "8. Клюква с/м",
+          "crossed": false,
+          "confidence": 0.99
+        },
+        {
+          "name": "9. Сливки 33%",
+          "crossed": true,
+          "confidence": 0.99
+        },
+        {
+          "name": "10. Тоник",
+          "crossed": false,
+          "confidence": 0.99
+        }
+      ],
+      "unreadable": "",
+      "model": "gemini-flash-lite-latest",
+      "confidence": 0.99,
+      "reason": ""
+    },
+    "matched": [
+      {
+        "name": "1. Джин Монки 47 0,5",
+        "shown": "Джин Монки 47 0,5",
+        "canonical": "",
+        "how": ""
+      },
+      {
+        "name": "2. Просекко",
+        "shown": "Просекко",
+        "canonical": "",
+        "how": ""
+      },
+      {
+        "name": "3. Лимоны",
+        "shown": "Лимоны",
+        "canonical": "Лимон",
+        "how": "stem"
+      },
+      {
+        "name": "4. Мята (листья)",
+        "shown": "Мята (листья)",
+        "canonical": "Мята",
+        "how": "prefix"
+      },
+      {
+        "name": "5. Апероль",
+        "shown": "Апероль",
+        "canonical": "",
+        "how": ""
+      },
+      {
+        "name": "6. Саке",
+        "shown": "Саке",
+        "canonical": "",
+        "how": ""
+      },
+      {
+        "name": "7. Лайм",
+        "shown": "Лайм",
+        "canonical": "Лайм",
+        "how": "exact"
+      },
+      {
+        "name": "8. Клюква с/м",
+        "shown": "Клюква с/м",
+        "canonical": "Клюква",
+        "how": "prefix"
+      },
+      {
+        "name": "9. Сливки 33%",
+        "shown": "Сливки 33%",
+        "canonical": "Сливки",
+        "how": "prefix"
+      },
+      {
+        "name": "10. Тоник",
+        "shown": "Тоник",
+        "canonical": "",
+        "how": ""
+      }
+    ]
+  },
+  "handwritten": {
+    "httpStatus": 200,
+    "wallMs": 9476,
+    "image": "docs/stop-list/test/handwritten.png",
+    "ok": true,
+    "bytes": 104315,
+    "elapsedMs": 5362,
+    "result": {
+      "ok": true,
+      "items": [
+        {
+          "name": "джин монки 47 0.5",
+          "crossed": false,
+          "confidence": 0.95
+        },
+        {
+          "name": "просекко",
+          "crossed": false,
+          "confidence": 0.95
+        },
+        {
+          "name": "лимоны",
+          "crossed": false,
+          "confidence": 0.95
+        },
+        {
+          "name": "мята лист.",
+          "crossed": false,
+          "confidence": 0.95
+        },
+        {
+          "name": "апероль",
+          "crossed": true,
+          "confidence": 0.95
+        },
+        {
+          "name": "саке",
+          "crossed": true,
+          "confidence": 0.95
+        },
+        {
+          "name": "лайм",
+          "crossed": false,
+          "confidence": 0.95
+        },
+        {
+          "name": "клюква с/м",
+          "crossed": false,
+          "confidence": 0.95
+        },
+        {
+          "name": "сливки 33%",
+          "crossed": false,
+          "confidence": 0.95
+        },
+        {
+          "name": "тоник",
+          "crossed": false,
+          "confidence": 0.95
+        }
+      ],
+      "unreadable": "",
+      "model": "gemini-flash-lite-latest",
+      "confidence": 0.95,
+      "reason": ""
+    },
+    "matched": [
+      {
+        "name": "джин монки 47 0.5",
+        "shown": "джин монки 47 0.5",
+        "canonical": "",
+        "how": ""
+      },
+      {
+        "name": "просекко",
+        "shown": "просекко",
+        "canonical": "",
+        "how": ""
+      },
+      {
+        "name": "лимоны",
+        "shown": "лимоны",
+        "canonical": "Лимон",
+        "how": "stem"
+      },
+      {
+        "name": "мята лист.",
+        "shown": "мята лист.",
+        "canonical": "Мята",
+        "how": "prefix"
+      },
+      {
+        "name": "апероль",
+        "shown": "апероль",
+        "canonical": "",
+        "how": ""
+      },
+      {
+        "name": "саке",
+        "shown": "саке",
+        "canonical": "",
+        "how": ""
+      },
+      {
+        "name": "лайм",
+        "shown": "лайм",
+        "canonical": "Лайм",
+        "how": "exact"
+      },
+      {
+        "name": "клюква с/м",
+        "shown": "клюква с/м",
+        "canonical": "Клюква",
+        "how": "prefix"
+      },
+      {
+        "name": "сливки 33%",
+        "shown": "сливки 33%",
+        "canonical": "Сливки",
+        "how": "prefix"
+      },
+      {
+        "name": "тоник",
+        "shown": "тоник",
+        "canonical": "",
+        "how": ""
+      }
+    ]
+  }
+}

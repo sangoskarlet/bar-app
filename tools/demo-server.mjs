@@ -6,7 +6,7 @@
 //  не попадает (лежит в tools/), на боевой бэкенд не влияет.
 //
 //  Запуск: node tools/demo-server.mjs  (порт 8799)
-//  Управление флагами: GET /__state?quiz=off&duel=off&pairs=off
+//  Управление флагами: GET /__state?quiz=off&duel=off&pairs=off&stoplist=off
 //  Журнал POST-запросов: GET /__log
 // =====================================================================
 
@@ -21,11 +21,84 @@ const PORT = Number(process.env.PORT || 8799);
 const state = {
   features: {
     quiz: true, duel: true, checklists: true, acts: true, photo: true,
-    inventory: true, ttk: true, transfer: true, writeoff: true,
+    stoplist: true, inventory: true, ttk: true, transfer: true, writeoff: true,
   },
   pairsOn: true,
   posts: [],
 };
+
+/** Дни назад в формате «2026-11-24» (для демо-стоп-листа). */
+function dayAgo(n) {
+  const d = new Date(Date.now() - n * 86400000);
+  const p = x => String(x).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/** Демо-стоп-лист: долгожитель, скорое возвращение, позиция не из справочника. */
+function demoStopList(withHistory) {
+  const current = [
+    {
+      name: 'Джин Монки 47', canonical: 'Джин Монки 47', inCatalog: true,
+      days: 4, since: dayAgo(3), span: 4, gaps: 0, long: true, streaks: [{ from: dayAgo(3), to: dayAgo(0), days: 4, gaps: 0 }],
+      wasCrossed: false, removedAt: '', premature: null, returned: false,
+      lastReturnAt: '', totalDays: 4, lastSeen: dayAgo(0), records: 4,
+    },
+    {
+      name: 'Лимоны', canonical: 'Лимоны', inCatalog: true,
+      days: 2, since: dayAgo(1), span: 2, gaps: 0, long: false, streaks: [{ from: dayAgo(1), to: dayAgo(0), days: 2, gaps: 0 }],
+      wasCrossed: false, removedAt: '', premature: null, returned: false,
+      lastReturnAt: '', totalDays: 2, lastSeen: dayAgo(0), records: 2,
+    },
+    {
+      name: 'Просекко', canonical: 'Просекко', inCatalog: true,
+      days: 1, since: dayAgo(0), span: 1, gaps: 0, long: false, streaks: [{ from: dayAgo(3), to: dayAgo(2), days: 2, gaps: 0 }, { from: dayAgo(0), to: dayAgo(0), days: 1, gaps: 0 }],
+      wasCrossed: true, removedAt: dayAgo(1),
+      premature: { removedAt: dayAgo(1), returnedAt: dayAgo(0), gapDays: 1, beforeDays: 2 },
+      returned: true, lastReturnAt: dayAgo(0), totalDays: 3, lastSeen: dayAgo(0), records: 4,
+    },
+    {
+      name: 'Саке', canonical: '', inCatalog: false,
+      days: 1, since: dayAgo(0), span: 1, gaps: 0, long: false, streaks: [{ from: dayAgo(0), to: dayAgo(0), days: 1, gaps: 0 }],
+      wasCrossed: false, removedAt: '', premature: null, returned: false,
+      lastReturnAt: '', totalDays: 1, lastSeen: dayAgo(0), records: 1,
+    },
+  ];
+  const out = {
+    ok: true,
+    today: dayAgo(0),
+    updatedAt: new Date().toISOString(),
+    settings: {
+      longDays: 3, prematureDays: 2, historyDays: 30,
+      checks: { long: true, premature: true, catalog: true, data: true },
+    },
+    current,
+    long: current.filter(p => p.long),
+    premature: current.filter(p => p.premature),
+    missingCatalog: current.filter(p => !p.inCatalog),
+    returned: current.filter(p => p.returned),
+    noData: [{ day: dayAgo(1), time: '23:40', reason: 'квота Gemini (429)', employee: 'Анна' }],
+    totals: { positions: 5, inStop: 4, daysWithData: 5, photos: 8, photoShots: 5, manual: 1, unreadable: 1, lastDay: dayAgo(0) },
+  };
+  if (withHistory) {
+    out.history = {
+      'Джин Монки 47': [0, 1, 2, 3].map(n => ({ day: dayAgo(n), crossed: false, source: 'фото', name: 'Джин Монки 47' })),
+      'Лимоны': [0, 1].map(n => ({ day: dayAgo(n), crossed: false, source: 'фото', name: 'Лимоны' })),
+      'Просекко': [
+        { day: dayAgo(3), crossed: false, source: 'фото', name: 'Просекко' },
+        { day: dayAgo(2), crossed: false, source: 'фото', name: 'Просекко' },
+        { day: dayAgo(1), crossed: true, source: 'фото', name: 'Просекко' },
+        { day: dayAgo(0), crossed: false, source: 'фото', name: 'Просекко' },
+      ],
+      'Саке': [{ day: dayAgo(0), crossed: false, source: 'ручной ввод', name: 'Саке' }],
+      'Апероль': [
+        { day: dayAgo(6), crossed: false, source: 'фото', name: 'Апероль' },
+        { day: dayAgo(7), crossed: false, source: 'фото', name: 'Апероль' },
+      ],
+    };
+  }
+  return out;
+}
+
 
 const acts = [
   {
@@ -54,6 +127,14 @@ function config() {
     items: [
       { name: 'Мята', unit: 'г', category: 'Зелень' },
       { name: 'Лимоны', unit: 'г', category: 'Фрукты' },
+      { name: 'Джин Монки 47', unit: 'мл', category: 'Крепкий алкоголь' },
+      { name: 'Просекко', unit: 'мл', category: 'Игристое' },
+      { name: 'Апероль', unit: 'мл', category: 'Ликёр' },
+      { name: 'Саке', unit: 'мл', category: 'Крепкий алкоголь' },
+      { name: 'Лайм', unit: 'шт', category: 'Фрукты' },
+      { name: 'Клюква', unit: 'г', category: 'Ягоды' },
+      { name: 'Сливки', unit: 'мл', category: 'Молочное' },
+      { name: 'Тоник', unit: 'мл', category: 'Безалкогольное' },
     ],
     reasons: ['Бой', 'Порча', 'Пролив'],
     zones: ['Окно', 'Дверь', 'Склад', 'Бар', 'Холодильники', 'За баром'],
@@ -98,6 +179,7 @@ function config() {
     pairs: state.pairsOn ? [
       { a: 'Мята (листья)', b: 'Мята (ветки)', shareA: 0.6, shareB: 0.4, comment: 'демо' },
     ] : [],
+    stopList: demoStopList(false),
     directions: ['Кухня → Бар', 'Бар → Кухня'],
     units: ['г', 'мл', 'шт', 'кг', 'л'],
   };
@@ -139,12 +221,39 @@ const server = http.createServer((req, res) => {
           return json(res, { ok: true, duplicate: false, results: [{ id: b.id, status: 'saved' }] });
         }
         if (b.action === 'submit') {
-          return json(res, { ok: true, results: (b.records || []).map(r => ({ id: r.id, status: 'saved' })) });
+          // Снимок стоп-листа: отдаём то, что «распознала» модель, чтобы
+          // экран результата было на чём проверить.
+          const results = (b.records || []).map(r => {
+            if (r.type === 'photo' && (r.stopList === true || r.zone === 'Стоп-лист')) {
+              return {
+                id: r.id, status: 'saved',
+                verdict: {
+                  level: 'stoplist', verdict: 'стоп-лист', confidence: 0.88,
+                  notes: 'распознано позиций: 3, перечёркнуто: 1, нет в справочнике: 1',
+                  items: [], model: 'gemini-flash-lite-latest',
+                  checkedAt: new Date().toISOString(), reference: '', references: [], error: '',
+                },
+                stoplist: {
+                  ok: true, reason: '', unreadable: '', model: 'gemini-flash-lite-latest',
+                  confidence: 0.88, day: dayAgo(0),
+                  summary: 'распознано позиций: 3, перечёркнуто: 1, нет в справочнике: 1',
+                  items: [
+                    { name: 'джин монки', canonical: 'Джин Монки 47', inCatalog: true, crossedOut: false, confidence: 0.94, note: '' },
+                    { name: 'Просеко', canonical: 'Просекко', inCatalog: true, crossedOut: true, confidence: 0.81, note: '' },
+                    { name: 'Саке', canonical: '', inCatalog: false, crossedOut: false, confidence: 0.62, note: 'нет в справочнике' },
+                  ],
+                },
+              };
+            }
+            return { id: r.id, status: 'saved' };
+          });
+          return json(res, { ok: true, results });
         }
         return json(res, { ok: true });
       }
       const action = url.searchParams.get('action') || '';
       if (action === 'config') return json(res, config());
+      if (action === 'stopList') return json(res, demoStopList(true));
       if (action === 'openActs') return json(res, { ok: true, acts: [] });
       if (action === 'photos') return json(res, { ok: true, photos: [] });
       if (action === 'questions') return json(res, { ok: true, questions: [], version: 'demo' });

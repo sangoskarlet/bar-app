@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Стоп-лист — рукописный образец</title>
+<!--
+  Тестовый образец «рукописный стоп-лист»: картинка для проверки распознавания
+  (docs/stop-list/test/handwritten.png). Не часть приложения.
+  Почерк имитируется шрифтом Segoe Script и неровными строками.
+-->
+<style>
+  html, body { margin: 0; padding: 0; background: #cfc9be; }
+  body { display: flex; justify-content: center; padding: 26px; }
+  .paper {
+    position: relative; width: 720px; background: #fbf7ec; padding: 30px 44px 40px;
+    box-shadow: 0 12px 34px rgba(0,0,0,.22); transform: rotate(-1.1deg);
+    background-image: repeating-linear-gradient(#fbf7ec 0 43px, #e9e3d3 43px 44px);
+    background-position: 0 26px;
+  }
+  .head {
+    font-family: "Segoe Script", "Bradley Hand", "Comic Sans MS", cursive;
+    font-size: 34px; color: #1e3c6e; transform: rotate(-2deg);
+    margin: 0 0 6px 4px; letter-spacing: .04em;
+  }
+  .date {
+    font-family: "Segoe Script", cursive; font-size: 17px; color: #3e4a63;
+    margin: 0 0 12px 10px; transform: rotate(.6deg);
+  }
+  ul { list-style: none; margin: 0; padding: 0; font-family: "Segoe Script", "Bradley Hand", cursive; color: #1a3663; }
+  li { position: relative; font-size: 25px; line-height: 44px; height: 44px; white-space: nowrap; }
+  li:nth-child(1) { transform: rotate(-1.6deg) translateX(2px); font-size: 24px; }
+  li:nth-child(2) { transform: rotate(1.2deg) translateX(12px); font-size: 27px; }
+  li:nth-child(3) { transform: rotate(-.6deg) translateX(-3px); font-size: 23px; color: #213d70; }
+  li:nth-child(4) { transform: rotate(1.8deg) translateX(6px); font-size: 25px; }
+  li:nth-child(5) { transform: rotate(-1.1deg) translateX(10px); font-size: 26px; }
+  li:nth-child(6) { transform: rotate(.9deg) translateX(-6px); font-size: 24px; }
+  li:nth-child(7) { transform: rotate(-1.9deg) translateX(4px); font-size: 23px; }
+  li:nth-child(8) { transform: rotate(1.4deg) translateX(14px); font-size: 26px; }
+  li:nth-child(9) { transform: rotate(-.8deg) translateX(0); font-size: 22px; }
+  li:nth-child(10) { transform: rotate(1.6deg) translateX(8px); font-size: 25px; }
+  /* Зачёркнуто от руки: две неровные линии поверх слова. */
+  .cross { position: absolute; left: -4px; top: 8px; width: 170px; height: 30px; pointer-events: none; }
+  .cross path { stroke: #1a3663; stroke-width: 2.4; fill: none; stroke-linecap: round; }
+  .cross.red path { stroke: #a3242b; }
+  .tail {
+    font-family: "Segoe Script", cursive; font-size: 16px; color: #4b5670;
+    margin: 14px 0 0 6px; transform: rotate(.8deg);
+  }
+</style>
+</head>
+<body>
+  <div class="paper">
+    <p class="head">Стоп лист</p>
+    <p class="date">24.11.26 вечер</p>
+    <ul>
+      <li>джин монки 47 0.5</li>
+      <li>просекко</li>
+      <li>лимоны</li>
+      <li>мята лист.</li>
+      <li>апероль
+        <svg class="cross" viewBox="0 0 170 30" aria-hidden="true">
+          <path d="M0 14 C40 10, 90 18, 168 12"/>
+          <path d="M2 20 C50 17, 110 23, 166 18"/>
+        </svg>
+      </li>
+      <li>саке
+        <svg class="cross red" viewBox="0 0 170 30" aria-hidden="true">
+          <path d="M4 6 L150 24"/>
+          <path d="M6 22 L152 7"/>
+        </svg>
+      </li>
+      <li>лайм</li>
+      <li>клюква с/м</li>
+      <li>сливки 33%</li>
+      <li>тоник</li>
+    </ul>
+    <p class="tail">что зачёркнуто — уже привезли</p>
+  </div>
+</body>
+</html>

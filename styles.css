@@ -631,3 +631,113 @@ textarea { margin-top: 16px; resize: vertical; }
 .photo-hist-date { color: var(--muted); font-size: 12.5px; margin: 2px 0 0; }
 .photo-hist-notes { font-size: 14px; line-height: 1.35; margin: 6px 0 0; overflow-wrap: anywhere; }
 .photo-hist-empty { color: var(--muted); text-align: center; margin: 28px 0; }
+
+/* =====================================================================
+   СТОП-ЛИСТ — что закончилось, сколько дней, недочёты
+   ===================================================================== */
+.photo-mode { margin-top: 4px; }
+.photo-stop-hint .muted { text-align: left; margin: 6px 0 0; line-height: 1.45; }
+
+.stop-body { display: flex; flex-direction: column; gap: 14px; }
+.stop-actions { display: flex; flex-direction: column; gap: 8px; margin-top: 6px; }
+.stop-actions .primary, .stop-actions .secondary { margin-top: 0; }
+.stop-history-link { display: block; width: 100%; text-align: center; margin: 2px 0 0; font-size: 14px; }
+
+.stop-summary { display: flex; flex-wrap: wrap; gap: 8px; }
+.stop-count {
+  display: inline-flex; align-items: baseline; gap: 5px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 999px;
+  padding: 7px 14px; font-size: 13.5px; color: var(--muted);
+}
+.stop-count b { font-size: 17px; color: var(--text); font-variant-numeric: tabular-nums; }
+.stop-count.alert { border-color: var(--bad); }
+.stop-count.alert b { color: var(--bad); }
+.stop-count.warn { border-color: var(--wait); }
+.stop-count.warn b { color: var(--wait); }
+.stop-updated { margin: -6px 0 0; }
+
+.stop-list { display: flex; flex-direction: column; gap: 8px; }
+.stop-empty { color: var(--muted); text-align: center; margin: 18px 0; }
+
+.stop-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  width: 100%; text-align: left; cursor: pointer;
+  background: var(--panel); color: var(--text); border: 1px solid var(--line);
+  border-left: 4px solid var(--line); border-radius: 12px; padding: 12px 14px;
+}
+.stop-row.long { border-left-color: var(--bad); }
+.stop-row.unknown { border-left-color: var(--wait); }
+.stop-row-main { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.stop-row-name { font-size: 16px; font-weight: 600; line-height: 1.25; overflow-wrap: anywhere; }
+.stop-row-sub { font-size: 12.5px; color: var(--muted); line-height: 1.3; }
+.stop-row-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 3px; }
+.stop-tag {
+  font-size: 11px; text-transform: uppercase; letter-spacing: .04em; font-weight: 700;
+  padding: 2px 8px; border-radius: 999px;
+  background: var(--panel-2); color: var(--muted); white-space: nowrap;
+}
+.stop-tag.long, .stop-tag.catalog, .stop-tag.premature { color: var(--bad); }
+.stop-tag.returned { color: var(--wait); }
+.stop-tag.crossed { color: var(--muted); text-decoration: line-through; }
+.stop-tag.low { color: var(--wait); }
+.stop-days {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  min-width: 58px; padding: 4px 8px; border-radius: 10px;
+  background: var(--panel-2); color: var(--text); flex: none;
+}
+.stop-days.long { background: var(--bad); color: var(--bg); }
+.stop-days-num { font-size: 20px; font-weight: 700; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.stop-days-word { font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+.stop-days.long .stop-days-word { color: rgba(255, 255, 255, .8); }
+
+.stop-issues { display: flex; flex-direction: column; gap: 8px; }
+.stop-issue-list { display: flex; flex-direction: column; gap: 6px; }
+.stop-issue {
+  display: flex; gap: 10px; align-items: flex-start;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 10px 12px; font-size: 14px; line-height: 1.35; overflow-wrap: anywhere;
+}
+.stop-issue-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--wait); margin-top: 6px; flex: none; }
+.stop-issue.long .stop-issue-dot, .stop-issue.premature .stop-issue-dot, .stop-issue.catalog .stop-issue-dot { background: var(--bad); }
+.stop-issue.data .stop-issue-dot { background: var(--muted); }
+
+.stop-past { display: flex; flex-direction: column; gap: 6px; }
+.stop-past .chips { gap: 6px; }
+
+.stop-hist-title { flex: 1; margin: 0; font-size: 16px; text-transform: none; letter-spacing: 0; color: var(--text); }
+.sheet-auto { height: auto; max-height: 88vh; overflow-y: auto; padding-bottom: 18px; }
+.stop-hist-body { padding: 4px 16px 8px; display: flex; flex-direction: column; gap: 8px; }
+.stop-hist-lead { margin: 4px 0 0; font-size: 15px; line-height: 1.4; }
+.stop-hist-warn { margin: 0; font-size: 14px; line-height: 1.4; color: var(--wait); }
+.stop-hist-streaks { margin: 4px 0 0; padding: 0 0 0 18px; display: flex; flex-direction: column; gap: 6px; }
+.stop-hist-streaks li { font-size: 14px; line-height: 1.35; }
+.stop-hist-streaks li b { display: block; font-weight: 600; }
+.stop-hist-streaks li span { color: var(--muted); font-size: 12.5px; }
+.stop-hist-total { margin: 6px 0 0; color: var(--muted); font-size: 13px; }
+.stop-hist-days { display: flex; flex-direction: column; gap: 4px; }
+.stop-hist-day {
+  display: grid; grid-template-columns: 88px minmax(0, 1fr) auto; gap: 8px;
+  align-items: baseline; font-size: 13.5px; padding: 6px 10px; border-radius: 8px;
+  background: var(--panel-2);
+}
+.stop-hist-day-date { font-variant-numeric: tabular-nums; }
+.stop-hist-day-what { overflow-wrap: anywhere; }
+.stop-hist-day.crossed .stop-hist-day-what { color: var(--muted); text-decoration: line-through; }
+.stop-hist-day-src { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+
+.stop-result-list { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
+.stop-result-item {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px;
+  background: var(--panel-2); border-radius: 10px; padding: 9px 12px; font-size: 15px;
+}
+.stop-result-name { font-weight: 600; overflow-wrap: anywhere; }
+.stop-result-canon { color: var(--muted); font-size: 13px; }
+
+.stop-suggest { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 4px; }
+.stop-suggest-hint { margin: 10px 0 0; }
+.stop-crossed {
+  display: flex; align-items: center; gap: 10px; margin: 16px 0 0;
+  font-size: 15px; color: var(--text); line-height: 1.35;
+}
+.stop-crossed .check-box { flex: none; width: 22px; height: 22px; }
+

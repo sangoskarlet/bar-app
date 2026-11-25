@@ -24,6 +24,7 @@ import {
 } from './sync.js';
 import { voiceSupported, listenOnce, voiceErrorText, parseInventoryPhrase, confident, parseCustomPhrase } from './voice.js';
 import { icon } from './icons.js';
+import { splitPair, displayGrams, pairSumOk } from './pair-calc.js';
 import {
   buildLabel, labelDataUrl, labelFileName, canShareFiles, shareLabel, saveLabel, printLabel,
 } from './label.js';
@@ -741,9 +742,16 @@ function screenLabel() {
 /** Закрыть акт: вписать, сколько получилось. Может любой бармен. */
 function screenCloseAct(a) {
   const root = h('main', { class: 'screen' }, header('Закрыть акт'));
-  // Выход может быть позицией-парой (мята): тогда два поля вместо одного.
-  const closePair = makePairBlock(a.item, { big: true, unit: a.unit });
+  // Выход может быть позицией-парой (мята): общий вес уже в акте,
+  // листья и ветки считаются вычитанием из него.
+  const rawTotal = Number((a.inputs && a.inputs[0] && a.inputs[0].qty) || 0);
+  const closePair = makePairBlock(a.item, {
+    big: true, unit: a.unit,
+    ...(rawTotal > 0 ? { total: () => rawTotal } : {}),
+    onChange: () => { recalcInfo(); syncLabel(); },
+  });
   const qty = closePair ? closePair.input : h('input', { type: 'text', inputmode: 'decimal', placeholder: '0', class: 'qty big' });
+  const outVal = () => (closePair ? closePair.value() : parseQty(qty.value));
   const info = h('p', { class: 'total' });
   const comment = h('textarea', { rows: '2', placeholder: 'Комментарий (необязательно)' });
   const saveBtn = h('button', { class: 'primary' }, '✅ Закрыть акт');
@@ -755,7 +763,7 @@ function screenCloseAct(a) {
   const labelSlot = h('div', {});
   let labelBox = null;
   const syncLabel = () => {
-    if (!(parseQty(qty.value) > 0)) {
+    if (!(outVal() > 0)) {
       if (labelBox) { labelSlot.replaceChildren(); labelBox = null; }
       return;
     }
@@ -766,7 +774,7 @@ function screenCloseAct(a) {
   };
 
   const recalcInfo = () => {
-    const v = parseQty(qty.value);
+    const v = outVal();
     if (!(v > 0) || !(a.expected > 0)) { info.textContent = ''; return; }
     const d = dev(v);
     info.textContent = Math.abs(d) < 1 ? 'Точно как ожидалось' : `${d > 0 ? '+' : ''}${fmtNum(d)}% от ожидаемого`;
@@ -775,8 +783,10 @@ function screenCloseAct(a) {
   qty.addEventListener('input', () => { recalcInfo(); syncLabel(); });
   if (closePair) closePair.otherInput.addEventListener('input', () => { recalcInfo(); syncLabel(); });
   saveBtn.addEventListener('click', async () => {
-    const v = parseQty(qty.value);
+    const v = outVal();
     if (!(v > 0)) return toast('Введите, сколько получилось', 'bad');
+    const pair = closePair ? closePair.meta() : null;
+    if (closePair && !pair) return toast(closePair.error() || 'Проверьте листья и ветки', 'bad');
     // Выход сильно отличается от ожидаемого — переспрашиваем и просим комментарий
     if (a.expected > 0 && Math.abs(dev(v)) >= 15) {
       if (!confirm(`Выход ${fmtNum(v)} ${a.unit}, а ожидалось ≈ ${fmtNum(a.expected)} ${a.unit}. Всё верно?`)) return;
@@ -786,7 +796,7 @@ function screenCloseAct(a) {
     const madeAt = labelBox ? labelBox.madeAt : startedAt;
     const pairNote = closePair ? closePair.summary() : '';
     await enqueue({ type: 'processingClose', name: session.name, pin: session.pin, actId: a.id, act: a.act,
-      qty: v, unit: a.unit, comment: comment.value.trim(), pair: closePair ? closePair.meta() : null });
+      qty: v, unit: a.unit, comment: comment.value.trim(), pair });
     toast('Акт закрыт');
     stack.pop(); // экран закрытия в истории заменяем на «Акт закрыт» + этикетка
     go(screenActDone, {
@@ -2914,17 +2924,19 @@ function smartRound(v) {
 // =====================================================================
 //  ПАРЫ ПОЗИЦИЙ: мята — листья и ветки
 //
-//  Владелец добавляет строку в лист «Пары позиций» — приложение показывает
-//  у такой позиции два поля и пересчитывает одно в другое по долям.
-//  Доли приходят из таблицы уже нормализованными (сумма 1.0), например 0.6 / 0.4.
+//  Лист «Пары позиций» говорит только, какие две позиции образуют пару
+//  (мята-листья ↔ мята-ветки). Долей и коэффициентов больше нет.
 //
-//  Что считается «своим», а что «вторым»: строка акта всегда про одну позицию
-//  (например, «Мята (листья)»). Второе поле — партнёр из пары («Мята (ветки)»).
-//  Ввод в любое поле пересчитывает другое и помечает введённое как источник —
-//  в акт уходит признак, что именно взвесили.
+//  Общий вес — опора: поле «Было: мята, г» (в акте по рецепту — своё поле
+//  у пары). Бармен вводит общий вес и любую одну часть, вторая часть
+//  считается вычитанием: листья = общий − ветки, ветки = общий − листья.
 //
-//  В расчёт выхода акта идёт только количество своей позиции: вторая доля
-//  (ветки) — справочная, это отход, а не результат. Прежние формулы не меняются.
+//  Последнее, что ввели, — источник; правка пересчитанного поля делает
+//  источником его. В акт уходит точное значение (не округлённое),
+//  поэтому сумма частей всегда равна общему весу.
+//
+//  В расчёт выхода акта идёт только количество своей позиции: вторая
+//  часть (ветки) — справочная, это отход, а не результат.
 // =====================================================================
 
 /** Активная пара, в которую входит позиция (или null). */
@@ -2959,47 +2971,79 @@ function pairGenitive(part) {
 }
 
 /**
- * Два поля для позиции-пары. null — позиция не в паре (форма как раньше).
+ * Два поля для позиции-пары + общий вес. null — позиция не в паре.
  *
- * @param {string} itemName  позиция строки акта (например, «Мята (листья)»)
- * @param {{big?:boolean, unit?:string, onChange?:Function}} opts
+ * opts.totalInput — внешнее поле общего веса (например, «Было: мята»);
+ * opts.total      — функция, возвращающая общий вес (например, из акта);
+ * opts.showTotal  — рисовать ли строку «Общий вес из акта», если он
+ *                   внешний (по умолчанию да; для поля «Было» — нет,
+ *                   оно и так стоит выше);
+ * opts.onChange   — вызывается после каждого пересчёта.
+ *
  * @returns {?{el:HTMLElement, input:HTMLInputElement, otherInput:HTMLInputElement,
- *            inputs:HTMLInputElement[], value:Function, setOwn:Function,
- *            meta:Function, summary:Function, focus:Function}}
+ *            inputs:HTMLInputElement[], value:Function, totalValue:Function,
+ *            setOwn:Function, meta:Function, summary:Function, error:Function,
+ *            syncTotal:Function, focus:Function}}
  */
 function makePairBlock(itemName, opts = {}) {
   const pair = pairFor(itemName);
   if (!pair) return null;
 
   const isA = nameKey(pair.a) === nameKey(itemName);
-  const ownName = isA ? pair.a : pair.b;
   const otherName = isA ? pair.b : pair.a;
-  const shareA = Number(pair.shareA);
-  const shareB = Number(pair.shareB);
-  const ownShare = isA ? shareA : shareB;
-  const otherShare = isA ? shareB : shareA;
-  const unit = opts.unit || 'г';
-  if (!(ownShare > 0) || !(otherShare > 0)) return null; // сервер такую пару не отдаст
-
   const partA = pairPart(pair.a);
   const partB = pairPart(pair.b);
+  const unit = opts.unit || 'г';
+  const ownSide = isA ? 'a' : 'b';
+  const otherOf = side => (side === 'a' ? 'b' : 'a');
+  const ownPart = isA ? partA : partB;
+
+  const externalInput = opts.totalInput || null;
+  const fixedTotal = typeof opts.total === 'function' ? opts.total : null;
+  const needTotalInput = !externalInput && !fixedTotal;
+
   const mkInput = () => h('input', {
     type: 'text', inputmode: 'decimal', placeholder: '0',
     class: 'qty' + (opts.big ? ' big' : ''),
   });
+  const totalIn = needTotalInput ? mkInput() : null;
   const inputA = mkInput();
   const inputB = mkInput();
   const badgeA = h('span', { class: 'pair-badge hidden' }, 'взвешено');
   const badgeB = h('span', { class: 'pair-badge hidden' }, 'взвешено');
+  const warn = h('p', { class: 'pair-warn hidden' });
   const note = h('p', { class: 'pair-note muted' });
-  let source = ''; // 'a' | 'b' — какое поле ввели вручную
+  let rawA = null, rawB = null;
+  let source = ''; // 'a' | 'b' — что ввели вручную последним
+  let warnText = '';
+
+  const totalNow = () => {
+    if (externalInput) return parseQty(externalInput.value);
+    if (fixedTotal) return Number(fixedTotal());
+    return parseQty(totalIn.value);
+  };
+  const inputFor = side => (side === 'a' ? inputA : inputB);
+  const rawFor = side => (side === 'a' ? rawA : rawB);
+  const setRaw = (side, v) => { if (side === 'a') rawA = v; else rawB = v; };
+  const partFor = side => (side === 'a' ? partA : partB);
+
+  const totalRow = needTotalInput
+    ? h('div', { class: 'pair-total-row' },
+      h('span', { class: 'pair-cap' }, `Общий вес, ${unit}`), totalIn)
+    : null;
+  const totalLine = fixedTotal && opts.showTotal !== false
+    ? h('p', { class: 'pair-total muted' }, `Общий вес из акта: ${displayGrams(totalNow())} ${unit}`)
+    : null;
 
   const fld = (part, input, badge) => h('div', { class: 'pair-field' },
     h('span', { class: 'pair-cap' }, `${part}, ${unit}`),
     h('div', { class: 'pair-line' }, input, badge));
 
   const el = h('div', { class: 'pair-block' },
+    totalRow || null,
+    totalLine || null,
     h('div', { class: 'pair-grid' }, fld(partA, inputA, badgeA), fld(partB, inputB, badgeB)),
+    warn,
     note);
 
   const showSource = () => {
@@ -3007,84 +3051,206 @@ function makePairBlock(itemName, opts = {}) {
     badgeB.classList.toggle('hidden', source !== 'b');
   };
 
-  const updateNote = () => {
-    const a = parseQty(inputA.value), b = parseQty(inputB.value);
-    const total = (isFinite(a) ? a : 0) + (isFinite(b) ? b : 0);
-    note.textContent = `Доли ${shareA} / ${shareB} · ` +
-      (total > 0 ? `всего ${fmtNum(Math.round(total))} ${unit}` : 'одно поле считается из другого');
+  const overText = side => {
+    const g = pairGenitive(partFor(side));
+    return (g.charAt(0).toUpperCase() + g.slice(1)) + ' больше, чем общий вес — проверьте';
   };
 
-  /** Пересчёт второго поля по долям: целые граммы, округление. */
-  const syncFrom = which => {
-    source = which;
-    const from = which === 'a' ? inputA : inputB;
-    const to = which === 'a' ? inputB : inputA;
-    const fromShare = which === 'a' ? shareA : shareB;
-    const toShare = which === 'a' ? shareB : shareA;
-    if (from.value.trim() === '') {
-      to.value = '';
-    } else {
-      const v = parseQty(from.value);
-      if (isFinite(v)) to.value = String(Math.round(v * toShare / fromShare));
+  const updateNote = () => {
+    const t = totalNow();
+    warn.classList.toggle('hidden', !warnText);
+    warn.textContent = warnText;
+    if (!(isFinite(t) && t > 0)) {
+      note.textContent = 'Сначала укажите общий вес';
+      return;
     }
+    if (Number.isFinite(rawA) && Number.isFinite(rawB)) {
+      note.textContent = `Общий вес ${displayGrams(t)} ${unit} · ` +
+        `${partA} ${displayGrams(rawA)} + ${partB} ${displayGrams(rawB)}`;
+    } else {
+      note.textContent = `Общий вес ${displayGrams(t)} ${unit} · введите ${partA} или ${partB}`;
+    }
+  };
+
+  const fire = () => { if (opts.onChange) opts.onChange(); };
+
+  /**
+   * Пересчитать вторую часть от source. Значения точные; в поле пишем
+   * целые граммы. Если введённая часть больше общего веса — вторая 0
+   * и заметное предупреждение, введённое значение не обрезаем.
+   */
+  const applyFrom = side => {
+    const t = totalNow();
+    const v = rawFor(side);
+    if (!(isFinite(t) && t > 0) || !(Number.isFinite(v) && v >= 0)) return;
+    const split = splitPair(t, v);
+    if (!split.ok) return;
+    const other = otherOf(side);
+    setRaw(other, split.other);
+    inputFor(other).value = displayGrams(split.other);
+    warnText = split.warning === 'over' ? overText(side) : '';
     showSource();
     updateNote();
-    if (opts.onChange) opts.onChange();
+    fire();
   };
 
-  inputA.addEventListener('input', () => syncFrom('a'));
-  inputB.addEventListener('input', () => syncFrom('b'));
+  /** Программный пересчёт после смены общего веса. */
+  const syncTotal = () => {
+    const t = totalNow();
+    if (!(isFinite(t) && t > 0)) {
+      const typed = externalInput
+        ? externalInput.value.trim()
+        : (totalIn ? totalIn.value.trim() : '');
+      rawA = null; rawB = null;
+      inputA.value = ''; inputB.value = '';
+      source = '';
+      warnText = typed && !isFinite(t) ? 'Общий вес — число без минуса и букв' : '';
+      showSource();
+      updateNote();
+      fire();
+      return;
+    }
+    if (source === '' || !(Number.isFinite(rawFor(source)) && rawFor(source) >= 0)) {
+      updateNote();
+      fire();
+      return;
+    }
+    applyFrom(source);
+  };
 
-  const primary = isA ? inputA : inputB;
-  const otherInput = isA ? inputB : inputA;
-  const ownPart = isA ? partA : partB;
-  const otherPart = isA ? partB : partA;
+  const onPartInput = side => {
+    const input = inputFor(side);
+    const other = otherOf(side);
+    const text = input.value.trim();
+    if (text === '') {
+      rawA = null; rawB = null;
+      inputA.value = ''; inputB.value = '';
+      source = ''; warnText = '';
+      showSource();
+      updateNote();
+      fire();
+      return;
+    }
+    const v = parseQty(text);
+    if (!isFinite(v)) {
+      // Мусор или минус: не пересчитываем, второе поле не подставляем.
+      setRaw(side, null);
+      setRaw(other, null);
+      inputFor(other).value = '';
+      source = side;
+      warnText = 'Введите число без минуса и букв — пересчёт не делаем';
+      showSource();
+      updateNote();
+      fire();
+      return;
+    }
+    setRaw(side, v);
+    source = side;
+    const t = totalNow();
+    if (!(isFinite(t) && t > 0)) {
+      setRaw(other, null);
+      inputFor(other).value = '';
+      warnText = '';
+      showSource();
+      updateNote();
+      fire();
+      return;
+    }
+    applyFrom(side);
+  };
+
+  const normalize = side => {
+    const v = rawFor(side);
+    if (Number.isFinite(v) && inputFor(side).value.trim() !== '') inputFor(side).value = displayGrams(v);
+  };
+
+  inputA.addEventListener('input', () => onPartInput('a'));
+  inputB.addEventListener('input', () => onPartInput('b'));
+  inputA.addEventListener('blur', () => normalize('a'));
+  inputB.addEventListener('blur', () => normalize('b'));
+  if (totalIn) totalIn.addEventListener('input', syncTotal);
 
   /** Программная подстановка (рецепт, «постоянное»): второе поле считаем сами. */
   const setOwn = v => {
-    primary.value = v === '' || v === null || v === undefined ? '' : String(v).replace('.', ',');
-    if (primary.value === '') {
-      otherInput.value = '';
-    } else {
-      const n = parseQty(primary.value);
-      if (isFinite(n)) otherInput.value = String(Math.round(n * otherShare / ownShare));
+    const n = typeof v === 'number' ? v : parseQty(v);
+    if (!(isFinite(n) && n >= 0)) {
+      rawA = null; rawB = null;
+      inputA.value = ''; inputB.value = '';
+      source = ''; warnText = '';
+      showSource();
+      updateNote();
+      fire();
+      return;
     }
-    source = '';
-    showSource();
-    updateNote();
+    setRaw(ownSide, n);
+    inputFor(ownSide).value = displayGrams(n);
+    source = ownSide;
+    const t = totalNow();
+    if (isFinite(t) && t > 0) {
+      applyFrom(ownSide);
+    } else {
+      const other = otherOf(ownSide);
+      setRaw(other, null);
+      inputFor(other).value = '';
+      warnText = '';
+      showSource();
+      updateNote();
+      fire();
+    }
   };
 
   const meta = () => {
-    const own = parseQty(primary.value);
-    if (!(own > 0)) return null;
-    const other = parseQty(otherInput.value);
-    const ownIsSource = source === '' || source === (isA ? 'a' : 'b');
+    const t = totalNow();
+    if (!(isFinite(t) && t > 0)) return null;
+    if (!Number.isFinite(rawA) || !Number.isFinite(rawB)) return null;
+    if (!pairSumOk(t, rawA, rawB)) return null;
+    const side = source || ownSide;
+    const ownRaw = rawFor(ownSide);
+    const otherRaw = rawFor(otherOf(ownSide));
+    if (!(ownRaw >= 0) || !(otherRaw >= 0)) return null;
     return {
       item: otherName,
-      qty: isFinite(other) ? Math.round(other) : 0,
-      source: ownIsSource ? 'own' : 'other',
+      qty: otherRaw,
+      total: t,
+      own: ownRaw,
+      source: side === ownSide ? 'own' : 'other',
+      weighed: side === 'a' ? pair.a : pair.b,
     };
   };
 
   /** Итоговая строка для экрана «Акт сохранён»: «мята: 120 г листьев / 80 г веток …». */
   const summary = () => {
-    const own = parseQty(primary.value), other = parseQty(otherInput.value);
-    if (!(own > 0) || !isFinite(other)) return '';
-    const aVal = isA ? own : other;
-    const bVal = isA ? other : own;
-    const weighed = source === '' ? ownPart : (source === 'a' ? partA : partB);
+    const t = totalNow();
+    if (!(isFinite(t) && t > 0) || !Number.isFinite(rawA) || !Number.isFinite(rawB)) return '';
+    const weighed = source === 'a' ? partA : (source === 'b' ? partB : ownPart);
     const baseA = pairBase(pair.a), baseB = pairBase(pair.b);
     const title = nameKey(baseA) === nameKey(baseB) ? baseA.toLowerCase() : `${baseA} / ${baseB}`.toLowerCase();
-    return `${title}: ${Math.round(aVal)} ${unit} ${pairGenitive(partA)} / ` +
-      `${Math.round(bVal)} ${unit} ${pairGenitive(partB)} ` +
-      `(по коэффициенту ${shareA}/${shareB}, взвешены ${weighed})`;
+    return `${title}: ${Math.round(rawA)} ${unit} ${pairGenitive(partA)} / ` +
+      `${Math.round(rawB)} ${unit} ${pairGenitive(partB)} ` +
+      `(общий вес ${Math.round(t)} ${unit}, взвешены ${weighed})`;
   };
 
+  const error = () => {
+    const t = totalNow();
+    if (!(isFinite(t) && t > 0)) return 'Сначала укажите общий вес';
+    if (warnText) return warnText;
+    if (!Number.isFinite(rawA) || !Number.isFinite(rawB)) return `Введите ${partA} или ${partB}`;
+    if (!pairSumOk(t, rawA, rawB)) return 'Сумма не сходится с общим весом — проверьте';
+    return '';
+  };
+
+  showSource();
   updateNote();
   return {
-    el, input: primary, otherInput, inputs: [inputA, inputB],
-    value: () => parseQty(primary.value),
-    setOwn, meta, summary, focus: () => primary.focus(),
+    el,
+    input: inputFor(ownSide),
+    otherInput: inputFor(otherOf(ownSide)),
+    inputs: [inputA, inputB],
+    value: () => rawFor(ownSide),
+    totalValue: totalNow,
+    totalInput: totalIn || externalInput || null,
+    setOwn, meta, summary, error, syncTotal,
+    focus: () => inputFor(ownSide).focus(),
   };
 }
 
@@ -3131,8 +3297,13 @@ function screenAct(act) {
   const info = h('p', { class: 'total' });
   const comment = h('textarea', { rows: '2', placeholder: 'Комментарий (необязательно)' });
   const saveBtn = h('button', { class: 'primary' }, 'Сохранить акт');
-  // Позиция выхода в паре (например, «Мята (листья)») — два поля вместо одного.
-  const outPair = makePairBlock(act.output.item, { big: true, unit: act.output.unit });
+  // Общий вес для пары на выходе. В простом акте это поле «Было: мята»;
+  // в акте по рецепту у пары будет своё поле общего веса.
+  let outTotal = () => NaN;
+  const outPair = makePairBlock(act.output.item, {
+    big: true, unit: act.output.unit,
+    ...(isRecipe ? {} : { total: () => outTotal(), showTotal: false }),
+  });
   const outInput = outPair ? outPair.input : numInput(true);
   let expectedOut = null;
 
@@ -3140,8 +3311,11 @@ function screenAct(act) {
   // Пока выхода нет — блока нет вообще (печатать нечего).
   const labelSlot = h('div', {});
   let labelBox = null;
+  const outPositive = () => (outPair
+    ? (Number.isFinite(outPair.value()) && outPair.value() > 0)
+    : parseQty(outInput.value) > 0);
   const syncLabel = () => {
-    if (!(parseQty(outInput.value) > 0)) {
+    if (!outPositive()) {
       if (labelBox) { labelSlot.replaceChildren(); labelBox = null; }
       return;
     }
@@ -3150,37 +3324,64 @@ function screenAct(act) {
     labelBox = createLabelBox({ name: labelName, madeAt: new Date(), nameEditable: !labelName });
     labelSlot.replaceChildren(labelBox.el);
   };
-  outInput.addEventListener('input', syncLabel);
+  const syncOut = () => { syncLabel(); setSaveLabel(saveBtn, outInput); };
+  outInput.addEventListener('input', syncOut);
+  if (outPair) outPair.otherInput.addEventListener('input', syncOut);
+  if (outPair && outPair.totalInput) outPair.totalInput.addEventListener('input', syncOut);
 
   // ---------- Простой акт: было → стало ----------
   if (!isRecipe) {
     const key = act.inputs[0];
-    const keyPair = makePairBlock(key.item, { big: true, unit: key.unit });
+    const keyPair = makePairBlock(key.item, {
+      big: true, unit: key.unit,
+      onChange: () => {
+        if (outPair) outPair.syncTotal();
+        recalc();
+        syncOut();
+      },
+    });
     const keyInput = keyPair ? keyPair.input : numInput(true);
+    // Общий вес для выходной пары — поле «Было» (для пары на сырье — её общий вес).
+    outTotal = keyPair
+      ? () => (typeof keyPair.totalValue === 'function' ? keyPair.totalValue() : NaN)
+      : () => parseQty(keyInput.value);
+
+    const valueOf = (pair, input) => (pair ? pair.value() : parseQty(input.value));
+    const num = v => (Number.isFinite(v) ? v : NaN);
     const recalc = () => {
-      const k = parseQty(keyInput.value), o = parseQty(outInput.value);
+      const k = num(valueOf(keyPair, keyInput));
+      const o = num(valueOf(outPair, outInput));
       info.textContent = k > 0 && o >= 0 ? `Выход: ${fmtNum(o / k * 100)}%` : '';
     };
-    keyInput.addEventListener('input', recalc);
+    // Сначала общий вес пересчитывает листья/ветки, потом выход и этикетку.
+    keyInput.addEventListener('input', () => {
+      if (outPair) outPair.syncTotal();
+      recalc();
+      syncOut();
+    });
     outInput.addEventListener('input', recalc);
-    if (keyPair) keyPair.otherInput.addEventListener('input', recalc);
+    if (keyPair) keyPair.otherInput.addEventListener('input', () => { recalc(); syncOut(); });
     if (outPair) outPair.otherInput.addEventListener('input', recalc);
     if (!outPair) outInput.placeholder = 'пусто = впишу позже';
-    outInput.addEventListener('input', () => setSaveLabel(saveBtn, outInput));
-    if (outPair) outPair.otherInput.addEventListener('input', () => setSaveLabel(saveBtn, outInput));
     saveBtn.addEventListener('click', async () => {
-      const k = parseQty(keyInput.value);
+      const k = valueOf(keyPair, keyInput);
       const later = outInput.value.trim() === '';
-      const o = later ? 0 : parseQty(outInput.value);
-      if (!(k > 0)) return toast('Введите, сколько было', 'bad');
-      if (!later && !(o > 0)) return toast('Проверьте, сколько стало', 'bad');
+      const o = later ? 0 : valueOf(outPair, outInput);
+      if (!(Number.isFinite(k) && k > 0)) return toast('Введите, сколько было', 'bad');
+      if (!later && outPair && !outPair.meta()) {
+        return toast(outPair.error() || 'Проверьте листья и ветки', 'bad');
+      }
+      if (!later && !(Number.isFinite(o) && o > 0)) return toast('Проверьте, сколько стало', 'bad');
+      const keyMeta = keyPair ? keyPair.meta() : null;
+      if (keyPair && !keyMeta) return toast(keyPair.error() || 'Проверьте общий вес', 'bad');
+      const outMeta = outPair && !later ? outPair.meta() : null;
       saveBtn.disabled = true;
       const madeAt = labelBox ? labelBox.madeAt : new Date();
       const pairNotes = [keyPair && keyPair.summary(), outPair && outPair.summary()].filter(Boolean);
       await enqueue({ type: 'processing', name: session.name, pin: session.pin, act: act.name, comment: comment.value.trim(),
         pending: later,
-        lines: [{ role: 'Сырьё', item: key.item, unit: key.unit, qty: k, pair: keyPair ? keyPair.meta() : null },
-                { role: 'Результат', item: act.output.item, unit: act.output.unit, qty: o, pair: outPair ? outPair.meta() : null }] });
+        lines: [{ role: 'Сырьё', item: key.item, unit: key.unit, qty: Number.isFinite(k) ? k : 0, pair: keyMeta },
+                { role: 'Результат', item: act.output.item, unit: act.output.unit, qty: later ? 0 : o, pair: outMeta }] });
       toast(later ? 'Сохранено. Выход впишете позже в «⏳ В работе»' : 'Акт сохранён');
       if (later) return back();
       // Акт готов — сразу этикетка, чтобы не искать её потом
@@ -3188,9 +3389,13 @@ function screenAct(act) {
       go(screenActDone, { name: act.output.item || '', madeAt, note: pairNotes.join(' · ') });
     });
     setSaveLabel(saveBtn, outInput);
+    const outDef = outPair ? pairFor(act.output.item) : null;
+    const outLabel = outDef
+      ? `Стало: ${pairBase(act.output.item)} — ${pairPart(outDef.a)} и ${pairPart(outDef.b)}, ${act.output.unit}`
+      : `Стало: ${act.output.item}, ${act.output.unit}`;
     root.append(
       h('p', { class: 'label' }, `Было: ${key.item}, ${key.unit}`), keyPair ? keyPair.el : keyInput,
-      h('p', { class: 'label' }, `Стало: ${act.output.item}, ${act.output.unit}`), outPair ? outPair.el : outInput,
+      h('p', { class: 'label' }, outLabel), outPair ? outPair.el : outInput,
       h('p', { class: 'muted' }, 'Ещё не готово? Оставьте «стало» пустым — допишете потом.'),
       info, labelSlot, comment, saveBtn);
     setTimeout(() => (keyPair ? keyPair.focus() : keyInput.focus()), 50);
@@ -3207,7 +3412,14 @@ function screenAct(act) {
     const raw = i.clean ? numInput(false) : null;
     amount.dataset.dirty = '';
     amount.addEventListener('input', () => { if (i !== key) amount.dataset.dirty = '1'; });
-    if (pair) pair.otherInput.addEventListener('input', () => { if (i !== key) amount.dataset.dirty = '1'; });
+    if (pair) {
+      pair.otherInput.addEventListener('input', () => { if (i !== key) amount.dataset.dirty = '1'; });
+      // Отдельное поле общего веса у пары: правка — тоже ручной ввод.
+      if (pair.totalInput) pair.totalInput.addEventListener('input', () => {
+        if (i !== key) amount.dataset.dirty = '1';
+        recalc();
+      });
+    }
     if (i.fixed && i.qty > 0) {
       if (pair) pair.setOwn(i.qty);
       else amount.value = String(i.qty).replace('.', ',');
@@ -3217,7 +3429,7 @@ function screenAct(act) {
   const keyRow = rows.find(r => r.i === key);
 
   function recalc() {
-    const k = parseQty(keyRow.amount.value);
+    const k = keyRow.pair ? keyRow.pair.value() : parseQty(keyRow.amount.value);
     if (key.qty > 0 && k > 0) {
       const f = k / key.qty;
       rows.forEach(r => {
@@ -3233,7 +3445,7 @@ function screenAct(act) {
     // процент чистки
     rows.forEach(r => {
       if (!r.raw) return;
-      const a = parseQty(r.amount.value), w = parseQty(r.raw.value);
+      const a = r.pair ? r.pair.value() : parseQty(r.amount.value), w = parseQty(r.raw.value);
       r.pct.textContent = a > 0 && w > 0 ? `чистый вес: ${fmtNum(a / w * 100)}% от грязного` : '';
     });
   }
@@ -3242,13 +3454,17 @@ function screenAct(act) {
     if (r.pair) r.pair.otherInput.addEventListener('input', recalc);
     if (r.raw) { r.raw.addEventListener('input', recalc); r.pct = h('p', { class: 'muted' }); }
   });
+  if (outPair && outPair.totalInput) outPair.totalInput.addEventListener('input', recalc);
 
   saveBtn.addEventListener('click', async () => {
     const lines = [];
     for (const r of rows) {
-      const a = r.amount.value.trim() === '' ? 0 : parseQty(r.amount.value);
-      if (!(a >= 0)) return toast(`Проверьте: ${r.i.item}`, 'bad');
+      const text = r.amount.value.trim();
+      const rawA = r.pair ? r.pair.value() : (text === '' ? 0 : parseQty(r.amount.value));
+      if (r.pair && text !== '' && !Number.isFinite(rawA)) return toast(`Проверьте: ${r.i.item}`, 'bad');
+      const a = Number.isFinite(rawA) ? rawA : 0;
       if (r.i === key && !(a > 0)) return toast(`Введите: ${r.i.item}`, 'bad');
+      if (r.pair && text !== '' && !r.pair.meta()) return toast(r.pair.error() || `Проверьте: ${r.i.item}`, 'bad');
       const pair = r.pair ? r.pair.meta() : null;
       if (r.raw) {
         const w = parseQty(r.raw.value);
@@ -3260,9 +3476,11 @@ function screenAct(act) {
       }
     }
     const later = outInput.value.trim() === '';
-    const o = later ? 0 : parseQty(outInput.value);
-    if (!later && !(o > 0)) return toast('Проверьте, сколько получилось', 'bad');
-    lines.push({ role: 'Результат', item: act.output.item, unit: act.output.unit, qty: o, pair: outPair ? outPair.meta() : null });
+    const o = later ? 0 : (outPair ? outPair.value() : parseQty(outInput.value));
+    if (!later && outPair && !outPair.meta()) return toast(outPair.error() || 'Проверьте листья и ветки', 'bad');
+    if (!later && !(Number.isFinite(o) && o > 0)) return toast('Проверьте, сколько получилось', 'bad');
+    lines.push({ role: 'Результат', item: act.output.item, unit: act.output.unit, qty: later ? 0 : o,
+      pair: outPair && !later ? outPair.meta() : null });
     saveBtn.disabled = true;
     const madeAt = labelBox ? labelBox.madeAt : new Date();
     const pairNotes = rows.map(r => r.pair && r.pair.summary()).filter(Boolean);
@@ -3274,8 +3492,6 @@ function screenAct(act) {
     stack.pop();
     go(screenActDone, { name: act.output.item || '', madeAt, note: pairNotes.filter(Boolean).join(' · ') });
   });
-  outInput.addEventListener('input', () => setSaveLabel(saveBtn, outInput));
-  if (outPair) outPair.otherInput.addEventListener('input', () => setSaveLabel(saveBtn, outInput));
   setSaveLabel(saveBtn, outInput);
 
   const block = (r) => {
@@ -3306,7 +3522,7 @@ function screenAct(act) {
     block(keyRow),
     restRows.length ? h('p', { class: 'label' }, 'Остальное сырьё (считается само, можно поправить)') : null,
     h('div', { class: 'lines' }, ...restRows.map(block)),
-    h('p', { class: 'label' }, `Получилось: ${act.output.item}, ${act.output.unit}`), outInput,
+    h('p', { class: 'label' }, `Получилось: ${act.output.item}, ${act.output.unit}`), outPair ? outPair.el : outInput,
     h('p', { class: 'muted' }, 'Ещё варится? Оставьте пустым — выход впишете потом.'),
     info, labelSlot, comment, saveBtn);
   recalc();

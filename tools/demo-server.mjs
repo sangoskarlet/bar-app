@@ -216,7 +216,7 @@ function config() {
     ],
     features: { ...state.features },
     pairs: state.pairsOn ? [
-      { a: 'Мята (листья)', b: 'Мята (ветки)', shareA: 0.6, shareB: 0.4, comment: 'демо' },
+      { a: 'Мята (листья)', b: 'Мята (ветки)', comment: 'демо: вычитание из общего веса' },
     ] : [],
     stopList: demoStopList(false),
     directions: ['Кухня → Бар', 'Бар → Кухня'],

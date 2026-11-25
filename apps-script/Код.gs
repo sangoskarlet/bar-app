@@ -514,32 +514,39 @@ function setupSettings() {
  * =====================================================================
  *
  *  Лист «Пары позиций» (создаётся автоматически при первом чтении config):
- *    позиция_A | позиция_B | доля_A | доля_B | активен | комментарий
+ *    позиция_A | позиция_B | доля_A (не используется) | доля_B (не используется) | активен | комментарий
  *
- *  Доли — от общей массы: A + B = 1.0. Пример для мяты: 0.6 / 0.4.
- *  Это стартовое значение, владелец поправит его по факту взвешивания.
- *  Если сумма не равна 1.0, сервер НЕ падает: нормализует доли и пишет
- *  предупреждение в «Лог». Приложение получает уже нормализованные доли.
+ *  Доли больше НЕ используются: строка только говорит, какие две позиции
+ *  образуют пару. У мяты общий вес вводится в акте («Было: мята, г»),
+ *  листья и ветки считаются вычитанием: часть = общий вес − вторая часть.
  *
- *  В форме акта позиция из активной пары показывается двумя полями
- *  («листья, г» / «ветки, г»), и ввод в любое поле пересчитывает второе.
- *  В акт пишутся оба значения и то, какое поле взвешено вручную:
- *  «Акты переработки», новые колонки Q–V (см. ACT_PAIR_HEADERS).
+ *  Старые колонки «доля_A»/«доля_B» остаются в листе, но помечаются
+ *  «(не используется)»; значения владельца не стираются.
+ *
+ *  В акт пишутся общий вес, обе части и то, что взвесили вручную:
+ *  «Акты переработки», колонки Q–X (см. ACT_PAIR_HEADERS).
  *
  *  На расчёт выхода акта пара НЕ влияет: в «Сырьё»/«Результат» идёт
- *  количество позиции своей строки (например, листья), вторая доля —
- *  справочная (ветки — отход). Это сохраняет прежние формулы выхода.
+ *  количество позиции своей строки (например, листья), вторая часть —
+ *  справочная (ветки — отход). Прежние формулы выхода не меняются.
  * ===================================================================== */
 
-const PAIR_HEADERS = ['позиция_A', 'позиция_B', 'доля_A', 'доля_B', 'активен', 'комментарий'];
+const PAIR_HEADERS = ['позиция_A', 'позиция_B', 'доля_A (не используется)', 'доля_B (не используется)', 'активен', 'комментарий'];
+const PAIR_OLD_SHARE_HEADERS = ['доля_A', 'доля_B'];
+const PAIR_UNUSED_SUFFIX = ' (не используется)';
 
 /** Первое заполнение: мята. Дальше владелец добавляет строки сам, код не нужен. */
 const PAIR_SEED = [
-  { a: 'Мята (листья)', b: 'Мята (ветки)', shareA: 0.6, shareB: 0.4,
-    note: 'стартовое значение 0.6 / 0.4 — поправьте по факту взвешивания' },
+  { a: 'Мята (листья)', b: 'Мята (ветки)',
+    note: 'две части одной массы; общий вес вводится в акте, листья и ветки считаются вычитанием' },
 ];
 
-const ACT_PAIR_HEADERS = ['пара_позиция', 'пара_кол-во', 'доля_A', 'доля_B', 'взвешено', 'всего, г'];
+const ACT_PAIR_HEADERS = [
+  'пара_позиция', 'пара_кол-во',
+  'доля_A (не используется)', 'доля_B (не используется)',
+  'взвешено', 'всего, г', 'часть_A, г', 'часть_B, г',
+];
+const ACT_PAIR_OLD_SHARE_HEADERS = ['доля_A', 'доля_B'];
 
 /** Пустая галочка = пара включена; «нет»/«выкл»/0 — выключена. */
 function pairActive_(v) {
@@ -561,32 +568,73 @@ function pairsHeader_(sh) {
   const width = Math.max(sh.getLastColumn(), PAIR_HEADERS.length);
   const head = sh.getRange(1, 1, 1, width).getValues()[0].map(str_);
   return {
-    a: head.indexOf(PAIR_HEADERS[0]),
-    b: head.indexOf(PAIR_HEADERS[1]),
-    shareA: head.indexOf(PAIR_HEADERS[2]),
-    shareB: head.indexOf(PAIR_HEADERS[3]),
-    active: head.indexOf(PAIR_HEADERS[4]),
-    note: head.indexOf(PAIR_HEADERS[5]),
+    a: head.indexOf('позиция_A'),
+    b: head.indexOf('позиция_B'),
+    active: head.indexOf('активен'),
+    note: head.indexOf('комментарий'),
   };
+}
+
+/** Старые колонки долей помечаем «не используется»; значения не трогаем. */
+function migratePairsSheet_(sh) {
+  const width = Math.max(sh.getLastColumn(), PAIR_HEADERS.length);
+  const head = sh.getRange(1, 1, 1, width).getValues()[0].map(str_);
+  let changed = false;
+  PAIR_OLD_SHARE_HEADERS.forEach(function (name) {
+    const i = head.indexOf(name);
+    if (i < 0) return;
+    sh.getRange(1, i + 1).setValue(name + PAIR_UNUSED_SUFFIX).setFontWeight('bold');
+    changed = true;
+    log_('Пары позиций', 'колонка «' + name + '» помечена «не используется»; старые значения сохранены');
+  });
+  if (changed) { sh.setColumnWidth(3, 200); sh.setColumnWidth(4, 200); }
+  markPairsUnusedNote_(sh);
+  return sh;
+}
+
+/**
+ * Дописывает в «комментарий» старых строк пометку, что доли больше не
+ * используются. Именно дописывает: прежний текст владельца сохраняется.
+ */
+function markPairsUnusedNote_(sh) {
+  const h = pairsHeader_(sh);
+  if (h.note < 0) return;
+  const last = sh.getLastRow();
+  if (last < 2) return;
+  const range = sh.getRange(2, h.note + 1, last - 1, 1);
+  const values = range.getValues();
+  const marker = 'доли не используются';
+  let changed = false;
+  values.forEach(function (row, i) {
+    const text = str_(row[0]);
+    if (!text || text.indexOf(marker) >= 0) return;
+    if (!/0[.,]6|0[.,]4|дол[яи]/i.test(text)) return;
+    values[i][0] = text + ' | 25.11.2026: доли не используются — пересчёт вычитанием из общего веса; старые значения сохранены';
+    changed = true;
+  });
+  if (changed) {
+    range.setValues(values);
+    log_('Пары позиций', 'в комментарий добавлена пометка: доли не используются');
+  }
 }
 
 /** Лист «Пары позиций»: создаёт и один раз заполняет парой для мяты. */
 function ensurePairsSheet_(ss) {
   let sh = ss.getSheetByName(SHEETS.pairs);
-  if (sh) return sh;
+  if (sh) return migratePairsSheet_(sh);
 
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(20000)) return null;
   try {
     sh = ss.getSheetByName(SHEETS.pairs);
-    if (sh) return sh;
+    if (sh) return migratePairsSheet_(sh);
     sh = ss.insertSheet(SHEETS.pairs);
     sh.getRange(1, 1, 1, PAIR_HEADERS.length).setValues([PAIR_HEADERS]).setFontWeight('bold');
     sh.setFrozenRows(1);
     sh.setColumnWidth(1, 220);
     sh.setColumnWidth(2, 220);
-    sh.setColumnWidth(3, 80);
-    sh.setColumnWidth(4, 80);
+    sh.setColumnWidth(3, 200);
+    sh.setColumnWidth(4, 200);
     sh.setColumnWidth(5, 80);
     sh.setColumnWidth(6, 420);
     seedPairs_(sh);
@@ -594,7 +642,7 @@ function ensurePairsSheet_(ss) {
     return sh;
   } catch (e) {
     sh = ss.getSheetByName(SHEETS.pairs);
-    if (sh) return sh;
+    if (sh) return migratePairsSheet_(sh);
     throw e;
   } finally {
     lock.releaseLock();
@@ -604,7 +652,7 @@ function ensurePairsSheet_(ss) {
 /** Пишет стартовую пару для мяты и ставит галочку «активен». */
 function seedPairs_(sh) {
   const rows = PAIR_SEED.map(function (p) {
-    return [text_(p.a, 120), text_(p.b, 120), p.shareA, p.shareB, true, text_(p.note, 300)];
+    return [text_(p.a, 120), text_(p.b, 120), '', '', true, text_(p.note, 300)];
   });
   sh.getRange(2, 1, rows.length, PAIR_HEADERS.length).setValues(rows);
   sh.getRange(2, 5, rows.length, 1)
@@ -612,15 +660,15 @@ function seedPairs_(sh) {
 }
 
 /**
- * Активные пары с нормализованными долями:
- * [{ a, b, shareA, shareB, comment }].
- * Неверные строки (пусто, одинаковые позиции, доля ≤ 0) пропускаются с записью в «Лог».
+ * Активные пары: [{ a, b, comment }]. Доли не читаются и не проверяются:
+ * для расчёта нужен только состав пары.
+ * Неверные строки (пусто, одинаковые позиции) пропускаются с записью в «Лог».
  */
 function pairs_(ss) {
   const sh = ensurePairsSheet_(ss);
   if (!sh) return [];
   const h = pairsHeader_(sh);
-  if (h.a < 0 || h.b < 0 || h.shareA < 0 || h.shareB < 0) return [];
+  if (h.a < 0 || h.b < 0) return [];
 
   const out = [];
   const seen = {};
@@ -633,20 +681,6 @@ function pairs_(ss) {
       return;
     }
     if (!pairActive_(h.active >= 0 ? r[h.active] : true)) return;
-    let sa = num_(r[h.shareA]);
-    let sb = num_(r[h.shareB]);
-    if (!(sa > 0) || !(sb > 0)) {
-      log_('Пары позиций', 'пропущена пара без долей: ' + a + ' / ' + b);
-      return;
-    }
-    const sum = sa + sb;
-    if (Math.abs(sum - 1) > 0.001) {
-      const origSum = sum;
-      sa = sa / sum;
-      sb = sb / sum;
-      log_('Пары позиций', 'сумма долей ' + Math.round(origSum * 1000) / 1000 + ' у «' + a + ' / ' + b +
-        '» — доли нормализованы: ' + Math.round(sa * 1000) / 1000 + ' / ' + Math.round(sb * 1000) / 1000);
-    }
     // Одна позиция — одна пара: первая активная строка выигрывает, остальные в «Лог».
     const ka = str_(a).toLowerCase();
     const kb = str_(b).toLowerCase();
@@ -658,30 +692,38 @@ function pairs_(ss) {
     seen[kb] = true;
     out.push({
       a: a, b: b,
-      shareA: Math.round(sa * 1000) / 1000,
-      shareB: Math.round(sb * 1000) / 1000,
       comment: h.note >= 0 ? str_(r[h.note]) : '',
     });
   });
   return out;
 }
 
-/** Сторона пары для позиции: { name, share, isA } или null. */
+/** Сторона пары для позиции: { name, isA } или null. */
 function pairSide_(pair, name) {
-  if (sameName_(pair.a, name)) return { name: pair.a, share: pair.shareA, isA: true };
-  if (sameName_(pair.b, name)) return { name: pair.b, share: pair.shareB, isA: false };
+  if (sameName_(pair.a, name)) return { name: pair.a, isA: true };
+  if (sameName_(pair.b, name)) return { name: pair.b, isA: false };
   return null;
 }
 
 /**
- * Данные пары из строки акта. Возвращает null, если пары нет, она выключена
- * или данные неверные — тогда строка сохраняется как обычная, без пары.
+ * Данные пары из строки акта.
  *
- * line.pair = { item: '<вторая позиция>', qty: <граммы>, source: 'own'|'other' }.
- * source = 'own' — взвесили позицию этой строки, второе значение считаем;
- * source = 'other' — взвесили вторую позицию, количество строки пересчитываем.
+ * line.pair = { item, qty, total, source, own? }:
+ *   item   — вторая позиция пары;
+ *   total  — общий вес (опора, введён в акте);
+ *   qty    — вес второй позиции (нужен при source = 'other');
+ *   source = 'own'   — взвесили позицию этой строки, вторая = общий − она;
+ *   source = 'other' — взвесили вторую позицию, позиция строки = общий − она.
+ *
+ * Возвращает null, если пары нет или она выключена — строка сохраняется
+ * как обычная, без пары.
+ * Возвращает { invalid: true, error } для неверных данных: акт не пишем,
+ * чтобы в таблице не появилась сумма, не сходящаяся с общим весом.
+ *
+ * fallbackTotal — общий вес из ключевого сырья (для старых записей в
+ * очереди, где pair.total ещё не было).
  */
-function actPairForLine_(pairs, line, baseQty) {
+function actPairForLine_(pairs, line, baseQty, fallbackTotal) {
   const p = line && line.pair;
   if (!p || typeof p !== 'object') return null;
   const item = str_(line.item);
@@ -700,27 +742,44 @@ function actPairForLine_(pairs, line, baseQty) {
   const other = pairSide_(pair, partner);
   if (!side || !other) return null;
 
-  const source = str_(p.source) === 'other' ? 'other' : 'own';
-  let ownQty = Math.round(Number(baseQty) || 0);
-  let partnerQty = 0;
-  if (source === 'other') {
-    const weighed = Number(p.qty);
-    if (!(weighed >= 0 && weighed < 1000000)) return null;
-    partnerQty = Math.round(weighed);
-    ownQty = Math.round(partnerQty * side.share / other.share);
-  } else {
-    partnerQty = Math.round(ownQty * other.share / side.share);
+  let total = Number(p.total);
+  if (!(total > 0 && total < 1000000)) total = Number(fallbackTotal);
+  if (!(total > 0 && total < 1000000)) {
+    return { invalid: true, error: 'Пара «' + item + '»: не указан общий вес' };
   }
-  if (!(ownQty >= 0) || !(partnerQty >= 0) || ownQty + partnerQty <= 0) return null;
+
+  const source = str_(p.source) === 'other' ? 'other' : 'own';
+  let ownQty, partnerQty;
+  if (source === 'other') {
+    partnerQty = Number(p.qty);
+    if (!(partnerQty >= 0 && partnerQty < 1000000)) {
+      return { invalid: true, error: 'Пара «' + item + '»: проверьте вес второй позиции' };
+    }
+    ownQty = total - partnerQty;
+  } else {
+    ownQty = Number(baseQty);
+    if (!(ownQty >= 0 && ownQty < 1000000)) {
+      return { invalid: true, error: 'Пара «' + item + '»: проверьте вес' };
+    }
+    partnerQty = total - ownQty;
+  }
+  if (ownQty < 0 || partnerQty < 0) {
+    const over = ownQty < 0 ? other : side;
+    return { invalid: true, error: 'Пара «' + item + '»: «' + over.name +
+      '» больше общего веса (' + total + ' г)' };
+  }
+  if (Math.abs((ownQty + partnerQty) - total) > 0.01) {
+    return { invalid: true, error: 'Пара «' + item + '»: сумма не сходится с общим весом' };
+  }
 
   return {
     item: other.name,             // вторая позиция (например, «Мята (ветки)»)
     qty: partnerQty,              // её граммы
-    shareA: pair.shareA,
-    shareB: pair.shareB,
     weighed: source === 'own' ? side.name : other.name,
-    total: ownQty + partnerQty,
+    total: total,
     ownQty: ownQty,
+    aQty: side.isA ? ownQty : partnerQty,
+    bQty: side.isA ? partnerQty : ownQty,
   };
 }
 
@@ -729,37 +788,92 @@ function actPairColumns_(sheet) {
   const width = Math.max(sheet.getLastColumn(), 16);
   const head = sheet.getRange(1, 1, 1, width).getValues()[0].map(str_);
   const idx = {};
-  ACT_PAIR_HEADERS.forEach(function (name) { idx[name] = head.indexOf(name) + 1; }); // 0 → «нет»
+  ACT_PAIR_HEADERS.forEach(function (name) {
+    let i = head.indexOf(name);
+    if (i < 0) {
+      const base = name.replace(PAIR_UNUSED_SUFFIX, '');
+      if (base !== name) i = head.indexOf(base);
+    }
+    idx[name] = i + 1; // 0 → «нет»
+  });
   return idx;
 }
 
 /**
- * Дописывает колонки Q–V в «Акты переработки», если их нет.
- * Существующие A–P не трогает, порядок и формулы не меняет.
+ * Дописывает колонки Q–X в «Акты переработки»:
+ *   Q пара_позиция | R пара_кол-во | U взвешено | V всего, г |
+ *   W часть_A, г | X часть_B, г.
+ * Старые S/T «доля_A/доля_B» помечаются «(не используется)»;
+ * их значения не стираются. A–P, порядок и формулы не меняются.
  */
 function ensureActPairColumns_(sheet) {
-  let idx = actPairColumns_(sheet);
-  if (idx[ACT_PAIR_HEADERS[0]] > 0) return idx;
+  const width0 = Math.max(sheet.getLastColumn(), 16);
+  const head0 = sheet.getRange(1, 1, 1, width0).getValues()[0].map(str_);
+  const hasQ = head0.indexOf('пара_позиция') >= 0;
+
+  if (!hasQ) {
+    let last = 0;
+    head0.forEach(function (v, i) { if (str_(v)) last = i + 1; });
+    const start = Math.max(last, 16) + 1;
+    sheet.getRange(1, start, 1, ACT_PAIR_HEADERS.length)
+      .setValues([ACT_PAIR_HEADERS]).setFontWeight('bold');
+    for (let i = 0; i < ACT_PAIR_HEADERS.length; i++) sheet.setColumnWidth(start + i, i === 0 ? 160 : 100);
+    log_('Пары позиций', 'в «' + SHEETS.acts + '» добавлены колонки ' + start + '–' + (start + ACT_PAIR_HEADERS.length - 1));
+    return actPairColumns_(sheet);
+  }
 
   const width = Math.max(sheet.getLastColumn(), 16);
   const head = sheet.getRange(1, 1, 1, width).getValues()[0].map(str_);
+  let changed = false;
+  ACT_PAIR_OLD_SHARE_HEADERS.forEach(function (name) {
+    const i = head.indexOf(name);
+    if (i < 0) return;
+    sheet.getRange(1, i + 1).setValue(name + PAIR_UNUSED_SUFFIX).setFontWeight('bold');
+    head[i] = name + PAIR_UNUSED_SUFFIX;
+    changed = true;
+    log_('Пары позиций', 'в «' + SHEETS.acts + '» колонка «' + name + '» помечена «не используется»; значения сохранены');
+  });
+
+  let idx = actPairColumns_(sheet);
   let last = 0;
   head.forEach(function (v, i) { if (str_(v)) last = i + 1; });
-  const start = Math.max(last, 16) + 1;
-  sheet.getRange(1, start, 1, ACT_PAIR_HEADERS.length)
-    .setValues([ACT_PAIR_HEADERS]).setFontWeight('bold');
-  for (let i = 0; i < ACT_PAIR_HEADERS.length; i++) sheet.setColumnWidth(start + i, i === 0 ? 160 : 100);
-  log_('Пары позиций', 'в «' + SHEETS.acts + '» добавлены колонки ' + start + '–' + (start + ACT_PAIR_HEADERS.length - 1));
-  return actPairColumns_(sheet);
+  ['часть_A, г', 'часть_B, г'].forEach(function (name) {
+    if (idx[name] > 0) return;
+    last += 1;
+    sheet.getRange(1, last).setValue(name).setFontWeight('bold');
+    sheet.setColumnWidth(last, 100);
+    idx[name] = last;
+    changed = true;
+  });
+  if (changed) log_('Пары позиций', 'колонки пары в «' + SHEETS.acts + '» обновлены');
+  return idx;
 }
 
-/** Значения Q–V для строки акта (пустые, если пары нет). */
+/** Значения Q–X для строки акта (пустые, если пары нет). */
 function actPairRow_(pair) {
-  if (!pair) return ['', '', '', '', '', ''];
-  return [text_(pair.item, 120), pair.qty, pair.shareA, pair.shareB, text_(pair.weighed, 120), pair.total];
+  if (!pair) return ['', '', '', '', '', '', '', ''];
+  return [
+    text_(pair.item, 120), pair.qty,
+    '', '', // старые доли: не заполняем и не перезаписываем
+    text_(pair.weighed, 120), pair.total,
+    pair.aQty, pair.bQty,
+  ];
 }
 
-/** Ручной запуск из редактора: создать «Пары позиций» и колонки Q–V в актах. */
+/**
+ * Запись колонок пары в строку акта. Старые «доля_A/доля_B» не трогаем:
+ * в уже сохранённых актах там могут быть прежние 0.6/0.4, их нельзя стереть.
+ */
+function writeActPairCols_(sheet, row, cols, pair) {
+  if (!pair || !cols) return;
+  const vals = actPairRow_(pair);
+  ACT_PAIR_HEADERS.forEach(function (name, i) {
+    if (name.indexOf('доля_') === 0) return;
+    if (cols[name] > 0) sheet.getRange(row, cols[name]).setValue(vals[i]);
+  });
+}
+
+/** Ручной запуск из редактора: создать «Пары позиций» и колонки Q–X в актах. */
 function setupPairs() {
   const ss = ss_();
   const sh = ensurePairsSheet_(ss);
@@ -1945,9 +2059,10 @@ function saveInventory_(ss, sheet, auth, rec, id, created, received, comment) {
  * Пишем по строке на каждую позицию: так в «Своде переработки» легко сложить расход и приход.
  * Позиции и единицы обязаны совпадать с шаблоном — бармен не может «придумать» сырьё.
  *
- * Пара (мята: листья/ветки) — только справочные колонки Q–V. В «Кол-во» идёт
- * количество своей позиции (листья), вторая доля (ветки) в сумму расхода и в
- * выход НЕ входит: ветки — отход, а не результат. Формулы выхода не меняются.
+ * Пара (мята: листья/ветки) — общий вес и две части. В «Кол-во» идёт
+ * количество своей позиции (листья), вторая часть (ветки) — справочные
+ * колонки Q–X; в сумму расхода и в выход она НЕ входит: ветки — отход.
+ * Формулы выхода не меняются.
  */
 function saveProcessing_(ss, sheet, auth, rec, id, created, received, comment) {
   const tpl = actTemplates_(ss).find(a => a.name === str_(rec.act));
@@ -1959,6 +2074,13 @@ function saveProcessing_(ss, sheet, auth, rec, id, created, received, comment) {
   let inQty = 0, outQty = 0, keyQty = 0;
   let hasPair = false;
 
+  // Общий вес для старой записи из очереди: у простого акта это «Было» —
+  // ключевое сырьё. Новый клиент присылает pair.total сам, но старые
+  // записи (до перехода на вычитание) его не знают.
+  const keyLine = tpl.inputs.find(i => i.key);
+  const keyRec = keyLine ? lines.find(l => str_(l.role) === 'Сырьё' && str_(l.item) === keyLine.item) : null;
+  const keyRawTotal = keyRec ? Number(keyRec.qty) : 0;
+
   for (const l of lines) {
     const k = str_(l.role) + '|' + str_(l.item) + '|' + str_(l.unit);
     if (allowed.indexOf(k) === -1) return { id, status: 'error', error: 'Позиция не из шаблона: ' + l.item };
@@ -1969,10 +2091,12 @@ function saveProcessing_(ss, sheet, auth, rec, id, created, received, comment) {
     const isClean = l.role === 'Сырьё' && tplLine && tplLine.clean;
     let clean = Number(l.clean);
 
-    // Пара: сервер сам пересчитывает вторую долю, клиенту на слово не верим.
+    // Пара: сервер сам считает вторую часть из общего веса, клиенту на слово не верим.
     // База пересчёта — то, что реально взвесили: чистый вес, если сырьё чистили.
     const base = isClean ? clean : q;
-    const pair = actPairForLine_(pairList, l, base);
+    const fallbackTotal = l.role === 'Результат' ? keyRawTotal : 0;
+    const pair = actPairForLine_(pairList, l, base, fallbackTotal);
+    if (pair && pair.invalid) return { id, status: 'error', error: pair.error };
     if (pair) {
       hasPair = true;
       if (isClean) clean = pair.ownQty; else q = pair.ownQty;
@@ -1983,7 +2107,6 @@ function saveProcessing_(ss, sheet, auth, rec, id, created, received, comment) {
       if (clean > q) return { id, status: 'error', error: 'Чистый вес больше грязного: ' + l.item };
     }
     if (l.role === 'Результат') outQty += q; else inQty += q;
-    const keyLine = tpl.inputs.find(i => i.key);
     if (l.role === 'Сырьё' && keyLine && l.item === keyLine.item) keyQty = q;
     prepared.push({ l, q, clean: isClean ? clean : 0, pair });
   }
@@ -2011,14 +2134,11 @@ function saveProcessing_(ss, sheet, auth, rec, id, created, received, comment) {
     const status = !isOut ? ['', '', ''] : pending ? ['⏳ В работе', '', ''] : ['✅ Закрыт', auth.name, received];
     const row = addRow_(sheet, [created, auth.name, "'" + tpl.name, l.role, "'" + str_(l.item), isOut && pending ? '' : p.q,
       str_(l.unit), pct, i === 0 ? comment : '', received, "'" + id, hasClean ? c : ''].concat(status));
-    // Q–V: вторая позиция пары, её граммы, доли, что взвешено и общая масса.
-    // Пишем по названиям колонок, а не по номеру: владелец может их переставить.
-    if (pairCols) {
-      const vals = actPairRow_(p.pair);
-      ACT_PAIR_HEADERS.forEach(function (name, k) {
-        if (pairCols[name] > 0) sheet.getRange(row, pairCols[name]).setValue(vals[k]);
-      });
-    }
+    // Q–X: вторая позиция пары, её граммы, что взвешено, общая масса
+    // и обе части (часть_A/часть_B). Пишем по названиям колонок, а не
+    // по номеру: владелец может их переставить. Старые «доля_A/доля_B»
+    // не перезаписываем — в истории там остались прежние 0.6/0.4.
+    if (pairCols) writeActPairCols_(sheet, row, pairCols, p.pair);
   });
   return { id, status: 'saved' };
 }
@@ -2042,15 +2162,22 @@ function closeProcessing_(ss, sheet, auth, rec, id, received) {
   }
   // Выход в % — для простых актов: стало / было
   const tpl = actTemplates_(ss).find(a => a.name === str_(r[2]));
-  // Пара у результата: количество листьев остаётся в F, ветки — в Q–V.
-  const pair = rec.pair && typeof rec.pair === 'object' && tpl
-    ? actPairForLine_(pairs_(ss), { item: tpl.output.item, pair: rec.pair }, qty)
+  // Общий вес уже записан в акте (строка ключевого сырья). Для закрытия
+  // он важнее того, что прислал клиент: акт нельзя «перевзвесить» задним числом.
+  const raw = data.find(x => str_(x[10]) === actId && str_(x[3]) === 'Сырьё');
+  const rawTotal = raw ? Number(raw[5]) : 0;
+  const pairRec = rec.pair && typeof rec.pair === 'object' && tpl
+    ? Object.assign({}, rec.pair, { total: rawTotal > 0 ? rawTotal : rec.pair.total })
     : null;
+  // Пара у результата: количество листьев остаётся в F, ветки — в Q–X.
+  const pair = pairRec
+    ? actPairForLine_(pairs_(ss), { item: tpl.output.item, pair: pairRec }, qty, rawTotal)
+    : null;
+  if (pair && pair.invalid) return { id, status: 'error', error: pair.error };
   if (pair) qty = pair.ownQty;
   let pct = '';
-  if (tpl && tpl.type === 'простой') {
-    const raw = data.find(x => str_(x[10]) === actId && str_(x[3]) === 'Сырьё');
-    if (raw && Number(raw[5]) > 0) pct = Math.round(qty / Number(raw[5]) * 1000) / 10;
+  if (tpl && tpl.type === 'простой' && raw && rawTotal > 0) {
+    pct = Math.round(qty / rawTotal * 1000) / 10;
   }
   const row = idx + 2;
   const note = str_(rec.comment).slice(0, 300);
@@ -2059,13 +2186,7 @@ function closeProcessing_(ss, sheet, auth, rec, id, received) {
   sheet.getRange(row, 8).setValue(pct);
   if (note) sheet.getRange(row, 9).setValue("'" + (oldComment ? oldComment + ' | ' : '') + 'При закрытии: ' + note);
   sheet.getRange(row, 13, 1, 4).setValues([['✅ Закрыт', auth.name, received, "'" + id]]);
-  if (pair) {
-    const cols = ensureActPairColumns_(sheet);
-    const vals = actPairRow_(pair);
-    ACT_PAIR_HEADERS.forEach(function (name, i) {
-      if (cols[name] > 0) sheet.getRange(row, cols[name]).setValue(vals[i]);
-    });
-  }
+  if (pair) writeActPairCols_(sheet, row, ensureActPairColumns_(sheet), pair);
   return { id, status: 'saved' };
 }
 

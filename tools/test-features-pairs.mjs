@@ -4,9 +4,10 @@
 //  Загружает apps-script/Код.gs в песочницу Node, подменяет сервисы
 //  Apps Script таблицей-заглушкой и проверяет:
 //    * лист «Настройки» → config.features (нет листа/ключа = включено);
-//    * лист «Пары позиций» → нормализация долей, выключенная пара;
-//    * запись акта с парой: оба значения, доли, «взвешено», расчёт выхода;
-//    * закрытие акта с парой;
+//    * лист «Пары позиций» → состав пары без долей, миграция старых колонок;
+//    * запись акта с парой: общий вес, листья + ветки = общий вес, «взвешено»,
+//      расчёт выхода, отказ при неверной сумме;
+//    * закрытие акта с парой и сохранение старых значений долей;
 //    * выключенный раздел не мешает записи (очередь как раньше).
 //
 //  Запуск: node tools/test-features-pairs.mjs
@@ -209,8 +210,8 @@ function makeSs(extra = {}) {
     ['Чек-листы', ['список', 'порядок', 'пункт', 'подсказка', 'фото_обязательно', 'активен'], []],
     ['Факты', ['id', 'текст', 'источник', 'активен', 'дата_показа'], []],
   ]);
-  for (const [name, headers, rows] of Object.entries(extra)) {
-    ss.sheets.set(name, new FakeSheet(name, headers, rows));
+  for (const [name, spec] of Object.entries(extra || {})) {
+    ss.sheets.set(name, new FakeSheet(name, spec[0], spec[1] || []));
   }
   return ss;
 }
@@ -303,7 +304,7 @@ test('непонятное значение не выключает раздел
   assert.ok(state.log.some(x => x.includes('непонятное значение') && x.includes('раздел_викторина')));
 });
 
-test('config.features — объект со всеми булевыми полями; config.pairs — массив пар', () => {
+test('config.features — объект со всеми булевыми полями; config.pairs — состав пар без долей', () => {
   const ss = makeSs();
   state.ss = ss;
   const cfg = sandbox.getConfig_(ss);
@@ -315,36 +316,47 @@ test('config.features — объект со всеми булевыми поля
   assert.equal(cfg.pairs.length, 1);
   assert.equal(cfg.pairs[0].a, 'Мята (листья)');
   assert.equal(cfg.pairs[0].b, 'Мята (ветки)');
-  assert.equal(cfg.pairs[0].shareA, 0.6);
-  assert.equal(cfg.pairs[0].shareB, 0.4);
+  assert.ok(!('shareA' in cfg.pairs[0]), 'доли больше не отдаются клиенту');
+  assert.ok(!('shareB' in cfg.pairs[0]));
 });
 
 // =====================================================================
 //  Б. ПАРЫ ПОЗИЦИЙ
 // =====================================================================
 
-test('лист «Пары позиций» создаётся и заполняется мятой 0.6 / 0.4', () => {
+test('лист «Пары позиций» создаётся с мятой; доли не заполняются', () => {
   const ss = makeSs();
   state.ss = ss;
   const pairs = sandbox.pairs_(ss);
   assert.equal(pairs.length, 1);
+  assert.deepEqual(Object.keys(pairs[0]).sort(), ['a', 'b', 'comment']);
   const sh = ss.getSheetByName('Пары позиций');
   assert.ok(sh);
-  assert.deepEqual(sh.cells[0], ['позиция_A', 'позиция_B', 'доля_A', 'доля_B', 'активен', 'комментарий']);
-  assert.deepEqual(sh.cells[1].slice(0, 5), ['Мята (листья)', 'Мята (ветки)', 0.6, 0.4, true]);
+  assert.deepEqual(sh.cells[0], ['позиция_A', 'позиция_B', 'доля_A (не используется)',
+    'доля_B (не используется)', 'активен', 'комментарий']);
+  assert.deepEqual(sh.cells[1].slice(0, 5), ['Мята (листья)', 'Мята (ветки)', '', '', true]);
 });
 
-test('сумма долей не 1.0 — сервер не падает, нормализует и пишет предупреждение', () => {
-  const ss = makeSs();
+test('старый лист с долями: колонки помечены «не используется», 0.6/0.4 сохранены', () => {
+  const ss = makeSs({
+    'Пары позиций': [
+      ['позиция_A', 'позиция_B', 'доля_A', 'доля_B', 'активен', 'комментарий'],
+      [['Мята (листья)', 'Мята (ветки)', 0.6, 0.4, true, 'стартовое значение 0.6 / 0.4 — поправьте']],
+    ],
+  });
   state.ss = ss;
-  sandbox.pairs_(ss);
-  const sh = ss.getSheetByName('Пары позиций');
-  sh.set(2, 3, 0.6);
-  sh.set(2, 4, 0.6); // сумма 1.2
   const pairs = sandbox.pairs_(ss);
-  assert.equal(pairs[0].shareA, 0.5);
-  assert.equal(pairs[0].shareB, 0.5);
-  assert.ok(state.log.some(x => x.includes('нормализованы')));
+  assert.equal(pairs.length, 1);
+  assert.equal(pairs[0].a, 'Мята (листья)');
+  assert.ok(!('shareA' in pairs[0]), 'доли не отдаются клиенту');
+  const sh = ss.getSheetByName('Пары позиций');
+  assert.deepEqual(sh.cells[0], ['позиция_A', 'позиция_B', 'доля_A (не используется)',
+    'доля_B (не используется)', 'активен', 'комментарий']);
+  assert.equal(sh.get(2, 3), 0.6, 'старое значение доли_A не стёрто');
+  assert.equal(sh.get(2, 4), 0.4, 'старое значение доли_B не стёрто');
+  assert.match(String(sh.get(2, 6)), /доли не используются/, 'в комментарий добавлена пометка');
+  assert.match(String(sh.get(2, 6)), /стартовое значение 0\.6 \/ 0\.4/, 'прежний комментарий сохранён');
+  assert.ok(state.log.some(x => x.includes('не используется')));
 });
 
 test('выключенная пара (снятая галочка) не попадает в config', () => {
@@ -355,16 +367,16 @@ test('выключенная пара (снятая галочка) не поп�
   assert.equal(sandbox.pairs_(ss).length, 0);
 });
 
-test('вторая пара добавляется строкой в лист, без правки кода, и её можно выключить', () => {
+test('вторая пара добавляется строкой в лист, без долей, и её можно выключить', () => {
   const ss = makeSs();
   state.ss = ss;
   sandbox.pairs_(ss);
   const sh = ss.getSheetByName('Пары позиций');
-  sh.cells.push(['Апельсин (цедра)', 'Апельсин (мякоть)', 0.3, 0.7, true, 'тестовая пара']);
+  sh.cells.push(['Апельсин (цедра)', 'Апельсин (мякоть)', '', '', true, 'тестовая пара']);
   let pairs = sandbox.pairs_(ss);
   assert.equal(pairs.length, 2);
   assert.equal(pairs[1].a, 'Апельсин (цедра)');
-  assert.equal(pairs[1].shareB, 0.7);
+  assert.ok(!('shareA' in pairs[1]), 'доли не нужны и не отдаются');
   // «выключаем» вторую строку
   sh.set(3, 5, false);
   pairs = sandbox.pairs_(ss);
@@ -372,7 +384,7 @@ test('вторая пара добавляется строкой в лист, �
   assert.equal(pairs[0].a, 'Мята (листья)');
 });
 
-test('одинаковые позиции в паре и доли ≤ 0 пропускаются с записью в «Лог»', () => {
+test('одинаковые позиции пропускаются; пустые доли больше не мешают', () => {
   const ss = makeSs();
   state.ss = ss;
   sandbox.pairs_(ss);
@@ -381,13 +393,26 @@ test('одинаковые позиции в паре и доли ≤ 0 проп
   assert.equal(sandbox.pairs_(ss).length, 0);
   assert.ok(state.log.some(x => x.includes('одинаковыми позициями')));
   sh.set(2, 2, 'Мята (ветки)');
-  sh.set(2, 3, 0);
-  assert.equal(sandbox.pairs_(ss).length, 0);
-  assert.ok(state.log.some(x => x.includes('без долей')));
+  sh.set(2, 3, '');
+  sh.set(2, 4, '');
+  assert.equal(sandbox.pairs_(ss).length, 1, 'пара без долей работает');
+});
+
+test('старые колонки Q–V: доли помечены, часть_A/часть_B добавлены', () => {
+  const ss = makeSs();
+  state.ss = ss;
+  const sh = actSheet(ss);
+  sh.cells[0].push('пара_позиция', 'пара_кол-во', 'доля_A', 'доля_B', 'взвешено', 'всего, г');
+  const cols = sandbox.ensureActPairColumns_(sh);
+  assert.equal(sh.cells[0][18], 'доля_A (не используется)');
+  assert.equal(sh.cells[0][19], 'доля_B (не используется)');
+  assert.ok(cols['часть_A, г'] > 0, 'часть_A добавлена');
+  assert.ok(cols['часть_B, г'] > 0, 'часть_B добавлена');
+  assert.ok(state.log.some(x => x.includes('обновлены')));
 });
 
 // =====================================================================
-//  В. АКТЫ: запись, сохранение обоих значений, выход
+//  В. АКТЫ: запись, сохранение общего веса и обеих частей, выход
 // =====================================================================
 
 const AUTH = { name: 'Анна', role: 'бармен' };
@@ -396,15 +421,23 @@ function actSheet(ss) { return ss.getSheetByName('Акты переработк�
 function lastPairCols(ss) {
   const sh = actSheet(ss);
   const head = sh.cells[0].map(String);
-  const at = name => head.indexOf(name) + 1;
+  const at = name => {
+    const exact = head.indexOf(name);
+    if (exact >= 0) return exact + 1;
+    if (name.indexOf('доля_') === 0) return head.indexOf(name + ' (не используется)') + 1;
+    return 0;
+  };
   const row = sh.getLastRow();
+  const val = name => (at(name) ? sh.get(row, at(name)) : '');
   return {
-    pairItem: at('пара_позиция') ? sh.get(row, at('пара_позиция')) : '',
-    pairQty: at('пара_кол-во') ? sh.get(row, at('пара_кол-во')) : '',
-    shareA: at('доля_A') ? sh.get(row, at('доля_A')) : '',
-    shareB: at('доля_B') ? sh.get(row, at('доля_B')) : '',
-    weighed: at('взвешено') ? sh.get(row, at('взвешено')) : '',
-    total: at('всего, г') ? sh.get(row, at('всего, г')) : '',
+    pairItem: val('пара_позиция'),
+    pairQty: val('пара_кол-во'),
+    shareA: val('доля_A'),
+    shareB: val('доля_B'),
+    weighed: val('взвешено'),
+    total: val('всего, г'),
+    partA: val('часть_A, г'),
+    partB: val('часть_B, г'),
   };
 }
 function saveMint(ss, outQty, pair) {
@@ -418,40 +451,73 @@ function saveMint(ss, outQty, pair) {
   }, 'test-mint-0001', new Date(), new Date(), '');
 }
 
-test('акт с парой: в лист пишутся листья 120, ветки 80, доли 0.6/0.4, взвешены листья', () => {
+test('акт с парой: листья 120 + ветки 80 = общий 200, взвешены листья', () => {
+  const ss = makeSs();
+  state.ss = ss;
+  const res = saveMint(ss, 120, { item: 'Мята (ветки)', qty: 80, total: 200, source: 'own' });
+  assert.equal(res.status, 'saved');
+  const cols = lastPairCols(ss);
+  assert.equal(cols.pairItem, 'Мята (ветки)');
+  assert.equal(cols.pairQty, 80);
+  assert.equal(cols.shareA, '', 'старые доли не заполняются');
+  assert.equal(cols.shareB, '', 'старые доли не заполняются');
+  assert.equal(cols.weighed, 'Мята (листья)');
+  assert.equal(cols.total, 200);
+  assert.equal(cols.partA, 120);
+  assert.equal(cols.partB, 80);
+  const sh = actSheet(ss);
+  const row = sh.getLastRow();
+  assert.equal(sh.get(row, 6), 120);
+  assert.equal(sh.get(row, 8), 60);
+  assert.equal(cols.partA + cols.partB, cols.total, 'сумма частей = общий вес');
+  assert.equal(sh.get(row, 6) + cols.pairQty, cols.total, 'F + R = V');
+});
+
+test('ввели ветки 80 — сервер считает листья 120, присланному 999 не верит', () => {
+  const ss = makeSs();
+  state.ss = ss;
+  saveMint(ss, 999, { item: 'Мята (ветки)', qty: 80, total: 200, source: 'other' });
+  const sh = actSheet(ss);
+  const row = sh.getLastRow();
+  assert.equal(sh.get(row, 6), 120);
+  assert.equal(sh.get(row, 8), 60);
+  const cols = lastPairCols(ss);
+  assert.equal(cols.pairQty, 80);
+  assert.equal(cols.weighed, 'Мята (ветки)');
+  assert.equal(cols.partA, 120);
+  assert.equal(cols.partB, 80);
+  assert.equal(cols.partA + cols.partB, cols.total);
+});
+
+test('листья больше общего веса: акт не пишется, ошибка заметная', () => {
+  const ss = makeSs();
+  state.ss = ss;
+  const res = saveMint(ss, 250, { item: 'Мята (ветки)', qty: 0, total: 200, source: 'own' });
+  assert.equal(res.status, 'error');
+  assert.match(res.error, /больше общего веса/);
+  assert.equal(actSheet(ss).getLastRow(), 1, 'ни одной строки акта не добавлено');
+});
+
+test('старая запись без total: общий вес берётся из «Было» (200)', () => {
   const ss = makeSs();
   state.ss = ss;
   const res = saveMint(ss, 120, { item: 'Мята (ветки)', qty: 80, source: 'own' });
   assert.equal(res.status, 'saved');
   const cols = lastPairCols(ss);
-  assert.equal(cols.pairItem, 'Мята (ветки)');
-  assert.equal(cols.pairQty, 80);
-  assert.equal(cols.shareA, 0.6);
-  assert.equal(cols.shareB, 0.4);
-  assert.equal(cols.weighed, 'Мята (листья)');
   assert.equal(cols.total, 200);
-  // F результата = 120, H (выход) = 120/200 = 60 %
-  const sh = actSheet(ss);
-  const row = sh.getLastRow();
-  assert.equal(sh.get(row, 6), 120);
-  assert.equal(sh.get(row, 8), 60);
+  assert.equal(cols.partA, 120);
+  assert.equal(cols.partB, 80);
 });
 
-test('ввели ветки (120 г листьев посчитаны) — сервер всё равно пишет 120 и 80', () => {
-  const ss = makeSs();
-  state.ss = ss;
-  saveMint(ss, 120, { item: 'Мята (ветки)', qty: 80, source: 'other' });
-  const sh = actSheet(ss);
-  const row = sh.getLastRow();
-  assert.equal(sh.get(row, 6), 120);
-  assert.equal(lastPairCols(ss).weighed, 'Мята (ветки)');
-});
-
-test('клиент прислал неверное «своё» число — сервер пересчитывает по взвешенному', () => {
-  const ss = makeSs();
-  state.ss = ss;
-  saveMint(ss, 999, { item: 'Мята (ветки)', qty: 80, source: 'other' });
-  assert.equal(actSheet(ss).get(actSheet(ss).getLastRow(), 6), 120);
+test('пара без общего веса и без fallback — invalid, акт не пишется молча', () => {
+  const pair = sandbox.actPairForLine_(
+    [{ a: 'Мята (листья)', b: 'Мята (ветки)' }],
+    { item: 'Мята (листья)', pair: { item: 'Мята (ветки)', qty: 80, source: 'own' } },
+    120,
+    0,
+  );
+  assert.equal(pair.invalid, true);
+  assert.match(pair.error, /общий вес/);
 });
 
 test('выключенная пара не показывается: акт пишется как раньше, без колонок пары', () => {
@@ -459,7 +525,7 @@ test('выключенная пара не показывается: акт пи
   state.ss = ss;
   sandbox.pairs_(ss);
   ss.getSheetByName('Пары позиций').set(2, 5, false);
-  saveMint(ss, 120, { item: 'Мята (ветки)', qty: 80, source: 'own' });
+  saveMint(ss, 120, { item: 'Мята (ветки)', qty: 80, total: 200, source: 'own' });
   const sh = actSheet(ss);
   const row = sh.getLastRow();
   assert.equal(sh.get(row, 6), 120);
@@ -489,7 +555,8 @@ test('позиция не из шаблона по-прежнему отклон
     act: 'Мята — очистка',
     lines: [
       { role: 'Сырьё', item: 'Мята', unit: 'г', qty: 200 },
-      { role: 'Результат', item: 'Мята (листья)', unit: 'г', qty: 120, pair: { item: 'Неизвестно', qty: 80 } },
+      { role: 'Результат', item: 'Мята (листья)', unit: 'г', qty: 120,
+        pair: { item: 'Неизвестно', qty: 80, total: 200 } },
     ],
   }, 'test-badpair-01', new Date(), new Date(), '');
   // Вторая позиция пары неизвестна → пара игнорируется, сам акт сохраняется.
@@ -513,26 +580,34 @@ test('пары не меняют расчёт выхода у рецепта', (
   assert.equal(sh.get(sh.getLastRow(), 8), '');
 });
 
-test('закрытие акта с парой пишет ветки в Q–V', () => {
+test('закрытие акта с парой: общий вес из акта, части считаются; старые доли не стёрты', () => {
   const ss = makeSs();
   state.ss = ss;
   saveMint(ss, 0, null); // pending: выход пуст
   const sh = actSheet(ss);
   const row = sh.getLastRow();
   assert.equal(sh.get(row, 13), '⏳ В работе');
+  // Старый акт мог быть сохранён прежней версией: в S/T уже стоят 0.6/0.4.
+  sandbox.ensureActPairColumns_(sh);
+  const shareAcol = sh.cells[0].indexOf('доля_A (не используется)') + 1;
+  const shareBcol = sh.cells[0].indexOf('доля_B (не используется)') + 1;
+  sh.set(row, shareAcol, 0.6);
+  sh.set(row, shareBcol, 0.4);
   const res = sandbox.closeProcessing_(ss, sh, AUTH, {
-    actId: 'test-mint-0001', qty: 120, pair: { item: 'Мята (ветки)', qty: 80, source: 'other' },
+    actId: 'test-mint-0001', qty: 999,
+    pair: { item: 'Мята (ветки)', qty: 80, total: 200, source: 'other' },
   }, 'test-close-0001', new Date());
   assert.equal(res.status, 'saved');
-  assert.equal(sh.get(row, 6), 120); // листья пересчитаны из 80 г веток
-  const cols = {
-    item: sh.get(row, sh.cells[0].indexOf('пара_позиция') + 1),
-    qty: sh.get(row, sh.cells[0].indexOf('пара_кол-во') + 1),
-    weighed: sh.get(row, sh.cells[0].indexOf('взвешено') + 1),
-  };
-  assert.equal(cols.item, 'Мята (ветки)');
-  assert.equal(cols.qty, 80);
+  assert.equal(sh.get(row, 6), 120); // листья = 200 − 80
+  assert.equal(sh.get(row, 8), 60);
+  const cols = lastPairCols(ss);
+  assert.equal(cols.pairQty, 80);
+  assert.equal(cols.total, 200);
+  assert.equal(cols.partA, 120);
+  assert.equal(cols.partB, 80);
   assert.equal(cols.weighed, 'Мята (ветки)');
+  assert.equal(sh.get(row, shareAcol), 0.6, 'старая доля_A не стёрта');
+  assert.equal(sh.get(row, shareBcol), 0.4, 'старая доля_B не стёрта');
 });
 
 test('выключенный раздел «акты» не мешает записи акта (очередь работает)', () => {

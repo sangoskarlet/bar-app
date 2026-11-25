@@ -9,7 +9,7 @@
 //  иначе телефоны продолжат показывать старую версию.
 // =====================================================================
 
-const VERSION = 'v31';
+const VERSION = 'v32';
 const CACHE = 'bar-app-' + VERSION;
 const FILES = [
   './',
@@ -18,6 +18,7 @@ const FILES = [
   './config.js',
   './manifest.webmanifest',
   './js/app.js',
+  './js/pair-calc.js',
   './js/api.js',
   './js/db.js',
   './js/sync.js',

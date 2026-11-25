@@ -217,8 +217,8 @@ textarea { margin-top: 16px; resize: vertical; }
 .clean-line .arrow { text-align: center; color: var(--muted); font-size: 20px; }
 .clean-caps { margin-top: -4px; color: var(--muted); font-size: 12px; text-align: center; }
 
-/* Пара позиций (мята: листья и ветки) — два поля, пересчёт по долям.
-   Поле, введённое вручную, помечено «взвешено»; второе посчитано. */
+/* Пара позиций (мята: листья и ветки) — общий вес и две части.
+   Введённая часть помечена «взвешено»; вторая = общий вес − введённая. */
 .pair-block { margin-top: 8px; }
 .pair-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .pair-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
@@ -228,6 +228,12 @@ textarea { margin-top: 16px; resize: vertical; }
 .pair-badge { align-self: flex-start; font-size: 11px; line-height: 1.5; color: var(--accent-text);
   background: var(--accent); border-radius: 8px; padding: 0 6px; white-space: nowrap; }
 .pair-note { margin: 6px 0 0; font-size: 13px; }
+.pair-total-row { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+.pair-total-row input { width: 100%; }
+.pair-total { margin: 0 0 8px; font-size: 13px; }
+.pair-warn { margin: 8px 0 0; padding: 8px 10px; font-size: 14px; font-weight: 600;
+  line-height: 1.35; color: var(--bad); border: 1px solid var(--bad); border-radius: 10px;
+  background: rgba(239, 93, 93, .14); }
 .pair-row { margin-top: 8px; }
 .pair-row .label { margin-top: 0; }
 

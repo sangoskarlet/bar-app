@@ -263,13 +263,13 @@ test('config отдаёт одновременно features, 6 зон с эта�
   assert.deepEqual(Array.from(cfg.photoZones, z => z.floor), ['1', '1', '1', '2', '2', '2']);
   assert.equal(cfg.photoRefLimit, 3);
 
-  // 3) Пары позиций (ветка 17): мята 0.6 / 0.4.
+  // 3) Пары позиций (ветка 17): мята — состав пары; доли больше не нужны.
   assert.ok(Array.isArray(cfg.pairs));
   assert.equal(cfg.pairs.length, 1);
   assert.equal(cfg.pairs[0].a, 'Мята (листья)');
   assert.equal(cfg.pairs[0].b, 'Мята (ветки)');
-  assert.equal(cfg.pairs[0].shareA, 0.6);
-  assert.equal(cfg.pairs[0].shareB, 0.4);
+  assert.ok(!('shareA' in cfg.pairs[0]), 'доли не отдаются клиенту');
+  assert.ok(!('shareB' in cfg.pairs[0]));
 
   // 4) Листы обоих наборов реально созданы и не затёрли друг друга.
   const settings = ss.getSheetByName('Настройки');
@@ -335,7 +335,7 @@ test('акт с мятой пишется при выключенном «акт
     lines: [
       { role: 'Сырьё', item: 'Мята', unit: 'г', qty: 200 },
       { role: 'Результат', item: 'Мята (листья)', unit: 'г', qty: 120,
-        pair: { item: 'Мята (ветки)', qty: 80, source: 'own' } },
+        pair: { item: 'Мята (ветки)', qty: 80, total: 200, source: 'own' } },
     ],
   }, 'test-int-mint-01', new Date(), new Date(), '');
   spy.restore();
@@ -348,10 +348,14 @@ test('акт с мятой пишется при выключенном «акт
   const row = sh.getLastRow();
   assert.equal(sh.get(row, at('пара_позиция')), 'Мята (ветки)');
   assert.equal(sh.get(row, at('пара_кол-во')), 80);
-  assert.equal(sh.get(row, at('доля_A')), 0.6);
-  assert.equal(sh.get(row, at('доля_B')), 0.4);
+  assert.equal(sh.get(row, at('доля_A (не используется)')), '', 'старые доли не заполняются');
+  assert.equal(sh.get(row, at('доля_B (не используется)')), '', 'старые доли не заполняются');
   assert.equal(sh.get(row, at('взвешено')), 'Мята (листья)');
   assert.equal(sh.get(row, at('всего, г')), 200);
+  assert.equal(sh.get(row, at('часть_A, г')), 120);
+  assert.equal(sh.get(row, at('часть_B, г')), 80);
+  // Сумма частей равна общему весу.
+  assert.equal(sh.get(row, at('часть_A, г')) + sh.get(row, at('часть_B, г')), sh.get(row, at('всего, г')));
   // Выход считается по своей позиции: 120 / 200 = 60 %.
   assert.equal(sh.get(row, 6), 120);
   assert.equal(sh.get(row, 8), 60);
@@ -376,17 +380,20 @@ test('закрытие акта с мятой при выключенном «а
   const spy = spyFeatures();
   const res = sandbox.closeProcessing_(ss, sh, AUTH, {
     actId: 'test-int-mint-02',
-    qty: 80, // взвесили ветки: «своё» поле пересчитывается из 80 г веток
-    pair: { item: 'Мята (ветки)', qty: 80, source: 'other' },
+    qty: 80, // взвесили ветки: листья = общий 200 − 80 = 120
+    pair: { item: 'Мята (ветки)', qty: 80, total: 200, source: 'other' },
   }, 'test-int-close-01', new Date());
   spy.restore();
   assert.equal(res.status, 'saved');
   assert.equal(spy.count(), 0);
   const head = sh.cells[0].map(String);
   const at = name => head.indexOf(name) + 1;
-  assert.equal(sh.get(row, 6), 120, 'листья = 80 × 0.6/0.4 = 120');
+  assert.equal(sh.get(row, 6), 120, 'листья = 200 − 80 = 120');
   assert.equal(sh.get(row, at('пара_позиция')), 'Мята (ветки)');
   assert.equal(sh.get(row, at('пара_кол-во')), 80);
+  assert.equal(sh.get(row, at('всего, г')), 200);
+  assert.equal(sh.get(row, at('часть_A, г')), 120);
+  assert.equal(sh.get(row, at('часть_B, г')), 80);
   assert.equal(sh.get(row, at('взвешено')), 'Мята (ветки)');
 });
 

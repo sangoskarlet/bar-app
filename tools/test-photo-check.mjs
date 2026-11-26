@@ -77,21 +77,56 @@ class FakeSheet {
 
 const PHOTO_HEADERS = ['Дата', 'Сотрудник', 'Зона', 'Фото', 'Комментарий', 'Получено', 'ID записи',
   'Проверка ИИ', 'Что не так', 'Замечание менеджера', 'Фото удалено', 'ID файла'];
-const PHOTO_FULL_HEADERS = PHOTO_HEADERS.concat(['вердикт', 'уверенность', 'замечания', 'модель', 'проверено_в', 'эталон', 'этаж']);
+const PHOTO_FULL_HEADERS = PHOTO_HEADERS.concat(['вердикт', 'уверенность', 'замечания', 'модель', 'проверено_в', 'эталон', 'этаж',
+  'проход_id', 'зона_определена_автоматически', 'уверенность_зоны']);
 const REF_PHOTO_HEADERS = ['зона', 'порядок', 'ссылка_на_фото', 'ракурс', 'активен'];
 
 const props = new Map([
   ['GEMINI_API_KEY', 'test-key'],
+  ['PHOTO_FOLDER_ID', 'folder-root'],
 ]);
 const state = {
   fetchCalls: [],
   fetchHandler: null,
   driveFiles: new Map(),
+  uploaded: [],
   photoSheet: null,
   refsSheet: null,
   refPhotosSheet: null,
+  listsSheet: null,
+  staffSheet: null,
   log: [],
 };
+
+/** Файл «на Диске» для createFile/getFileById. */
+function fakeFile(id, name, bytes, mime) {
+  const f = {
+    id, name, bytes: Uint8Array.from(bytes || []), mime: mime || 'image/jpeg',
+    getId() { return this.id; },
+    getName() { return this.name; },
+    setName(v) { this.name = v; return this; },
+    getUrl() { return 'https://drive.google.com/file/d/' + this.id + '/view'; },
+    getBlob() { return { getContentType: () => f.mime, getBytes: () => Uint8Array.from(f.bytes) }; },
+    getThumbnail() { return null; },
+  };
+  return f;
+}
+
+function fakeFolder(id, name) {
+  let n = 0;
+  return {
+    getId: () => id,
+    getName: () => name,
+    getFoldersByName: () => ({ hasNext: () => false, next: () => null }),
+    createFolder: (child) => fakeFolder('folder-' + child, child),
+    createFile: (blob) => {
+      const f = fakeFile('file-' + (++n) + '-' + Date.now(), blob.name || 'x.jpg',
+        blob.getBytes ? blob.getBytes() : [], blob.getContentType ? blob.getContentType() : 'image/jpeg');
+      state.uploaded.push(f);
+      return f;
+    },
+  };
+}
 
 const sandbox = {
   console,
@@ -126,6 +161,8 @@ const sandbox = {
       if (!f) throw new Error('нет файла ' + id);
       return {
         getId: () => id,
+        getName: () => f.name || id,
+        setName: (v) => { f.name = v; return f; },
         getUrl: () => 'https://drive.google.com/file/d/' + id + '/view',
         getBlob: () => ({
           getContentType: () => f.mime || 'image/jpeg',
@@ -136,6 +173,8 @@ const sandbox = {
           : null),
       };
     },
+    getFolderById: (id) => fakeFolder(id, 'root'),
+    createFolder: (name) => fakeFolder('created-' + name, name),
   },
   SpreadsheetApp: {
     openById: () => ({
@@ -143,6 +182,8 @@ const sandbox = {
         if (name === 'Фото уборки') return state.photoSheet;
         if (name === 'Эталоны уборки') return state.refsSheet;
         if (name === 'Эталоны — фото') return state.refPhotosSheet;
+        if (name === 'Списки') return state.listsSheet;
+        if (name === 'Сотрудники') return state.staffSheet;
         if (name === 'Лог') return null;
         return null;
       },
@@ -152,6 +193,7 @@ const sandbox = {
         return sh;
       },
     }),
+    flush: () => {},
     newRichTextValue: () => {
       const obj = {
         text: '',
@@ -669,20 +711,26 @@ test('таймаут с 3 эталонами → повтор всеми пре�
 });
 
 // ---------- 5. Лист: колонки, запись, чтение ----------
-test('колонки M–S создаются один раз и не дублируются', () => {
+test('колонки M–V создаются один раз и не дублируются', () => {
   const sheet = new FakeSheet(PHOTO_HEADERS);
   const cols = sandbox.ensurePhotoColumns_(sheet);
   assert.deepEqual(
     [cols.verdict, cols.confidence, cols.notes, cols.model, cols.checkedAt, cols.reference, cols.floor],
     [13, 14, 15, 16, 17, 18, 19],
   );
+  assert.deepEqual([cols.runId, cols.zoneAuto, cols.zoneConfidence], [20, 21, 22]);
   assert.equal(sheet.get(1, 13), 'вердикт');
   assert.equal(sheet.get(1, 18), 'эталон');
   assert.equal(sheet.get(1, 19), 'этаж');
+  assert.equal(sheet.get(1, 20), 'проход_id');
+  assert.equal(sheet.get(1, 21), 'зона_определена_автоматически');
+  assert.equal(sheet.get(1, 22), 'уверенность_зоны');
   const again = sandbox.ensurePhotoColumns_(sheet);
   assert.equal(again.verdict, 13);
   assert.equal(again.floor, 19);
-  assert.equal(sheet.getLastColumn(), 19);
+  assert.equal(again.runId, 20);
+  assert.equal(again.zoneConfidence, 22);
+  assert.equal(sheet.getLastColumn(), 22);
 });
 
 test('вердикт пишется в H/I и M–S, этаж — в S', () => {
@@ -767,6 +815,322 @@ test('эталоны читаются по зоне; этаж и ссылка с
   assert.equal(ref.fileId, 'ABC123456789012345678');
   assert.equal(ref.floor, '2');
   assert.match(ref.url, /ABC123456789012345678/);
+});
+
+// =====================================================================
+//  ТРИ КАДРА ЗА ПРОХОД: определение зоны, порог, новые колонки
+// =====================================================================
+
+/**
+ * Столы для нового потока: «Списки» с зонами, «Эталоны уборки» с этажами
+ * и критериями, пустой лист эталонных фото, лист фото и «Сотрудники».
+ */
+function zoneFixture() {
+  state.listsSheet = new FakeSheet(['причины', 'зоны'], [
+    ['Бой', 'Бар'],
+    ['', 'Холодильники'],
+    ['', 'За баром'],
+    ['', 'Окно'],
+    ['', 'Дверь'],
+    ['', 'Склад'],
+  ]);
+  state.refsSheet = new FakeSheet(['этаж', 'зона', 'критерии', 'эталонное_фото'], [
+    ['1', 'Бар', 'Стойка сухая и пустая.', ''],
+    ['1', 'Холодильники', 'Полки чистые, без липких следов.', ''],
+    ['1', 'За баром', 'Пол сухой, инвентарь на местах.', ''],
+    ['2', 'Окно', 'Подоконник сухой, стекло чистое.', ''],
+    ['2', 'Дверь', 'Ручка и стекло чистые.', ''],
+    ['2', 'Склад', 'Полки чистые, коробки ровно.', ''],
+  ]);
+  state.refPhotosSheet = new FakeSheet(REF_PHOTO_HEADERS);
+  state.photoSheet = new FakeSheet(PHOTO_HEADERS);
+  state.staffSheet = new FakeSheet(['Сотрудники', 'PIN', 'Роль', 'Активен'], [
+    ['Анна', '1234', 'бармен', true],
+  ]);
+  state.uploaded = [];
+}
+
+const IMG = 'data:image/jpeg;base64,' + Buffer.from([1, 2, 3, 4]).toString('base64');
+const ZONE_PROMPT = /определяешь, какая зона/;
+
+function zoneAwareGemini(zoneAnswer, verdictAnswer) {
+  return (url, opt) => {
+    const text = JSON.parse(opt.payload).contents[0].parts[0].text;
+    if (ZONE_PROMPT.test(text)) return geminiOk(zoneAnswer);
+    return geminiOk(verdictAnswer || {
+      verdict: 'ok', confidence: 0.9,
+      items: [{ criterion: 'Стойка', level: 'ok', comment: 'сухо' }],
+    });
+  };
+}
+
+test('зоны этажа: только этот этаж, с критериями', () => {
+  zoneFixture();
+  const one = sandbox.photoFloorZones_(ss(), '1');
+  assert.deepEqual(JSON.parse(JSON.stringify(one.map(z => z.zone))), ['Бар', 'Холодильники', 'За баром']);
+  assert.equal(one[0].what, 'Стойка сухая и пустая.');
+  assert.equal(one[0].floor, '1');
+  const two = sandbox.photoFloorZones_(ss(), '2 этаж');
+  assert.deepEqual(JSON.parse(JSON.stringify(two.map(z => z.zone))), ['Окно', 'Дверь', 'Склад']);
+});
+
+test('промпт зоны: закрытый список этажа, запрет придумывать, JSON-схема', () => {
+  zoneFixture();
+  const zones = sandbox.photoFloorZones_(ss(), '1');
+  const p = sandbox.buildPhotoZonePrompt_('1', zones);
+  assert.match(p, /Этаж: 1 этаж/);
+  assert.match(p, /«Бар»/);
+  assert.match(p, /Стойка сухая и пустая/);
+  assert.match(p, /«Холодильники»/);
+  assert.doesNotMatch(p, /«Окно»/);          // зона другого этажа не предлагается
+  assert.match(p, /ТОЛЬКО из списка/);
+  assert.match(p, /не определено/);
+  assert.match(p, /zone_confidence/);
+  assert.match(p, /ТОЛЬКО JSON/);
+  assert.match(p, /Не проверяй чистоту/);
+});
+
+test('ответ зоны: название из списка принимается, чужое — нет', () => {
+  zoneFixture();
+  const zones = sandbox.photoFloorZones_(ss(), '1');
+  let v = sandbox.validateZoneAnswer_('{"zone":"бар","zone_confidence":0.9}', zones);
+  assert.equal(v.ok, true);
+  assert.equal(v.zone, 'Бар');
+  assert.equal(v.confidence, 0.9);
+  // Зона 2 этажа на кадре 1 этажа: даже 0.95 не принимается.
+  v = sandbox.validateZoneAnswer_('{"zone":"Окно","zone_confidence":0.95}', zones);
+  assert.equal(v.ok, true);
+  assert.equal(v.zone, '');
+  assert.equal(v.raw, 'Окно');
+  assert.equal(sandbox.validateZoneAnswer_('{"zone":"Кухня","zone_confidence":0.9}', zones).zone, '');
+  assert.equal(sandbox.validateZoneAnswer_('{"zone":"Бар"}', zones).ok, false);
+  assert.equal(sandbox.validateZoneAnswer_('я не понял', zones).ok, false);
+  assert.equal(sandbox.validateZoneAnswer_('{"zone":"Бар","zone_confidence":1.4}', zones).ok, false);
+});
+
+test('определение зоны: 0.8 → зона; в запрос уходят только зоны этажа', () => {
+  zoneFixture();
+  state.fetchCalls = [];
+  state.fetchHandler = zoneAwareGemini({ zone: 'Холодильники', zone_confidence: 0.8 });
+  props.delete('GEMINI_ZONE_MODEL');
+  const checkModel = props.get('GEMINI_MODEL');
+  const det = sandbox.photoDetectZone_('1', sandbox.Utilities.newBlob([1, 2, 3], 'image/jpeg', 'x.jpg'), 'photo1');
+  assert.equal(det.zone, 'Холодильники');
+  assert.equal(det.confidence, 0.8);
+  assert.equal(det.reason, '');
+  const payload = JSON.parse(state.fetchCalls[0].options.payload);
+  const text = payload.contents[0].parts[0].text;
+  assert.match(text, /«Холодильники»/);
+  assert.doesNotMatch(text, /«Склад»/);
+  assert.equal(payload.contents[0].parts[1].inline_data.mime_type, 'image/jpeg');
+  assert.equal(payload.generationConfig.responseSchema.properties.zone.type, 'STRING');
+  // Модель запомнилась только для шага зоны, общий GEMINI_MODEL не тронут.
+  assert.equal(props.get('GEMINI_ZONE_MODEL'), 'gemini-flash-lite-latest');
+  assert.equal(props.get('GEMINI_MODEL'), checkModel);
+  props.delete('GEMINI_ZONE_MODEL');
+});
+
+test('ответ зоны: «Окно 2 этажа» — то же название, «Кухня» — нет', () => {
+  zoneFixture();
+  const two = sandbox.photoFloorZones_(ss(), '2');
+  // Уточнение этажа в ответе модели не делает зону новой.
+  assert.equal(sandbox.validateZoneAnswer_('{"zone":"Окно 2 этажа","zone_confidence":0.9}', two).zone, 'Окно');
+  assert.equal(sandbox.validateZoneAnswer_('{"zone":"Дверь (2 этаж)","zone_confidence":0.9}', two).zone, 'Дверь');
+  assert.equal(sandbox.validateZoneAnswer_('{"zone":"склад — 2 этаж","zone_confidence":0.9}', two).zone, 'Склад');
+  // А вот чужая зона и «сосед» не принимаются.
+  assert.equal(sandbox.validateZoneAnswer_('{"zone":"Кухня","zone_confidence":0.9}', two).zone, '');
+  assert.equal(sandbox.validateZoneAnswer_('{"zone":"Бар","zone_confidence":0.99}', two).zone, '');
+  assert.equal(sandbox.validateZoneAnswer_('{"zone":"Окно и подоконник","zone_confidence":0.9}', two).zone, '');
+});
+
+test('порог 0.6: 0.59 — зона не определена, 0.6 — определена', () => {
+  zoneFixture();
+  const blob = sandbox.Utilities.newBlob([1, 2, 3], 'image/jpeg', 'x.jpg');
+  state.fetchHandler = zoneAwareGemini({ zone: 'Бар', zone_confidence: 0.59 });
+  const low = sandbox.photoDetectZone_('1', blob, 'photo1');
+  assert.equal(low.zone, '');
+  assert.equal(low.confidence, 0.59);
+  state.fetchHandler = zoneAwareGemini({ zone: 'Бар', zone_confidence: 0.6 });
+  const edge = sandbox.photoDetectZone_('1', blob, 'photo1');
+  assert.equal(edge.zone, 'Бар');
+  props.delete('GEMINI_ZONE_MODEL');
+});
+
+test('зона вне списка этажа → не определена, даже при уверенности 0.99', () => {
+  zoneFixture();
+  state.fetchHandler = zoneAwareGemini({ zone: 'Окно', zone_confidence: 0.99 });
+  const det = sandbox.photoDetectZone_('1', sandbox.Utilities.newBlob([1], 'image/jpeg', 'x.jpg'), 'p');
+  assert.equal(det.zone, '');
+  assert.match(det.reason, /вне списка/);
+  props.delete('GEMINI_ZONE_MODEL');
+});
+
+test('сбой API на шаге зоны → не определена с причиной, без падения', () => {
+  zoneFixture();
+  state.fetchHandler = () => apiResponse(503, 'high demand');
+  const det = sandbox.photoDetectZone_('1', sandbox.Utilities.newBlob([1], 'image/jpeg', 'x.jpg'), null);
+  assert.equal(det.zone, '');
+  assert.match(det.reason, /503|Нет доступной модели/);
+  props.delete('GEMINI_ZONE_MODEL');
+});
+
+test('нет зон у этажа → не определена, в Gemini не ходим', () => {
+  zoneFixture();
+  state.fetchCalls = [];
+  const det = sandbox.photoDetectZone_('9', sandbox.Utilities.newBlob([1], 'image/jpeg', 'x.jpg'), null);
+  assert.equal(det.zone, '');
+  assert.match(det.reason, /нет зон/);
+  assert.equal(state.fetchCalls.length, 0);
+});
+
+test('savePhoto_ три кадра: зона определена, колонки T–V заполнены', () => {
+  zoneFixture();
+  state.fetchCalls = [];
+  state.fetchHandler = zoneAwareGemini({ zone: 'Бар', zone_confidence: 0.88 });
+  props.delete('GEMINI_ZONE_MODEL');
+  const rec = {
+    type: 'photo', name: 'Анна', pin: '1234', runId: 'run-aaa', floor: '1',
+    autoZone: true, image: IMG, comment: '',
+  };
+  const id = 'photo-0001-abcd';
+  const res = sandbox.savePhoto_(ss(), state.photoSheet, { name: 'Анна', role: 'бармен' }, rec, id,
+    new Date('2026-11-26T20:00:00Z'), new Date(), '');
+  assert.equal(res.status, 'saved');
+  assert.equal(res.zone, 'Бар');
+  assert.equal(res.verdict.zone, 'Бар');
+  assert.equal(res.verdict.zoneAuto, true);
+  assert.equal(res.verdict.zoneConfidence, 0.88);
+  assert.equal(res.verdict.runId, 'run-aaa');
+  assert.equal(res.verdict.floor, '1');
+  assert.equal(state.fetchCalls.length, 2);         // зона + проверка
+  const row = 2;
+  assert.equal(state.photoSheet.get(row, 3), "'Бар");
+  assert.equal(state.photoSheet.get(row, 19), '1'); // этаж
+  assert.equal(state.photoSheet.get(row, 20), 'run-aaa');
+  assert.equal(state.photoSheet.get(row, 21), 'да');
+  assert.equal(state.photoSheet.get(row, 22), 0.88);
+  assert.equal(state.photoSheet.get(row, 13), 'ok');
+  assert.equal(state.uploaded.length, 1);
+  assert.match(state.uploaded[0].name, /_Бар_/);    // файл переименован после определения
+  props.delete('GEMINI_ZONE_MODEL');
+});
+
+test('savePhoto_: зона не определена → проверка не запускается, вердикт не выдуман', () => {
+  zoneFixture();
+  state.fetchCalls = [];
+  state.fetchHandler = zoneAwareGemini({ zone: 'не определено', zone_confidence: 0.2 });
+  const rec = {
+    type: 'photo', name: 'Анна', pin: '1234', runId: 'run-bbb', floor: '1',
+    autoZone: true, image: IMG, comment: '',
+  };
+  const res = sandbox.savePhoto_(ss(), state.photoSheet, { name: 'Анна', role: 'бармен' }, rec, 'photo-0002-abcd',
+    new Date('2026-11-26T20:00:00Z'), new Date(), '');
+  assert.equal(res.status, 'saved');
+  assert.equal(res.zone, 'зона не определена');
+  assert.equal(res.verdict.zoneAuto, false);
+  assert.equal(res.verdict.level, 'unclear');
+  assert.match(res.verdict.notes, /зона не определена/);
+  assert.equal(state.fetchCalls.length, 1);          // только шаг зоны
+  assert.equal(state.photoSheet.get(2, 3), "'зона не определена");
+  assert.equal(state.photoSheet.get(2, 8), '❓ Зона не определена');
+  assert.equal(state.photoSheet.get(2, 13), 'unclear');
+  assert.equal(state.photoSheet.get(2, 20), 'run-bbb');
+  assert.equal(state.photoSheet.get(2, 21), 'нет');
+  assert.equal(state.photoSheet.get(2, 22), 0.2);
+  props.delete('GEMINI_ZONE_MODEL');
+});
+
+test('savePhoto_ старый путь: зона выбрана руками, U = «нет»', () => {
+  zoneFixture();
+  state.fetchCalls = [];
+  state.fetchHandler = zoneAwareGemini({ zone: 'Бар', zone_confidence: 0.9 });
+  const rec = {
+    type: 'photo', name: 'Анна', pin: '1234', runId: 'run-ccc', floor: '1',
+    zone: 'За баром', image: IMG, comment: '',
+  };
+  const res = sandbox.savePhoto_(ss(), state.photoSheet, { name: 'Анна', role: 'бармен' }, rec, 'photo-0003-abcd',
+    new Date('2026-11-26T20:00:00Z'), new Date(), '');
+  assert.equal(res.zone, 'За баром');
+  assert.equal(res.verdict.zoneAuto, false);
+  assert.equal(res.verdict.zoneConfidence, null);
+  assert.equal(state.fetchCalls.length, 1);          // сразу проверка, без шага зоны
+  assert.equal(state.photoSheet.get(2, 21), 'нет');
+});
+
+test('savePhoto_: авто без этажа → понятная ошибка, ничего не пишем', () => {
+  zoneFixture();
+  const before = state.photoSheet.getLastRow();
+  const res = sandbox.savePhoto_(ss(), state.photoSheet, { name: 'Анна', role: 'бармен' },
+    { type: 'photo', name: 'Анна', pin: '1234', autoZone: true, image: IMG },
+    'photo-0004-abcd', new Date(), new Date(), '');
+  assert.equal(res.status, 'error');
+  assert.match(res.error, /этаж/);
+  assert.equal(state.photoSheet.getLastRow(), before);
+});
+
+test('история: проход, авто-зона и уверенность отдаются телефону', () => {
+  state.photoSheet = new FakeSheet(PHOTO_FULL_HEADERS, [
+    [new Date('2026-11-26T20:00:00Z'), 'Анна', 'Бар', '', '', new Date(), 'id-a1', '✅ Чисто', '', '', '', 'f1',
+      'ok', 0.9, '', 'm', new Date('2026-11-26T20:01:00Z'), 'нет', '1', 'run-1', 'да', 0.88],
+    [new Date('2026-11-26T20:00:30Z'), 'Анна', 'зона не определена', '', '', new Date(), 'id-a2', '❓ Зона не определена', '', '', '', 'f2',
+      'unclear', null, 'зона не определена', 'm', new Date('2026-11-26T20:01:00Z'), 'нет', '1', 'run-1', 'нет', 0.31],
+  ]);
+  const res = sandbox.getPhotoHistory_(10);
+  assert.equal(res.photos.length, 2);
+  assert.equal(res.photos[1].runId, 'run-1');
+  assert.equal(res.photos[1].zoneAuto, true);
+  assert.equal(res.photos[1].zoneConfidence, 0.88);
+  assert.equal(res.photos[0].zoneAuto, false);
+  assert.equal(res.photos[0].zoneConfidence, 0.31);
+  assert.equal(res.photos[0].zone, 'зона не определена');
+});
+
+// =====================================================================
+//  РУЧНОЙ ВЫБОР ЗОНЫ: перепроверка и обновление вердикта
+// =====================================================================
+
+test('photoRecheck: зона изменена, вердикт перепроверен и обновлён в листе', () => {
+  zoneFixture();
+  const id = 'photo-0100-abcd';
+  state.photoSheet = new FakeSheet(PHOTO_FULL_HEADERS, [[
+    new Date('2026-11-26T20:00:00Z'), 'Анна', 'зона не определена', 'Открыть фото', '', new Date(), id,
+    '❓ Зона не определена', '', '', '', 'file0000000000000000009', 'unclear', '', 'зона не определена', 'm', new Date(), 'нет', '1', 'run-9', 'нет', 0.2,
+  ]]);
+  state.driveFiles.set('file0000000000000000009', { bytes: [7, 7, 7], mime: 'image/jpeg' });
+  state.fetchCalls = [];
+  state.fetchHandler = () => geminiOk({
+    verdict: 'warn', confidence: 0.8,
+    items: [{ criterion: 'Пол', level: 'warn', comment: 'коробка в углу' }],
+  });
+  const res = sandbox.photoRecheck_({ id, zone: 'За баром', name: 'Анна', pin: '1234', floor: '1' });
+  assert.equal(res.ok, true, res.error);
+  assert.equal(res.photo.zone, 'За баром');
+  assert.equal(res.photo.zoneAuto, false);
+  assert.equal(res.photo.level, 'warn');
+  assert.equal(state.fetchCalls.length, 1);       // только проверка, без шага зоны
+  const row = 2;
+  assert.equal(state.photoSheet.get(row, 3), "'За баром");
+  assert.equal(state.photoSheet.get(row, 8), '⚠ Замечания');
+  assert.equal(state.photoSheet.get(row, 13), 'warn');
+  assert.equal(state.photoSheet.get(row, 21), 'нет');   // зону выбрал человек
+  assert.equal(state.photoSheet.get(row, 22), '');      // уверенности модели больше нет
+  assert.equal(state.photoSheet.get(row, 20), 'run-9'); // проход сохранён
+});
+
+test('photoRecheck: чужая зона, чужое фото и чужой PIN отклоняются', () => {
+  zoneFixture();
+  const id = 'photo-0101-abcd';
+  state.photoSheet = new FakeSheet(PHOTO_FULL_HEADERS, [[
+    new Date(), 'Анна', 'Бар', 'Открыть фото', '', new Date(), id, '', '', '', '', 'file0000000000000000009', 'ok', 0.9, '', 'm', new Date(), 'нет', '1',
+  ]]);
+  state.driveFiles.set('file0000000000000000009', { bytes: [7], mime: 'image/jpeg' });
+  assert.match(sandbox.photoRecheck_({ id, zone: 'Кухня', name: 'Анна', pin: '1234' }).error, /нет в таблице зон/);
+  assert.match(sandbox.photoRecheck_({ id, zone: 'Бар', name: 'Анна', pin: '0000' }).error, /PIN/);
+  state.staffSheet = new FakeSheet(['Сотрудники', 'PIN', 'Роль', 'Активен'], [
+    ['Анна', '1234', 'бармен', true],
+    ['Пётр', '5678', 'бармен', true],
+  ]);
+  assert.match(sandbox.photoRecheck_({ id, zone: 'Бар', name: 'Пётр', pin: '5678' }).error, /другого сотрудника/);
 });
 
 // ---------- итог ----------

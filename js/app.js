@@ -168,8 +168,9 @@ function screenFeature(screen, args) {
   if (screen === screenItemsForm) return args && args[0] === 'transfer' ? 'transfer' : 'writeoff';
   if (screen === screenActs || screen === screenAct || screen === screenActDone ||
       screen === screenLabel || screen === screenCloseAct) return 'acts';
-  if (screen === screenPhoto || screen === screenPhotoChecking || screen === screenPhotoSent ||
-      screen === screenPhotoVerdict || screen === screenPhotoHistory) return 'photo';
+  if (screen === screenPhoto || screen === screenPhotoShoot || screen === screenPhotoChecking ||
+      screen === screenPhotoSent || screen === screenPhotoRunSummary ||
+      screen === screenPhotoHistory) return 'photo';
   if (screen === screenStopList || screen === screenStopListPhoto ||
       screen === screenStopListResult || screen === screenStopListManual) return 'stoplist';
   if (screen === screenChecklists || screen === screenChecklistRun || screen === screenChecklistDone) return 'checklists';
@@ -387,7 +388,7 @@ function screenHome() {
     : [
       sectionOn('transfer') ? tile('transfer', 'Перенос', 'кухня ⇄ бар', () => go(screenItemsForm, 'transfer')) : null,
       sectionOn('writeoff') ? tile('writeoff', 'Списание', 'бой, порча, проливы', () => go(screenItemsForm, 'writeoff')) : null,
-      sectionOn('photo') ? tile('photo', 'Фото уборки', 'зоны после смены', () => go(screenPhoto)) : null,
+      sectionOn('photo') ? tile('photo', 'Фото уборки', 'этаж и три кадра', () => go(screenPhoto)) : null,
       sectionOn('stoplist') ? tile('stoplist', 'Стоп-лист', 'что закончилось', () => go(screenStopList)) : null,
       sectionOn('checklists') ? tile('checklist', 'Чек-листы', 'смены и заготовки', () => go(screenChecklists)) : null,
       sectionOn('ttk') ? tile('ttk', 'ТТК', 'рецептуры', () => go(screenTtkList)) : null,
@@ -958,9 +959,27 @@ function openItemPicker(onPick) {
   setTimeout(() => search.focus(), 50);
 }
 
+
 // =====================================================================
-//  ЭКРАН: ФОТО УБОРКИ — этаж → зоны этажа → камера
+//  ЭКРАН: ФОТО УБОРКИ — этаж → съёмка до трёх кадров → одна отправка
 // =====================================================================
+//  Поток по просьбе владельца: «просто 1 этаж, три фото, а нейронка сама
+//  разделит их по категориям и проверит». Поэтому выбора зоны в основном
+//  пути больше нет:
+//    1. бармен выбирает ЭТАЖ;
+//    2. снимает до трёх кадров (счётчик «1 из 3», переснять можно любой);
+//    3. жмёт «Отправить» один раз — все кадры уходят в очередь пачкой с
+//       общим id прохода (runId), чтобы в истории это была одна смена;
+//    4. сервер сам определяет зону каждого кадра из списка зон ЭТОГО этажа
+//       и проверяет по критериям найденной зоны;
+//    5. если зона не определена (уверенность ниже 0.6) — вердикт не
+//       выдумывается: бармен выбирает зону вручную на экране результата,
+//       и снимок перепроверяется по критериям выбранной зоны.
+//  Стоп-лист остаётся отдельным режимом: он по-прежнему снимается вручную
+//  и не идёт в проверку чистоты.
+const PHOTO_RUN_MAX = 3;                 // кадров за один проход
+const PHOTO_ZONE_UNKNOWN = 'зона не определена';
+
 //  Сервер отдаёт config.photoZones: [{zone, floor}] и config.photoRefs:
 //  [{zone, floor, active, total}]. Список зон фиксированный и все зоны
 //  размечены по этажам, поэтому группы «Без этажа» на экране нет.
@@ -1004,165 +1023,78 @@ function zonesWord(n) {
 }
 
 function screenPhoto(initialArg) {
-  // Можно войти строкой (зона для «переснять») или объектом {stop, floor}.
+  // Можно войти объектом {stop, floor} — так приходит стоп-лист с этажа.
   const opts = (initialArg && typeof initialArg === 'object') ? initialArg : {};
-  const stopMode = opts.stop === true || String(initialArg || '') === STOP_ZONE_NAME;
   const form = {
-    mode: stopMode ? 'stop' : 'zone',
-    floor: null, floorPicked: false,
+    mode: opts.stop === true ? 'stop' : 'zone',
     stopFloor: String(opts.floor || '1'),
-    zone: stopMode ? STOP_ZONE_NAME : (typeof initialArg === 'string' ? initialArg : ''),
-    comment: '', photos: [],
+    comment: '',
+    photos: [],
   };
   if (STOP_FLOORS_UI.indexOf(form.stopFloor) < 0) form.stopFloor = '1';
   const all = photoZoneGroups();
 
-  // «Переснять» приносит уже выбранную зону: находим её этаж и сразу
-  // показываем форму. Если зоны нет в списке — относим её к 1 этажу.
-  if (form.zone && form.mode === 'zone') {
-    const found = [...all.groups.entries()].find(([, zs]) => zs.includes(form.zone));
-    form.floor = found ? found[0] : '1';
-    form.floorPicked = true;
-    if (!found) {
-      if (!all.groups.has('1')) { all.groups.set('1', []); all.floors.push('1'); }
-      all.groups.get('1').push(form.zone);
-    }
-  }
-
   const root = h('main', { class: 'screen' }, header('Фото уборки'));
-  const floorBox = h('div', { class: 'photo-floors' });
-  const zoneBox = h('div', { class: 'chips' });
-  const zoneCaption = h('p', { class: 'photo-zone-picked' });
-  const zoneStep = h('section', { class: 'photo-step', hidden: true },
-    h('p', { class: 'label' }, 'Зона этого этажа'), zoneBox);
 
   // Переключатель «фото зоны / стоп-лист». Стоп-лист — отдельный режим:
-  // зона и проверка чистоты ему не нужны, но этаж обязателен: стоп-лист
-  // свой на каждом этаже, и дни считаются в разрезе этаж + позиция.
+  // зона и проверка чистоты ему не нужны, но этаж обязателен.
   const modeZoneBtn = h('button', { class: 'chip', type: 'button', 'aria-pressed': 'false', onclick: () => setMode('zone') }, '📷 Фото зоны');
   const modeStopBtn = h('button', { class: 'chip', type: 'button', 'aria-pressed': 'false', onclick: () => setMode('stop') }, '📋 Стоп-лист');
   const modeBox = h('div', { class: 'chips photo-mode' }, modeZoneBtn, modeStopBtn);
-  const stopHint = h('section', { class: 'photo-step photo-stop-hint', hidden: true },
-    h('p', { class: 'label' }, 'Стоп-лист'),
-    h('p', { class: 'muted' }, 'Сфотографируйте экран планшета с двумя колонками — «Блюда на остатке» и «СТОП-ЛИСТ». В стоп пойдёт объединение: позиции из правой колонки и всё, где слева остаток 0. Кухня и служебные строки отсекаются по листу «Кухня».'));
+
+  // Этаж — единственный выбор основного пути.
+  const floorBox = h('div', { class: 'photo-floors' });
+  const floorsStep = h('section', { class: 'photo-step' },
+    h('p', { class: 'label' }, 'Этаж'),
+    h('p', { class: 'muted photo-floor-hint' }, 'Выберите этаж — снимете до трёх кадров. Зоны ИИ определит сам.'),
+    floorBox);
 
   const stopFloorBox = h('div', { class: 'chips stop-floor-chips' });
   const stopFloorStep = h('section', { class: 'photo-step', hidden: true },
     h('p', { class: 'label' }, 'Этаж стоп-листа'),
     h('p', { class: 'muted photo-floor-hint' }, 'Стоп-лист свой на каждом этаже — выберите этаж до снимка.'),
     stopFloorBox);
-
-  function drawStopFloors() {
-    stopFloorBox.replaceChildren(...STOP_FLOORS_UI.map(f => {
-      const on = f === form.stopFloor;
-      return h('button', {
-        class: 'chip' + (on ? ' on' : ''), type: 'button', 'aria-pressed': on ? 'true' : 'false',
-        onclick: () => { form.stopFloor = f; drawStopFloors(); drawMode(); },
-      }, stopFloorText(f));
-    }));
-  }
-
-  const floorsStep = h('section', { class: 'photo-step' },
-    h('p', { class: 'label' }, 'Этаж'),
-    h('p', { class: 'muted photo-floor-hint' }, 'Сначала этаж, потом зона этого этажа.'),
-    floorBox);
+  const stopHint = h('section', { class: 'photo-step photo-stop-hint', hidden: true },
+    h('p', { class: 'label' }, 'Стоп-лист'),
+    h('p', { class: 'muted' }, 'Сфотографируйте экран планшета с двумя колонками — «Блюда на остатке» и «СТОП-ЛИСТ». В стоп пойдёт объединение: позиции из правой колонки и всё, где слева остаток 0. Кухня и служебные строки отсекаются по листу «Кухня».'));
 
   function drawFloors() {
     floorBox.replaceChildren(...all.floors.map(f => {
       const count = (all.groups.get(f) || []).length;
-      const on = form.floorPicked && f === form.floor;
       return h('button', {
-        class: 'floor-btn' + (on ? ' on' : ''),
+        class: 'floor-btn',
         type: 'button',
-        'aria-pressed': on ? 'true' : 'false',
-        onclick: () => {
-          form.floor = f;
-          form.floorPicked = true;
-          form.zone = '';
-          drawFloors();
-          drawZones();
-          drawMode();
-        },
+        onclick: () => { if (form.mode === 'zone') go(screenPhotoShoot, f); },
       },
         h('span', { class: 'floor-name' }, floorLabel(f)),
         h('span', { class: 'floor-sub' }, `${count} ${zonesWord(count)}`));
     }));
   }
 
-  function drawZones() {
-    const list = form.floorPicked ? (all.groups.get(form.floor) || []) : [];
-    zoneBox.replaceChildren(...list.map(z => {
-      const on = z === form.zone;
+  function drawStopFloors() {
+    stopFloorBox.replaceChildren(...STOP_FLOORS_UI.map(f => {
+      const on = f === form.stopFloor;
       return h('button', {
-        class: 'chip' + (on ? ' on' : ''),
-        type: 'button',
-        'aria-pressed': on ? 'true' : 'false',
-        onclick: () => chooseZone(z),
-      }, z);
+        class: 'chip' + (on ? ' on' : ''), type: 'button', 'aria-pressed': on ? 'true' : 'false',
+        onclick: () => { form.stopFloor = f; drawStopFloors(); },
+      }, stopFloorText(f));
     }));
-    zoneStep.hidden = form.mode === 'stop' || !form.floorPicked;
   }
 
-  function chooseZone(z) {
-    form.zone = z;
-    drawZones();
-    drawMode();
-    setTimeout(() => { if (document.body.contains(formStep)) formStep.scrollIntoView({ block: 'nearest' }); }, 30);
-  }
-
-  function drawMode() {
-    const stop = form.mode === 'stop';
-    modeZoneBtn.classList.toggle('on', !stop);
-    modeStopBtn.classList.toggle('on', stop);
-    modeZoneBtn.setAttribute('aria-pressed', stop ? 'false' : 'true');
-    modeStopBtn.setAttribute('aria-pressed', stop ? 'true' : 'false');
-    floorsStep.hidden = stop;
-    stopFloorStep.hidden = !stop;
-    stopHint.hidden = !stop;
-    zoneStep.hidden = stop || !form.floorPicked;
-    if (stop) {
-      zoneCaption.replaceChildren('Зона: ', h('b', {}, STOP_ZONE_NAME + ' · ' + stopFloorText(form.stopFloor)));
-      formStep.hidden = false;
-    } else {
-      zoneCaption.replaceChildren(...(form.zone ? ['Зона: ', h('b', {}, form.zone)] : ['Зона не выбрана']));
-      formStep.hidden = !form.zone;
-    }
-  }
-
-  function setMode(m) {
-    if (form.mode === m) return;
-    form.mode = m;
-    if (m === 'stop') {
-      form.zone = STOP_ZONE_NAME;
-    } else if (form.zone === STOP_ZONE_NAME) {
-      form.zone = '';
-      form.floorPicked = false;
-      form.floor = null;
-      drawFloors();
-      drawZones();
-    }
-    drawMode();
-  }
-
+  // Фото стоп-листа — как раньше: камера/галерея, превью, комментарий.
   const previews = h('div', { class: 'previews' });
   function drawPreviews() {
     previews.replaceChildren(...form.photos.map((src, i) =>
       h('div', { class: 'preview' }, h('img', { src, alt: '' }),
         h('button', { class: 'x', onclick: () => { form.photos.splice(i, 1); drawPreviews(); } }, '✕'))));
   }
-
-  // Два поля выбора файла: с камерой и из галереи
   const camInput = h('input', { type: 'file', accept: 'image/*', capture: 'environment', hidden: true });
   const galInput = h('input', { type: 'file', accept: 'image/*', multiple: true, hidden: true });
   async function onFiles(e) {
     const files = [...e.target.files];
     e.target.value = '';
     for (const f of files) {
-      try {
-        form.photos.push(await compressImage(f));
-      } catch (err) {
-        toast('Не удалось обработать фото', 'bad');
-      }
+      try { form.photos.push(await compressImage(f)); } catch (err) { toast('Не удалось обработать фото', 'bad'); }
     }
     drawPreviews();
   }
@@ -1172,80 +1104,199 @@ function screenPhoto(initialArg) {
   const comment = h('textarea', { rows: '2', placeholder: 'Комментарий (необязательно)', oninput: e => { form.comment = e.target.value; } });
   const saveBtn = h('button', { class: 'primary' }, 'Сохранить');
   saveBtn.addEventListener('click', async () => {
-    const stop = form.mode === 'stop';
-    if (!stop && !form.zone) return toast('Выберите зону', 'bad');
-    if (form.photos.length === 0) return toast(stop ? 'Добавьте фото стоп-листа' : 'Добавьте фото', 'bad');
+    if (form.photos.length === 0) return toast('Добавьте фото стоп-листа', 'bad');
     saveBtn.disabled = true;
     const records = [];
     try {
       for (const image of form.photos) {
-        const rec = {
+        records.push(await enqueue({
           type: 'photo', name: session.name, pin: session.pin,
-          zone: stop ? STOP_ZONE_NAME : form.zone, image, comment: form.comment.trim(),
-        };
-        if (stop) {
-          rec.stopList = true;          // сервер: не проверять чистоту, распознать обе колонки
-          rec.floor = form.stopFloor;   // стоп-лист свой на каждом этаже
-        }
-        records.push(await enqueue(rec));
+          zone: STOP_ZONE_NAME, image, comment: form.comment.trim(),
+          stopList: true, floor: form.stopFloor,
+        }));
       }
     } catch (e) {
       saveBtn.disabled = false;
       return toast('Не удалось сохранить фото', 'bad');
     }
-    if (stop) {
-      // Стоп-лист: показываем, что распозналось, и текущий список.
-      if (!navigator.onLine) {
-        toast('Снимок сохранён — распознаем, когда появится связь');
-        resetTo(screenStopList);
-        return;
-      }
-      resetTo(screenStopListPhoto, records);
+    if (!navigator.onLine) {
+      toast('Снимок сохранён — распознаем, когда появится связь');
+      resetTo(screenStopList);
       return;
     }
-    if (!navigator.onLine) { resetTo(screenPhotoSent, records, form.zone); return; }
-    resetTo(screenPhotoChecking, records, form.zone);
+    resetTo(screenStopListPhoto, records);
   });
 
-  const formStep = h('section', { class: 'photo-step photo-form', hidden: true },
-    h('p', { class: 'label' }, 'Фото'),
-    zoneCaption,
+  const stopForm = h('section', { class: 'photo-step photo-form', hidden: true },
+    h('p', { class: 'label' }, 'Фото стоп-листа'),
     h('div', { class: 'two' },
       h('button', { class: 'secondary', onclick: () => camInput.click() }, '📷 Камера'),
       h('button', { class: 'secondary', onclick: () => galInput.click() }, '🖼 Галерея')),
     camInput, galInput, previews, comment, saveBtn);
 
+  function setMode(m) {
+    if (form.mode === m) return;
+    form.mode = m;
+    drawMode();
+  }
+  function drawMode() {
+    const stop = form.mode === 'stop';
+    modeZoneBtn.classList.toggle('on', !stop);
+    modeStopBtn.classList.toggle('on', stop);
+    modeZoneBtn.setAttribute('aria-pressed', stop ? 'false' : 'true');
+    modeStopBtn.setAttribute('aria-pressed', stop ? 'true' : 'false');
+    floorsStep.hidden = stop;
+    stopFloorStep.hidden = !stop;
+    stopHint.hidden = !stop;
+    stopForm.hidden = !stop;
+  }
+
   root.append(
     h('section', { class: 'photo-step' },
       h('p', { class: 'label' }, 'Что фотографируем'),
       modeBox),
-    floorsStep, stopFloorStep, stopHint, zoneStep, formStep,
+    floorsStep, stopFloorStep, stopHint, stopForm,
     h('button', { class: 'link photo-history-link', onclick: () => go(screenPhotoHistory) }, 'История снимков'),
   );
-
   drawFloors();
   drawStopFloors();
-  if (form.floorPicked && form.mode !== 'stop') {
-    drawZones();
-    if (form.zone) chooseZone(form.zone);
-  }
-  drawMode();
   drawPreviews();
+  drawMode();
+  return root;
+}
+
+/**
+ * Съёмка прохода: до трёх кадров и ОДНА отправка.
+ * opts.zone — режим «переснять конкретный кадр» (зону уже знаем, кадр один).
+ */
+function screenPhotoShoot(floor, opts = {}) {
+  const form = {
+    floor: String(floor || '1'),
+    zone: String(opts.zone || ''),
+    photos: [],
+    retake: -1,
+    comment: '',
+    sending: false,
+  };
+  const max = form.zone ? 1 : PHOTO_RUN_MAX;
+  const root = h('main', { class: 'screen' }, header(form.zone ? 'Переснять кадр' : 'Фото уборки'));
+  const counter = h('p', { class: 'photo-shot-counter' });
+  const hint = h('p', { class: 'muted photo-shot-hint' });
+  const slots = h('div', { class: 'photo-shot-grid' });
+  const sendBtn = h('button', { class: 'primary photo-shot-send' }, 'Отправить');
+  const retakeBtn = h('button', { class: 'secondary photo-shot-retake' }, 'Переснять');
+  const shutter = h('button', { class: 'photo-shutter', type: 'button', onclick: () => openCamera(-1) },
+    h('span', { class: 'photo-shutter-ico', 'aria-hidden': 'true' }, '📷'),
+    h('span', { class: 'photo-shutter-label' }, 'Снять'));
+
+  const camInput = h('input', { type: 'file', accept: 'image/*', capture: 'environment', hidden: true });
+  const galInput = h('input', { type: 'file', accept: 'image/*', multiple: true, hidden: true });
+
+  /** Открыть камеру: index ≥ 0 — переснять этот кадр, -1 — добавить новый. */
+  function openCamera(index) {
+    form.retake = index;
+    camInput.click();
+  }
+
+  async function addFiles(files) {
+    for (const f of files) {
+      let image;
+      try { image = await compressImage(f); } catch (e) { toast('Не удалось обработать фото', 'bad'); continue; }
+      if (form.retake >= 0 && form.retake < form.photos.length) {
+        form.photos[form.retake] = image;
+        form.retake = -1;
+      } else if (form.photos.length < max) {
+        form.photos.push(image);
+      }
+    }
+    form.retake = -1;
+    draw();
+  }
+  camInput.addEventListener('change', e => { const files = [...e.target.files]; e.target.value = ''; addFiles(files); });
+  galInput.addEventListener('change', e => { const files = [...e.target.files]; e.target.value = ''; addFiles(files); });
+
+  function draw() {
+    const n = form.photos.length;
+    counter.textContent = n + ' из ' + max;
+    hint.textContent = form.zone
+      ? 'Проверим по этой же зоне: ' + form.zone
+      : (n >= max ? 'Все кадры сняты — отправляйте.' : 'Зоны определит ИИ — выбирать вручную не нужно.');
+    slots.replaceChildren(...form.photos.map((src, i) =>
+      h('div', { class: 'photo-shot-slot' },
+        h('img', { src, alt: 'Кадр ' + (i + 1) }),
+        h('span', { class: 'photo-shot-no' }, String(i + 1)),
+        h('div', { class: 'photo-shot-tools' },
+          h('button', { class: 'photo-shot-tool', type: 'button', 'aria-label': 'Переснять кадр ' + (i + 1), onclick: () => openCamera(i) }, '↻'),
+          h('button', { class: 'photo-shot-tool', type: 'button', 'aria-label': 'Убрать кадр ' + (i + 1), onclick: () => { form.photos.splice(i, 1); draw(); } }, '✕')))));
+    shutter.hidden = n >= max;
+    retakeBtn.disabled = n === 0;
+    sendBtn.disabled = n === 0 || form.sending;
+    sendBtn.textContent = form.sending ? 'Отправляем…' : 'Отправить';
+  }
+
+  retakeBtn.addEventListener('click', () => { if (form.photos.length) openCamera(form.photos.length - 1); });
+
+  sendBtn.addEventListener('click', async () => {
+    if (!form.photos.length || form.sending) return;
+    form.sending = true;
+    draw();
+    const runId = newId();
+    const records = [];
+    try {
+      for (const image of form.photos) {
+        const rec = {
+          type: 'photo', name: session.name, pin: session.pin,
+          runId, floor: form.floor, image, comment: form.comment.trim(),
+        };
+        if (form.zone) rec.zone = form.zone; else rec.autoZone = true;
+        records.push(await enqueue(rec));
+      }
+    } catch (e) {
+      form.sending = false;
+      draw();
+      return toast('Не удалось сохранить фото', 'bad');
+    }
+    const meta = { floor: form.floor, runId, zone: form.zone || '' };
+    if (!navigator.onLine) { resetTo(screenPhotoSent, records, meta, { offline: true }); return; }
+    resetTo(screenPhotoChecking, records, meta);
+  });
+
+  const comment = h('textarea', { rows: '2', placeholder: 'Комментарий ко всем кадрам (необязательно)', oninput: e => { form.comment = e.target.value; } });
+
+  root.append(
+    h('section', { class: 'photo-shot-top' },
+      h('p', { class: 'label' }, form.zone ? 'Зона: ' + form.zone : floorLabel(form.floor)),
+      counter,
+      hint),
+    shutter,
+    h('div', { class: 'photo-shot-actions' },
+      retakeBtn,
+      h('button', { class: 'secondary', type: 'button', onclick: () => galInput.click() }, '🖼 Из галереи')),
+    slots,
+    camInput, galInput,
+    comment,
+    sendBtn,
+  );
+  draw();
   return root;
 }
 
 // ---------------------------------------------------------------------
-//  Проверка фото: «Проверяем…» → карточка вердикта / «проверим позже».
+//  Проверка прохода: «Проверяем…» → сводка по трём кадрам.
 //  Вердикт приходит с сервера в ответе submit (sync кладёт его в sent)
 //  или отдельным GET photoVerdict по ID записи.
 // ---------------------------------------------------------------------
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 /** Ждём вердикты по своим записям, но не дольше timeoutMs. */
-async function waitPhotoVerdicts_(records, timeoutMs) {
+async function waitPhotoVerdicts_(records, timeoutMs, onProgress) {
   const byId = new Map();
   const nextTry = new Map();
   const started = Date.now();
+  const report = () => {
+    if (typeof onProgress !== 'function') return;
+    try { onProgress(byId.size); } catch (e) { /* прогресс не должен мешать */ }
+  };
   while (Date.now() - started < timeoutMs && byId.size < records.length) {
     for (const rec of records) {
       if (byId.has(rec.id)) continue;
@@ -1271,122 +1322,245 @@ async function waitPhotoVerdicts_(records, timeoutMs) {
       }
       if (v) {
         v.id = rec.id;
-        if (!v.zone) v.zone = rec.zone;
+        if (!v.zone && rec.zone) v.zone = rec.zone;
+        if (!v.floor && rec.floor) v.floor = rec.floor;
+        if (!v.runId && rec.runId) v.runId = rec.runId;
         byId.set(rec.id, v);
       }
     }
+    report();
     if (byId.size >= records.length) break;
     if (!navigator.onLine) break;
-    await sleep(500);
+    await sleep(400);
   }
+  report();
   return records.map(r => byId.get(r.id)).filter(Boolean);
 }
 
-function screenPhotoChecking(records, zone) {
+function screenPhotoChecking(records, meta) {
+  const progress = h('p', { class: 'muted' }, 'Проверяем зоны и чистоту…');
   const root = h('main', { class: 'screen' }, header('Фото уборки', { showBack: false }),
     h('div', { class: 'photo-checking' },
       h('div', { class: 'photo-spinner', 'aria-hidden': 'true' }),
       h('p', { class: 'photo-checking-title' }, 'Проверяем…'),
-      h('p', { class: 'muted' }, 'Обычно занимает 1–3 секунды'),
-    ));
+      progress));
   (async () => {
+    const total = records.length;
     const started = Date.now();
-    const verdicts = await waitPhotoVerdicts_(records, 18000);
+    // Три кадра проверяются по очереди: на кадр уходит ~10–20 с (зона + проверка),
+    // поэтому ждём до двух минут и показываем, сколько уже проверено.
+    const verdicts = await waitPhotoVerdicts_(records, 120000, n => {
+      if (n > 0 && n < total) progress.textContent = 'Проверено ' + n + ' из ' + total + '…';
+    });
     const elapsed = Date.now() - started;
     if (elapsed < 900) await sleep(900 - elapsed);
     if (!document.body.contains(root)) return;
-    if (!verdicts.length) { resetTo(screenPhotoSent, records, zone, { slow: true }); return; }
-    resetTo(screenPhotoVerdict, verdicts, { zone, records });
+    if (!verdicts.length) { resetTo(screenPhotoSent, records, meta, { slow: true }); return; }
+    resetTo(screenPhotoRunSummary, records, verdicts, meta);
   })();
   return root;
 }
 
-/** «Снимок отправлен»: нет сети или проверка не успела за отведённое время. */
-function screenPhotoSent(records, zone, opts = {}) {
+/** «Кадры сохранены»: нет сети или проверка не успела за отведённое время. */
+function screenPhotoSent(records, meta, opts = {}) {
+  meta = meta || {};
   const slow = !!opts.slow;
+  const offline = !!opts.offline || !navigator.onLine;
+  const title = slow ? 'Проверка идёт дольше обычного' : (offline ? 'Кадры сохранены' : 'Кадры отправлены');
+  const lead = slow
+    ? 'Кадры сохранены. Вердикты появятся в истории, как только будут готовы.'
+    : (offline
+      ? 'Проверим, когда появится связь. Вердикты появятся в истории — все кадры прохода уйдут вместе.'
+      : 'Проверка займёт ещё немного времени. Вердикты появятся в истории.');
   return h('main', { class: 'screen' }, header('Фото уборки', { showBack: false }),
     h('section', { class: 'photo-verdict unclear' },
       h('h2', { class: 'photo-verdict-head' },
-        h('span', { class: 'photo-verdict-icon', 'aria-hidden': 'true' }, '📶'),
-        slow ? 'Проверка идёт дольше обычного' : 'Снимок отправлен'),
-      h('p', { class: 'photo-verdict-lead' }, slow
-        ? 'Снимок сохранён. Вердикт появится в истории, как только будет готов.'
-        : 'Проверим, когда появится связь. Вердикт появится в истории.'),
-      h('p', { class: 'photo-verdict-meta' }, `${zone} · фото: ${records.length}`),
+        h('span', { class: 'photo-verdict-icon', 'aria-hidden': 'true' }, '📶'), title),
+      h('p', { class: 'photo-verdict-lead' }, lead),
+      h('p', { class: 'photo-verdict-meta' }, `${floorLabel(meta.floor || '1')} · кадров: ${records.length}`),
     ),
     h('div', { class: 'photo-verdict-actions' },
       h('button', { class: 'primary', onclick: () => go(screenPhotoHistory) }, 'История снимков'),
       h('button', { class: 'link photo-close-anyway', onclick: () => resetTo(screenHome) }, 'На главную'),
-    ),
-  );
+    ));
 }
 
-/** Карточка вердикта: ok — спокойно, warn — замечания, crit — настойчиво. */
-function screenPhotoVerdict(verdicts, meta) {
-  const order = { crit: 3, warn: 2, unclear: 1, ok: 0 };
-  const worst = verdicts.reduce((a, b) => ((order[b.level] || 0) > (order[a.level] || 0) ? b : a), verdicts[0]);
-  const level = worst ? worst.level : 'unclear';
-  const items = [];
-  verdicts.forEach(v => {
-    if ((v.items || []).length) {
-      v.items.forEach(it => {
-        if (it.level === 'crit' || it.level === 'warn') items.push({ level: it.level, text: it.comment || it.criterion });
-      });
-    } else if (v.notes) {
-      v.notes.split(/;\s*/).forEach(t => {
-        const m = /^(crit|warn):\s*(.+)$/i.exec(t);
-        if (m) items.push({ level: m[1].toLowerCase(), text: m[2] });
-      });
+// ---------------------------------------------------------------------
+//  СВОДКА ПРОХОДА: три строки (кадр, зона, вердикт) и общий итог.
+//  Зону можно изменить вручную — снимок перепроверится вторым запросом.
+// ---------------------------------------------------------------------
+const PHOTO_LEVEL_WORD = {
+  ok: 'чисто', warn: 'замечания', crit: 'критично',
+  unclear: 'не проверено', unchecked: 'не проверено', pending: 'проверяется', stoplist: 'стоп-лист',
+};
+const PHOTO_LEVEL_SIGN = { ok: '✓', warn: '⚠', crit: '⛔', unclear: '?', unchecked: '?', pending: '…', stoplist: '📋' };
+const PHOTO_HIST_BADGE = {
+  ok: 'чисто', warn: 'замечания', crit: 'критично', unclear: 'не проверено',
+  unchecked: 'не проверено', pending: 'ждёт отправки', stoplist: 'стоп-лист', '': 'без вердикта',
+};
+
+/** «1 замечание», «2 замечания», «5 замечаний». */
+function remarksWord(n) {
+  const d = n % 10, dd = n % 100;
+  if (d === 1 && dd !== 11) return 'замечание';
+  if (d >= 2 && d <= 4 && (dd < 12 || dd > 14)) return 'замечания';
+  return 'замечаний';
+}
+
+function screenPhotoRunSummary(records, verdicts, meta) {
+  meta = meta || {};
+  const byId = new Map((verdicts || []).map(v => [v.id, v]));
+  const items = records.map(rec => ({ rec, v: byId.get(rec.id) || null, picker: false, busy: false }));
+  const floorZones = photoZoneGroups().groups.get(String(meta.floor)) || [];
+  const root = h('main', { class: 'screen' }, header('Результат проверки', { showBack: false }));
+  const list = h('div', { class: 'photo-run-list' });
+  const totalBox = h('section', { class: 'photo-run-total' });
+  const noteBox = h('div', { class: 'photo-run-notes' });
+
+  const levelOf = it => (it.v ? (it.v.zone === PHOTO_ZONE_UNKNOWN ? 'unclear' : (it.v.level || 'unclear')) : 'pending');
+  const hasZone = it => !!(it.v && it.v.zone && it.v.zone !== PHOTO_ZONE_UNKNOWN);
+  // Для строки «зона не определена» бейдж говорит именно это, а не «не проверено».
+  const levelWord = it => (it.v && !hasZone(it) ? 'зона не определена' : (PHOTO_LEVEL_WORD[levelOf(it)] || levelOf(it)));
+
+  async function changeZone(it, zone) {
+    if (it.busy) return;
+    if (!navigator.onLine) return toast('Нужна связь, чтобы перепроверить снимок', 'bad');
+    it.busy = true;
+    it.picker = false;
+    draw();
+    try {
+      const res = await apiPost({
+        action: 'photoRecheck', id: it.rec.id, zone: zone,
+        name: session.name, pin: session.pin, floor: meta.floor, runId: it.rec.runId || meta.runId || '',
+      }, 90000);
+      if (!res || !res.ok || !res.photo) throw new Error((res && res.error) || 'пустой ответ сервера');
+      const v = res.photo;
+      v.id = it.rec.id;
+      if (!v.runId) v.runId = it.rec.runId || meta.runId || '';
+      if (!v.floor) v.floor = meta.floor || '';
+      it.v = v;
+      // Обновляем и локальную копию вердикта, чтобы история видела новую зону.
+      try {
+        const sent = await db.get('sent', it.rec.id);
+        if (sent) await db.put('sent', { ...sent, zone: v.zone || zone, server: v });
+      } catch (e) { /* история обновится со следующего чтения */ }
+      toast('Зона изменена — снимок перепроверен');
+    } catch (e) {
+      toast('Не удалось перепроверить: ' + e.message, 'bad');
+    } finally {
+      it.busy = false;
+      draw();
     }
-  });
-  const seen = new Set();
-  const unique = items.filter(it => {
-    const key = it.level + '|' + it.text;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  }).slice(0, 12);
+  }
 
-  const titles = {
-    ok: ['✓', 'Всё чисто', 'Зона выглядит убранной — ничего делать не нужно.'],
-    warn: ['⚠', 'Есть замечания', 'Проверьте список и поправьте, если нужно.'],
-    crit: ['⛔', 'Критично', 'Это стоит исправить сейчас: грязь или беспорядок в зоне.'],
-    unclear: ['?', 'Не удалось проверить', 'Зону не видно целиком или проверка не удалась. Переснимите при свете.'],
-  };
-  const [ico, title, lead] = titles[level] || titles.unclear;
-  const errorText = verdicts.map(v => v.error).filter(Boolean)[0] || '';
-  const pendingCount = Math.max(0, meta.records.length - verdicts.length);
+  function retake(it) {
+    const zone = hasZone(it) ? it.v.zone : '';
+    go(screenPhotoShoot, meta.floor, zone ? { zone: zone } : {});
+  }
 
-  return h('main', { class: 'screen' }, header('Результат проверки', { showBack: false }),
-    h('section', { class: 'photo-verdict ' + level },
-      h('h2', { class: 'photo-verdict-head' },
-        h('span', { class: 'photo-verdict-icon', 'aria-hidden': 'true' }, ico), title),
-      h('p', { class: 'photo-verdict-lead' }, errorText && level === 'unclear'
-        ? 'Проверка не удалась: ' + errorText : lead),
-      unique.length ? h('ul', { class: 'photo-verdict-list' }, unique.map(it =>
-        h('li', {},
-          h('span', { class: 'level ' + it.level }, it.level === 'crit' ? 'критично' : 'замечание'),
-          h('span', {}, it.text)))) : null,
-      pendingCount ? h('p', { class: 'photo-verdict-meta' },
-        `Ещё ${pendingCount} ${pendingCount === 1 ? 'снимок проверяется' : 'снимка проверяются'} — результат появится в истории.`) : null,
-      h('p', { class: 'photo-verdict-meta' }, `${meta.zone || 'Зона'} · фото: ${meta.records.length}`),
-    ),
+  function zonePicker(it) {
+    return h('div', { class: 'photo-run-picker' },
+      h('p', { class: 'label' }, 'Зона этого этажа'),
+      floorZones.length
+        ? h('div', { class: 'chips' }, floorZones.map(z =>
+            h('button', {
+              class: 'chip' + (hasZone(it) && it.v.zone === z ? ' on' : ''),
+              type: 'button', disabled: it.busy,
+              onclick: () => changeZone(it, z),
+            }, z)))
+        : h('p', { class: 'muted' }, 'На этом этаже нет зон в таблице — проверьте «Эталоны уборки».'),
+      h('button', { class: 'link', type: 'button', onclick: () => { it.picker = false; draw(); } }, 'Отмена'));
+  }
+
+  function rowEl(it, index) {
+    const level = levelOf(it);
+    const cls = level === 'unchecked' ? 'unclear' : level;
+    const zoneName = hasZone(it) ? it.v.zone : (it.v ? 'не определена' : '—');
+    const notes = it.v && it.v.notes ? String(it.v.notes) : '';
+    return h('article', { class: 'photo-run-row ' + cls },
+      h('div', { class: 'photo-run-thumb' },
+        h('img', { src: it.rec.image, alt: 'Кадр ' + (index + 1) }),
+        h('span', { class: 'photo-run-thumb-no' }, String(index + 1))),
+      h('div', { class: 'photo-run-body' },
+        h('div', { class: 'photo-run-zone' },
+          h('span', { class: 'photo-run-zone-label' }, 'Зона: '),
+          h('b', {}, zoneName),
+          it.busy
+            ? h('span', { class: 'muted' }, ' · перепроверяем…')
+            : [
+                h('span', { class: 'photo-run-zone-sep' }, ' · '),
+                h('button', {
+                  class: 'link photo-zone-change', type: 'button',
+                  onclick: () => { it.picker = !it.picker; draw(); },
+                }, hasZone(it) ? 'изменить' : 'выбрать зону'),
+              ]),
+        hasZone(it) && it.v.zoneAuto === false
+          ? h('p', { class: 'photo-run-auto' }, 'зону выбрали вручную') : null,
+        h('div', { class: 'photo-run-verdict' },
+          h('span', { class: 'photo-run-badge ' + cls },
+            h('span', { 'aria-hidden': 'true' }, PHOTO_LEVEL_SIGN[level] || '?'),
+            ' ' + levelWord(it)),
+          it.v && it.v.zoneConfidence !== null && it.v.zoneConfidence !== undefined && hasZone(it) && it.v.zoneAuto
+            ? h('span', { class: 'muted photo-run-conf' }, '· уверенность зоны ' + Math.round(Number(it.v.zoneConfidence) * 100) + '%')
+            : null),
+        notes && (level === 'crit' || level === 'warn')
+          ? h('p', { class: 'photo-run-notes-row' }, notes) : null,
+        !hasZone(it) && it.v
+          ? h('p', { class: 'photo-run-notes-row' }, 'Зона не определена — выберите её, и снимок перепроверится по критериям этой зоны.')
+          : null,
+        level === 'crit'
+          ? h('button', { class: 'secondary photo-run-retake', type: 'button', onclick: () => retake(it) }, 'Переснять этот кадр')
+          : null,
+        it.picker ? zonePicker(it) : null));
+  }
+
+  function draw() {
+    list.replaceChildren(...items.map(rowEl));
+    const crit = items.filter(it => levelOf(it) === 'crit').length;
+    const warn = items.filter(it => levelOf(it) === 'warn').length;
+    const pending = items.filter(it => !it.v).length;
+    const unknown = items.filter(it => it.v && !hasZone(it)).length;
+
+    totalBox.className = 'photo-run-total ' + (crit ? 'crit' : warn ? 'warn' : 'ok');
+    let totalText;
+    if (pending) {
+      totalText = 'Проверяем ещё ' + pending + ' ' + (pending === 1 ? 'кадр' : 'кадра') + ' — итог появится в истории.';
+    } else if (crit || warn) {
+      totalText = [crit ? 'Критично: ' + crit : '', warn ? 'замечания: ' + warn : ''].filter(Boolean).join(', ');
+    } else if (unknown) {
+      totalText = 'Зона не определена — выберите её вручную.';
+    } else {
+      totalText = 'Замечаний нет';
+    }
+    totalBox.replaceChildren(
+      h('p', { class: 'photo-run-total-title' }, totalText),
+      h('p', { class: 'photo-run-total-meta' },
+        floorLabel(meta.floor || '1') + ' · кадров: ' + records.length +
+        (items.filter(it => it.v && it.v.zoneAuto).length ? ' · зоны определил ИИ' : '')));
+
+    // Две фотографии одной зоны: обе сохраняются, но бармен должен знать.
+    const counts = new Map();
+    items.forEach(it => {
+      if (!hasZone(it)) return;
+      counts.set(it.v.zone, (counts.get(it.v.zone) || 0) + 1);
+    });
+    const dup = [...counts.entries()].filter(([, n]) => n > 1);
+    noteBox.replaceChildren(...dup.map(([zone, n]) =>
+      h('p', { class: 'photo-run-note' },
+        (n === 2 ? 'две фотографии одной зоны' : n + ' фотографии одной зоны') + ': ' + zone)));
+  }
+
+  draw();
+  root.append(
+    h('section', { class: 'photo-step' }, totalBox, noteBox),
+    list,
     h('div', { class: 'photo-verdict-actions' },
-      level === 'crit' || level === 'unclear'
-        ? h('button', { class: 'primary', onclick: () => resetTo(screenPhoto, meta.zone) }, 'Переснять')
-        : h('button', { class: 'primary', onclick: () => resetTo(screenHome) }, 'Понятно'),
-      level === 'crit'
-        ? h('button', { class: 'link photo-close-anyway', onclick: () => resetTo(screenHome) }, 'Всё равно закрыть')
-        : null,
-      level === 'unclear'
-        ? h('button', { class: 'link photo-close-anyway', onclick: () => resetTo(screenHome) }, 'Позже')
-        : null,
-      h('button', { class: 'link', onclick: () => go(screenPhotoHistory) }, 'История снимков'),
-    ),
-  );
+      h('button', { class: 'primary', onclick: () => resetTo(screenHome) }, 'Готово'),
+      h('button', { class: 'link', onclick: () => go(screenPhotoHistory) }, 'История снимков')));
+  return root;
 }
 
-/** Последние снимки: дата, зона, вердикт, замечания. Критичные — сверху. */
+/** Последние снимки: одна смена = одна запись с кадрами прохода. */
 function screenPhotoHistory() {
   const list = h('div', { class: 'photo-hist-list' }, h('p', { class: 'photo-hist-empty' }, 'Загрузка…'));
   let run = () => {};
@@ -1399,25 +1573,26 @@ function screenPhotoHistory() {
     let server = (await db.get('kv', 'photoHistory')) || [];
     if (fresh && navigator.onLine) {
       try {
-        const res = await apiGet({ action: 'photos', limit: 30 }, 15000);
+        const res = await apiGet({ action: 'photos', limit: 50 }, 15000);
         server = res.photos || [];
         await db.put('kv', server, 'photoHistory');
       } catch (e) { /* нет сети — показываем кэш */ }
     }
     const queue = (await listQueue()).filter(r => r.type === 'photo');
-    const local = queue.map(r => ({ id: r.id, at: r.createdAt, zone: r.zone, level: 'pending', notes: '', local: true }));
+    const local = queue.map(r => ({
+      id: r.id, at: r.createdAt, zone: r.zone || '', level: 'pending', notes: '', local: true,
+      runId: r.runId || '', floor: r.floor || '', zoneAuto: !!r.autoZone,
+    }));
     const byId = new Map();
     server.forEach(p => byId.set(p.id, p));
     local.forEach(p => { if (!byId.has(p.id)) byId.set(p.id, p); });
-    const all = [...byId.values()];
-    const rank = { crit: 3, warn: 2, unclear: 1, unchecked: 1, pending: 0, ok: 0, '': 0 };
-    all.sort((a, b) => ((rank[b.level] || 0) - (rank[a.level] || 0)) || String(b.at || '').localeCompare(String(a.at || '')));
+    const groups = photoRuns([...byId.values()]);
     if (!document.body.contains(root)) return;
-    if (!all.length) {
+    if (!groups.length) {
       list.replaceChildren(h('p', { class: 'photo-hist-empty' },
         navigator.onLine ? 'Пока нет снимков' : 'Нет сети и нет сохранённой истории'));
     } else {
-      list.replaceChildren(...all.slice(0, 40).map(photoHistRow));
+      list.replaceChildren(...groups.slice(0, 30).map(photoRunRow));
     }
   }
 
@@ -1429,18 +1604,67 @@ function screenPhotoHistory() {
   return root;
 }
 
-function photoHistRow(p) {
-  const level = p.level || '';
-  const cls = level === 'unchecked' ? 'unclear' : (level || 'unclear');
-  const label = { ok: 'чисто', warn: 'замечания', crit: 'критично', unclear: 'не проверено',
-    unchecked: 'не проверено', pending: 'ждёт отправки', stoplist: 'стоп-лист', '': 'без вердикта' }[level] || level;
+/**
+ * Собирает снимки в проходы: один runId = одна смена с тремя кадрами.
+ * Старые снимки без runId остаются отдельными строками, как раньше.
+ */
+function photoRuns(items) {
+  const rank = { crit: 3, warn: 2, unclear: 1, unchecked: 1, pending: 0, ok: 0, stoplist: 0, '': 0 };
+  const map = new Map();
+  const groups = [];
+  (items || []).forEach(p => {
+    const key = p.runId ? 'run:' + p.runId : 'id:' + p.id;
+    let g = map.get(key);
+    if (!g) {
+      g = { key: key, runId: p.runId || '', floor: p.floor || '', at: p.at || '', photos: [] };
+      map.set(key, g);
+      groups.push(g);
+    }
+    g.photos.push(p);
+    if (!g.floor && p.floor) g.floor = p.floor;
+    if (String(p.at || '') > String(g.at || '')) g.at = p.at || '';
+  });
+  groups.forEach(g => {
+    g.photos.sort((a, b) => String(a.at || '').localeCompare(String(b.at || '')));
+    g.level = g.photos.reduce(
+      (acc, p) => ((rank[p.level] || 0) > (rank[acc] || 0) ? p.level : acc),
+      g.photos[0].level || '');
+    g.crit = g.photos.filter(p => p.level === 'crit').length;
+    g.warn = g.photos.filter(p => p.level === 'warn').length;
+  });
+  groups.sort((a, b) => ((rank[b.level] || 0) - (rank[a.level] || 0)) || String(b.at || '').localeCompare(String(a.at || '')));
+  return groups;
+}
+
+function photoRunRow(g) {
+  const cls = g.level === 'unchecked' ? 'unclear' : (g.level || 'unclear');
+  const grouped = g.photos.length > 1;
+  const first = g.photos[0] || {};
+  const title = grouped
+    ? 'Смена · ' + floorLabel(g.floor || '1')
+    : (first.zone || floorLabel(first.floor || ''));
+  const badge = PHOTO_HIST_BADGE[g.level] || g.level;
+  const inner = grouped
+    ? h('div', { class: 'photo-run-group' }, g.photos.map((p, i) =>
+        h('div', { class: 'photo-run-group-row' },
+          h('span', { class: 'photo-run-group-no' }, String(i + 1)),
+          h('span', { class: 'photo-run-group-zone' }, p.zone || PHOTO_ZONE_UNKNOWN),
+          h('span', { class: 'photo-hist-badge ' + (p.level === 'unchecked' ? 'unclear' : (p.level || 'unclear')) },
+            PHOTO_LEVEL_SIGN[p.level] || '', ' ', PHOTO_LEVEL_WORD[p.level] || PHOTO_HIST_BADGE[p.level] || ''))))
+    : null;
+  const summary = grouped && (g.crit || g.warn)
+    ? h('p', { class: 'photo-run-meta' },
+        [g.crit ? 'критично: ' + g.crit : '', g.warn ? 'замечания: ' + g.warn : ''].filter(Boolean).join(', '))
+    : null;
+  const notes = !grouped && first.notes ? h('p', { class: 'photo-hist-notes' }, first.notes) : null;
   return h('div', { class: 'photo-hist-row ' + cls },
     h('div', { class: 'photo-hist-head' },
-      h('b', {}, p.zone || 'Зона'),
-      h('span', { class: 'photo-hist-badge ' + cls }, label)),
-    h('p', { class: 'photo-hist-date' }, fmtDateTime(p.at) + (p.local ? ' · ждёт отправки' : '')),
-    p.notes ? h('p', { class: 'photo-hist-notes' }, p.notes) : null,
-  );
+      h('b', {}, title),
+      h('span', { class: 'photo-hist-badge ' + cls }, badge)),
+    h('p', { class: 'photo-hist-date' }, fmtDateTime(g.at) + (first.local ? ' · ждёт отправки' : '')),
+    summary,
+    inner,
+    notes);
 }
 
 // =====================================================================
@@ -4671,7 +4895,9 @@ function screenDuelResult({ duelId, initialState }) {
 function describe(r) {
   if (r.type === 'transfer') return `Перенос · ${r.direction} · ${r.item} ${r.qty} ${r.unit}`;
   if (r.type === 'writeoff') return `Списание · ${r.item} ${r.qty} ${r.unit} · ${r.reason}`;
-  if (r.type === 'photo') return r.stopList ? `Фото стоп-листа · ${stopFloorText(r.floor || '1')}` : `Фото уборки · ${r.zone}`;
+  if (r.type === 'photo') return r.stopList
+    ? `Фото стоп-листа · ${stopFloorText(r.floor || '1')}`
+    : `Фото уборки · ${r.zone || floorLabel(r.floor || '1')}`;
   if (r.type === 'stoplist') return `Стоп-лист · ${stopFloorText(r.floor || '1')} · ${r.item}${r.crossedOut ? ' · убрали' : ''}`;
   if (r.type === 'checklist') {
     const done = Number(r.done) || (r.marked || []).length;

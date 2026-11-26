@@ -639,6 +639,130 @@ textarea { margin-top: 16px; resize: vertical; }
 .photo-hist-empty { color: var(--muted); text-align: center; margin: 28px 0; }
 
 /* =====================================================================
+   ТРИ КАДРА ЗА ПРОХОД — съёмка, сводка, группа в истории
+   ===================================================================== */
+.photo-shot-top { margin-top: 10px; }
+.photo-shot-counter {
+  margin: 2px 0 0; font-size: 34px; font-weight: 700; line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+.photo-shot-hint { margin: 6px 0 0; line-height: 1.4; }
+
+/* Крупная кнопка «Снять»: палец должен попадать не глядя. */
+.photo-shutter {
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px;
+  width: 100%; min-height: 128px; margin: 16px 0 0; padding: 18px;
+  background: var(--panel); color: var(--text);
+  border: 2px dashed var(--accent); border-radius: var(--radius); cursor: pointer;
+}
+.photo-shutter:active { transform: translateY(1px); }
+.photo-shutter[hidden] { display: none; }
+.photo-shutter-ico { font-size: 38px; line-height: 1; }
+.photo-shutter-label { font-size: 21px; font-weight: 700; letter-spacing: .01em; }
+
+.photo-shot-actions { display: flex; gap: 8px; margin-top: 10px; }
+.photo-shot-actions .secondary { flex: 1; margin-top: 0; min-height: 48px; font-size: 15px; }
+.photo-shot-send { margin-top: 16px; }
+.photo-shot-send:disabled { opacity: .45; }
+
+.photo-shot-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px; }
+.photo-shot-grid:empty { display: none; }
+.photo-shot-slot { position: relative; }
+.photo-shot-slot img {
+  width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 10px; display: block;
+  background: var(--panel-2);
+}
+.photo-shot-no {
+  position: absolute; left: 4px; bottom: 4px;
+  background: rgba(0, 0, 0, .65); color: #fff; font-size: 12px; font-weight: 700;
+  border-radius: 999px; min-width: 20px; text-align: center; padding: 2px 5px;
+}
+.photo-shot-tools {
+  position: absolute; top: 2px; right: 2px; display: flex; flex-direction: column; gap: 4px;
+}
+.photo-shot-tool {
+  width: 32px; height: 32px; min-height: 0; padding: 0; cursor: pointer;
+  background: rgba(0, 0, 0, .65); color: #fff; border: 0; border-radius: 50%;
+  font-size: 16px; line-height: 1;
+}
+
+/* Сводка прохода: кадр · зона · вердикт */
+.photo-run-list { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; }
+.photo-run-row {
+  display: grid; grid-template-columns: 84px minmax(0, 1fr); gap: 12px;
+  padding: 12px; background: var(--panel); border: 1px solid var(--line);
+  border-left: 4px solid var(--line); border-radius: 12px;
+}
+.photo-run-row.ok { border-left-color: var(--ok); }
+.photo-run-row.warn { border-left-color: var(--wait); }
+.photo-run-row.crit { border-color: var(--bad); border-left-color: var(--bad); }
+.photo-run-row.unclear { border-left-color: var(--muted); }
+.photo-run-row.pending { border-left-color: var(--accent); }
+.photo-run-thumb { position: relative; }
+.photo-run-thumb img {
+  width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 10px; display: block;
+  background: var(--panel-2);
+}
+.photo-run-thumb-no {
+  position: absolute; left: 4px; bottom: 4px;
+  background: rgba(0, 0, 0, .65); color: #fff; font-size: 12px; font-weight: 700;
+  border-radius: 999px; min-width: 20px; text-align: center; padding: 2px 5px;
+}
+.photo-run-body { min-width: 0; }
+.photo-run-zone { font-size: 15px; line-height: 1.35; overflow-wrap: anywhere; }
+.photo-run-zone-label { color: var(--muted); }
+.photo-zone-change {
+  display: inline; padding: 2px 4px; font-size: 13.5px; text-decoration: underline;
+  color: var(--accent);
+}
+.photo-run-auto { margin: 2px 0 0; color: var(--muted); font-size: 12.5px; }
+.photo-run-verdict { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; margin-top: 6px; }
+.photo-run-badge {
+  font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+  font-weight: 700; color: var(--muted); white-space: nowrap;
+}
+.photo-run-badge.ok { color: var(--ok); }
+.photo-run-badge.warn { color: var(--wait); }
+.photo-run-badge.crit { color: var(--bad); }
+.photo-run-conf { font-size: 12px; }
+.photo-run-notes-row { margin: 6px 0 0; font-size: 13.5px; line-height: 1.35; overflow-wrap: anywhere; }
+.photo-run-retake { margin-top: 10px; min-height: 42px; font-size: 14px; }
+.photo-run-picker {
+  margin-top: 10px; padding: 10px; border-radius: 10px; background: var(--panel-2);
+}
+.photo-run-picker .label { margin-top: 0; }
+.photo-run-picker .chips { margin: 6px 0 0; }
+.photo-run-picker .link { margin-top: 6px; font-size: 13.5px; }
+
+.photo-run-total {
+  margin-top: 16px; padding: 14px 16px; background: var(--panel);
+  border: 1px solid var(--line); border-left: 4px solid var(--muted); border-radius: var(--radius);
+}
+.photo-run-total.ok { border-left-color: var(--ok); }
+.photo-run-total.warn { border-left-color: var(--wait); }
+.photo-run-total.crit { border-color: var(--bad); border-left-color: var(--bad); }
+.photo-run-total-title { margin: 0; font-size: 20px; font-weight: 700; line-height: 1.25; }
+.photo-run-total.ok .photo-run-total-title { color: var(--ok); }
+.photo-run-total.warn .photo-run-total-title { color: var(--wait); }
+.photo-run-total.crit .photo-run-total-title { color: var(--bad); }
+.photo-run-total-meta { margin: 6px 0 0; color: var(--muted); font-size: 13px; line-height: 1.35; }
+.photo-run-notes:empty { display: none; }
+.photo-run-note {
+  margin: 10px 0 0; padding: 10px 12px; border-radius: 10px;
+  background: var(--panel-2); font-size: 13.5px; line-height: 1.35;
+}
+
+/* История: одна смена = одна запись с кадрами прохода */
+.photo-run-group { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+.photo-run-group-row {
+  display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; gap: 8px; align-items: baseline;
+  font-size: 14px; line-height: 1.35;
+}
+.photo-run-group-no { color: var(--muted); font-variant-numeric: tabular-nums; }
+.photo-run-group-zone { overflow-wrap: anywhere; }
+.photo-run-meta { margin: 6px 0 0; color: var(--muted); font-size: 12.5px; }
+
+/* =====================================================================
    СТОП-ЛИСТ — что закончилось, сколько дней, недочёты
    ===================================================================== */
 .photo-mode { margin-top: 4px; }

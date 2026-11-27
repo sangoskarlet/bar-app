@@ -1483,6 +1483,9 @@ const PHOTO_HIST_BADGE = {
   ok: 'чисто', warn: 'замечания', crit: 'критично', unclear: 'не проверено',
   unchecked: 'не проверено', pending: 'ждёт отправки', stoplist: 'стоп-лист', '': 'без вердикта',
 };
+// Сколько проходов показывать в истории. Обрезка идёт ПОСЛЕ сортировки по
+// дате, поэтому остаются последние по времени, а не «самые плохие».
+const PHOTO_HIST_RUNS = 30;
 
 /** «1 замечание», «2 замечания», «5 замечаний». */
 function remarksWord(n) {
@@ -1731,7 +1734,9 @@ function screenPhotoHistory() {
       list.replaceChildren(h('p', { class: 'photo-hist-empty' },
         navigator.onLine ? 'Пока нет снимков' : 'Нет сети и нет сохранённой истории'));
     } else {
-      list.replaceChildren(...groups.slice(0, 30).map(photoRunRow));
+      // Лимит — только по времени: photoRuns уже отсортировал новые сверху,
+      // поэтому в обрезку попадают последние снимки, а не «самые плохие».
+      list.replaceChildren(...photoHistoryDays(groups.slice(0, PHOTO_HIST_RUNS)));
     }
   }
 
@@ -1746,6 +1751,11 @@ function screenPhotoHistory() {
 /**
  * Собирает снимки в проходы: один runId = одна смена с тремя кадрами.
  * Старые снимки без runId остаются отдельными строками, как раньше.
+ *
+ * Порядок — только по времени снимка: новые сверху. Вердикт (критично /
+ * замечания / чисто) на порядок не влияет — просьба владельца: «нужно чтобы
+ * они шли по датам, а не по качеству уборки». Внутри прохода кадры идут в
+ * порядке съёмки (по времени кадра), а не по вердикту.
  */
 function photoRuns(items) {
   const rank = { crit: 3, warn: 2, unclear: 1, unchecked: 1, pending: 0, ok: 0, stoplist: 0, '': 0 };
@@ -1761,18 +1771,68 @@ function photoRuns(items) {
     }
     g.photos.push(p);
     if (!g.floor && p.floor) g.floor = p.floor;
-    if (String(p.at || '') > String(g.at || '')) g.at = p.at || '';
+    if (comparePhotoAt(p.at, g.at) > 0) g.at = p.at || '';
   });
   groups.forEach(g => {
-    g.photos.sort((a, b) => String(a.at || '').localeCompare(String(b.at || '')));
+    // Кадры одного прохода — в порядке съёмки (от раннего к позднему).
+    g.photos.sort((a, b) => comparePhotoAt(a.at, b.at));
     g.level = g.photos.reduce(
       (acc, p) => ((rank[p.level] || 0) > (rank[acc] || 0) ? p.level : acc),
       g.photos[0].level || '');
     g.crit = g.photos.filter(p => p.level === 'crit').length;
     g.warn = g.photos.filter(p => p.level === 'warn').length;
   });
-  groups.sort((a, b) => ((rank[b.level] || 0) - (rank[a.level] || 0)) || String(b.at || '').localeCompare(String(a.at || '')));
+  // Проходы — от новых к старым; вердикт на место в списке не влияет.
+  groups.sort((a, b) => comparePhotoAt(b.at, a.at));
   return groups;
+}
+
+/** Время снимка в миллисекундах; пустое или битое — 0 (уходит вниз). */
+function photoAtMs(at) {
+  const t = Date.parse(String(at || ''));
+  return isNaN(t) ? 0 : t;
+}
+
+/** Сравнение по времени снимка: отрицательное — a раньше b. */
+function comparePhotoAt(a, b) {
+  const ta = photoAtMs(a), tb = photoAtMs(b);
+  if (ta !== tb) return ta - tb;
+  return String(a || '').localeCompare(String(b || ''));
+}
+
+/** Ключ дня снимка по местному времени: «2026-11-27». Нет даты — ''. */
+function photoHistDay(at) {
+  const t = photoAtMs(at);
+  return t ? dayKey(new Date(t)) : '';
+}
+
+/** Заголовок дня: «Сегодня», «Вчера», «24 ноября» (год — если не текущий). */
+function photoHistDayLabel(day, now = new Date()) {
+  if (!day) return 'Без даты';
+  if (day === dayKey(now)) return 'Сегодня';
+  const yest = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+  if (day === dayKey(yest)) return 'Вчера';
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day);
+  if (!m) return 'Без даты';
+  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  const opts = { day: 'numeric', month: 'long' };
+  if (d.getFullYear() !== now.getFullYear()) opts.year = 'numeric';
+  return d.toLocaleDateString('ru-RU', opts);
+}
+
+/** Проходы (уже от новых к старым) → строки с заголовками дней. */
+function photoHistoryDays(groups) {
+  const out = [];
+  let lastDay = null;
+  groups.forEach(g => {
+    const day = photoHistDay(g.at);
+    if (day !== lastDay) {
+      lastDay = day;
+      out.push(h('p', { class: 'photo-hist-day' }, photoHistDayLabel(day)));
+    }
+    out.push(photoRunRow(g));
+  });
+  return out;
 }
 
 function photoRunRow(g) {

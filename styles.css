@@ -615,6 +615,8 @@ textarea { margin-top: 16px; resize: vertical; }
 .photo-verdict-actions .link:last-child { display: block; width: 100%; text-align: center; margin: 12px 0 0; font-size: 14px; }
 
 .photo-hist-tools { display: flex; justify-content: flex-end; margin: 2px 0 4px; }
+.photo-hist-day { margin: 12px 2px 0; color: var(--muted); font-size: 13px; font-weight: 600; letter-spacing: .02em; }
+.photo-hist-list > .photo-hist-day:first-child { margin-top: 4px; }
 .photo-hist-list { display: flex; flex-direction: column; gap: 8px; margin-top: 6px; }
 .photo-hist-row {
   background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--line);

@@ -7,6 +7,8 @@
 //
 //  Запуск: node tools/demo-server.mjs  (порт 8799)
 //  Управление флагами: GET /__state?quiz=off&duel=off&pairs=off&stoplist=off
+//  История фото для проверки дат: /__state?photodates=days|daysold|empty|many
+//  Запоминать отправленные снимки: /__state?rememberphotos=1 (по умолчанию нет)
 //  Журнал POST-запросов: GET /__log
 // =====================================================================
 
@@ -27,6 +29,10 @@ const state = {
   posts: [],
   photoRuns: {},      // runId → сколько кадров уже «проверено» (демо)
   photoUndef: false,  // второй кадр прохода — «зона не определена» (для скриншота)
+  photoDates: 'off',  // 'off' | 'days' | 'daysold' | 'empty' | 'many' — тестовые даты истории
+  photoDatesRows: [], // тестовый набор считается один раз, время не «плывёт»
+  rememberPhotos: false, // запоминать отправленные снимки в истории (для проверки)
+  savedPhotos: [],    // «сохранённые» снимки: попадают в историю, как строки листа
 };
 
 const DEMO_ZONES = { '1': ['Бар', 'Холодильники', 'За баром'], '2': ['Окно', 'Дверь', 'Склад'] };
@@ -60,7 +66,7 @@ function demoPhotoVerdict(r, idx) {
 }
 
 /** Демо-история: одна смена с тремя кадрами и один старый одиночный снимок. */
-function demoPhotos() {
+function demoPhotoBase() {
   const at = n => new Date(Date.now() - n * 60000).toISOString();
   return [
     { id: 'demo-run-1-a', at: at(8), zone: 'Бар', level: 'ok', verdict: 'ok', notes: '',
@@ -77,6 +83,104 @@ function demoPhotos() {
     { id: 'demo-old-1', at: at(1500), zone: 'Окно', level: 'ok', verdict: 'ok', notes: '',
       floor: '2', runId: '', zoneAuto: false, zoneConfidence: null, model: 'gemini-flash-lite-latest' },
   ];
+}
+
+/** N дней назад в чч:мм по местному времени → ISO. */
+function atDaysAgo(days, hh, mm) {
+  const d = new Date();
+  d.setDate(d.getDate() - days);
+  d.setHours(hh, mm, 0, 0);
+  return d.toISOString();
+}
+
+/** Три времени сегодняшнего прохода: возрастают и не выходят за сегодня. */
+function demoTodayShots() {
+  const start = new Date(); start.setHours(0, 0, 0, 0);
+  const end = Math.max(Date.now() - 60000, +start + 3000);
+  const begin = Math.max(end - 120000, +start + 1000);
+  const step = (end - begin) / 3;
+  return [begin, begin + step, begin + 2 * step].map(t => new Date(Math.round(t)).toISOString());
+}
+
+/**
+ * Демо-история с разными днями и вердиктами. Строки идут от старых к новым —
+ * как в листе, где новые строки добавляются снизу. Клиент обязан сам
+ * отсортировать их по дате: критичный вчерашний снимок должен оказаться НИЖЕ
+ * сегодняшнего чистого (владелец: «по датам, а не по качеству уборки»).
+ */
+function demoPhotoDates(includeToday = true) {
+  const today = demoTodayShots();
+  const rec = (id, at, zone, level, floor, extra) => Object.assign({
+    id, at, zone, level, verdict: level, notes: DEMO_NOTES[level] || '',
+    floor, runId: '', zoneAuto: false, zoneConfidence: null,
+    model: 'gemini-flash-lite-latest',
+  }, extra || {});
+  const rows = [
+    rec('demo-dates-6-ok', atDaysAgo(6, 7, 45), 'Бар', 'ok', '1'),
+    rec('demo-dates-5-warn', atDaysAgo(5, 19, 30), 'Окно', 'warn', '2'),
+    rec('demo-dates-4-ok', atDaysAgo(4, 12, 10), 'Склад', 'ok', '2'),
+    rec('demo-dates-3-warn', atDaysAgo(3, 21, 5), 'Дверь', 'warn', '2'),
+    rec('demo-dates-2-ok', atDaysAgo(2, 8, 20), 'Склад', 'ok', '2'),
+    rec('demo-dates-1-crit', atDaysAgo(1, 18, 40), 'Окно', 'crit', '2'),
+  ];
+  if (!includeToday) return rows;
+  return rows.concat([
+    // Сегодняшний проход: три кадра, порядок задаётся временем съёмки.
+    rec('demo-dates-0-a', today[0], 'Бар', 'ok', '1',
+      { runId: 'demo-dates-0', zoneAuto: true, zoneConfidence: 0.9 }),
+    rec('demo-dates-0-b', today[1], 'Холодильники', 'warn', '1',
+      { runId: 'demo-dates-0', zoneAuto: true, zoneConfidence: 0.85 }),
+    rec('demo-dates-0-c', today[2], 'За баром', 'ok', '1',
+      { runId: 'demo-dates-0', zoneAuto: true, zoneConfidence: 0.88 }),
+    // Чистый одиночный снимок — самый новый в истории.
+    rec('demo-dates-0-ok', new Date().toISOString(), 'Бар', 'ok', '1'),
+  ]);
+}
+
+/**
+ * 35 одиночных снимков через 90 минут — проверка лимита истории.
+ * Самые старые (i < 5) критичные: при сортировке «по качеству» они всплыли бы
+ * наверх, при сортировке по дате и лимите 30 не показываются вовсе.
+ */
+function demoPhotoMany() {
+  const rows = [];
+  for (let i = 0; i < 35; i++) {
+    const level = i < 5 ? 'crit' : (i % 3 === 0 ? 'warn' : 'ok');
+    rows.push({
+      id: 'demo-many-' + i,
+      at: new Date(Date.now() - (35 - i) * 90 * 60000).toISOString(),
+      zone: i % 2 ? 'Бар' : 'Окно', level, verdict: level, notes: DEMO_NOTES[level] || '',
+      floor: i % 2 ? '1' : '2', runId: '', zoneAuto: false, zoneConfidence: null,
+      model: 'gemini-flash-lite-latest',
+    });
+  }
+  return rows;
+}
+
+/**
+ * История: базовый набор, тестовые даты или «много» + всё, что «сохранил»
+ * демо-сервер. Как лист: новые строки снизу, наружу — новые первыми.
+ */
+function demoPhotos() {
+  let rows;
+  if (state.photoDates === 'empty') rows = [];
+  else if (state.photoDates !== 'off') rows = state.photoDatesRows;
+  else rows = demoPhotoBase();
+  return rows.concat(state.savedPhotos).slice().reverse();
+}
+
+/** «Сохранённый» демо-снимок попадает в историю, как строка листа. */
+function demoRememberPhoto(rec, verdict, stopList) {
+  const row = Object.assign({}, verdict, {
+    id: rec.id,
+    at: rec.createdAt || new Date().toISOString(),
+    floor: String(rec.floor || verdict.floor || '1'),
+    runId: String(rec.runId || verdict.runId || ''),
+  });
+  if (stopList) row.zone = 'Стоп-лист';
+  if (rec.comment) row.comment = String(rec.comment);
+  const i = state.savedPhotos.findIndex(p => p.id === row.id);
+  if (i >= 0) state.savedPhotos[i] = row; else state.savedPhotos.push(row);
 }
 
 /** Дни назад в формате «2026-11-24» (для демо-стоп-листа). */
@@ -315,15 +419,18 @@ const server = http.createServer((req, res) => {
           // Снимок стоп-листа: отдаём то, что «распознала» модель (обе
           // колонки), чтобы экран результата было на чём проверить.
           const results = (b.records || []).map(r => {
-            if (r.type === 'photo' && (r.stopList === true || r.zone === 'Стоп-лист')) {              const floor = String(r.floor || '1');
+            if (r.type === 'photo' && (r.stopList === true || r.zone === 'Стоп-лист')) {
+              const floor = String(r.floor || '1');
+              const verdict = {
+                level: 'stoplist', verdict: 'стоп-лист', confidence: null,
+                notes: 'стоп-лист: 13, остатки: 8, недочётов: 2',
+                items: [], model: 'gemini-flash-lite-latest',
+                checkedAt: new Date().toISOString(), reference: '', references: [], error: '',
+              };
+              if (state.rememberPhotos) demoRememberPhoto(r, verdict, true);
               return {
                 id: r.id, status: 'saved',
-                verdict: {
-                  level: 'stoplist', verdict: 'стоп-лист', confidence: null,
-                  notes: 'стоп-лист: 13, остатки: 8, недочётов: 2',
-                  items: [], model: 'gemini-flash-lite-latest',
-                  checkedAt: new Date().toISOString(), reference: '', references: [], error: '',
-                },
+                verdict: verdict,
                 stoplist: {
                   ok: true, reason: '', unreadable: '', model: 'gemini-flash-lite-latest',
                   day: dayAgo(0), floor: floor,
@@ -353,7 +460,9 @@ const server = http.createServer((req, res) => {
               // Новый поток: зона «определяется» по этажу, кадры идут по порядку.
               state.photoRuns[r.runId] = (state.photoRuns[r.runId] || 0) + 1;
               const idx = state.photoRuns[r.runId] - 1;
-              return { id: r.id, status: 'saved', verdict: demoPhotoVerdict(r, idx) };
+              const verdict = demoPhotoVerdict(r, idx);
+              if (state.rememberPhotos) demoRememberPhoto(r, verdict);
+              return { id: r.id, status: 'saved', verdict: verdict };
             }
             return { id: r.id, status: 'saved' };
           });
@@ -395,10 +504,18 @@ const server = http.createServer((req, res) => {
     for (const [k, v] of url.searchParams.entries()) {
       if (k === 'pairs') state.pairsOn = v !== 'off';
       else if (k === 'photoundef') state.photoUndef = v !== '0';
-      else if (k === 'resetphotos') { state.photoRuns = {}; state.photoUndef = false; }
+      else if (k === 'photodates') {
+        state.photoDates = ['days', 'daysold', 'empty', 'many'].includes(v) ? v : 'off';
+        state.photoDatesRows = state.photoDates === 'days' ? demoPhotoDates(true)
+          : state.photoDates === 'daysold' ? demoPhotoDates(false)
+          : state.photoDates === 'many' ? demoPhotoMany() : [];
+      }
+      else if (k === 'resetphotos') { state.photoRuns = {}; state.photoUndef = false; state.savedPhotos = []; }
+      else if (k === 'rememberphotos') state.rememberPhotos = v !== '0';
       else if (k in state.features) state.features[k] = v !== 'off';
     }
-    return json(res, { ok: true, features: state.features, pairsOn: state.pairsOn, photoUndef: state.photoUndef });
+    return json(res, { ok: true, features: state.features, pairsOn: state.pairsOn, photoUndef: state.photoUndef,
+      photoDates: state.photoDates, rememberPhotos: state.rememberPhotos });
   }
   if (url.pathname === '/__log') return json(res, { ok: true, posts: state.posts });
   if (url.pathname === '/__clear-log') { state.posts = []; return json(res, { ok: true }); }

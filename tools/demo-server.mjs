@@ -25,7 +25,59 @@ const state = {
   },
   pairsOn: true,
   posts: [],
+  photoRuns: {},      // runId → сколько кадров уже «проверено» (демо)
+  photoUndef: false,  // второй кадр прохода — «зона не определена» (для скриншота)
 };
+
+const DEMO_ZONES = { '1': ['Бар', 'Холодильники', 'За баром'], '2': ['Окно', 'Дверь', 'Склад'] };
+const DEMO_NOTES = {
+  ok: '',
+  warn: 'warn: пустая бутылка у правого края стойки',
+  crit: 'crit: грязная посуда на стойке слева',
+  unclear: 'зона не определена',
+};
+
+/** Вердикт демо-проверки: зона из списка этажа + уровень по номеру кадра. */
+function demoPhotoVerdict(r, idx) {
+  const floor = String(r.floor || '1');
+  const zones = DEMO_ZONES[floor] || DEMO_ZONES['1'];
+  const manual = !!r.zone && r.zone !== 'стоп-лист';
+  const undefinedZone = !manual && state.photoUndef && idx === 1;
+  const zone = manual ? r.zone : (undefinedZone ? 'зона не определена' : zones[idx % zones.length]);
+  const levels = ['ok', 'warn', 'crit'];
+  const level = zone === 'зона не определена' ? 'unclear' : levels[idx % levels.length];
+  const zoneConfidence = zone === 'зона не определена' ? 0.42 : 0.86;
+  return {
+    level, verdict: level, confidence: zone === 'зона не определена' ? null : 0.84,
+    notes: DEMO_NOTES[level] || '',
+    issues: DEMO_NOTES[level] || '',
+    items: level === 'ok' ? [{ criterion: 'Стойка', level: 'ok', comment: 'сухо и пусто' }] : [],
+    model: 'gemini-flash-lite-latest',
+    checkedAt: new Date().toISOString(),
+    reference: '', references: [], error: '',
+    zone, zoneAuto: !manual, zoneConfidence, floor, runId: String(r.runId || ''),
+  };
+}
+
+/** Демо-история: одна смена с тремя кадрами и один старый одиночный снимок. */
+function demoPhotos() {
+  const at = n => new Date(Date.now() - n * 60000).toISOString();
+  return [
+    { id: 'demo-run-1-a', at: at(8), zone: 'Бар', level: 'ok', verdict: 'ok', notes: '',
+      floor: '1', runId: 'demo-run-1', zoneAuto: true, zoneConfidence: 0.91, model: 'gemini-flash-lite-latest' },
+    { id: 'demo-run-1-b', at: at(7), zone: 'Холодильники', level: 'warn', verdict: 'warn',
+      notes: 'warn: липкий след на полке', floor: '1', runId: 'demo-run-1', zoneAuto: true, zoneConfidence: 0.82,
+      model: 'gemini-flash-lite-latest' },
+    { id: 'demo-run-1-c', at: at(6), zone: 'За баром', level: 'crit', verdict: 'crit',
+      notes: 'crit: коробка и тряпка на полу', floor: '1', runId: 'demo-run-1', zoneAuto: true, zoneConfidence: 0.79,
+      model: 'gemini-flash-lite-latest' },
+    { id: 'demo-run-1-stop', at: at(5), zone: 'Стоп-лист', level: 'stoplist', verdict: 'стоп-лист',
+      notes: 'в стопе: 5, из них по остатку 0: 1, остатки: 4, кухня отсечена: 3', floor: '1',
+      runId: 'demo-run-1', zoneAuto: false, zoneConfidence: null, model: 'gemini-flash-lite-latest' },
+    { id: 'demo-old-1', at: at(1500), zone: 'Окно', level: 'ok', verdict: 'ok', notes: '',
+      floor: '2', runId: '', zoneAuto: false, zoneConfidence: null, model: 'gemini-flash-lite-latest' },
+  ];
+}
 
 /** Дни назад в формате «2026-11-24» (для демо-стоп-листа). */
 function dayAgo(n) {
@@ -263,8 +315,7 @@ const server = http.createServer((req, res) => {
           // Снимок стоп-листа: отдаём то, что «распознала» модель (обе
           // колонки), чтобы экран результата было на чём проверить.
           const results = (b.records || []).map(r => {
-            if (r.type === 'photo' && (r.stopList === true || r.zone === 'Стоп-лист')) {
-              const floor = String(r.floor || '1');
+            if (r.type === 'photo' && (r.stopList === true || r.zone === 'Стоп-лист')) {              const floor = String(r.floor || '1');
               return {
                 id: r.id, status: 'saved',
                 verdict: {
@@ -298,9 +349,33 @@ const server = http.createServer((req, res) => {
                 },
               };
             }
+            if (r.type === 'photo') {
+              // Новый поток: зона «определяется» по этажу, кадры идут по порядку.
+              state.photoRuns[r.runId] = (state.photoRuns[r.runId] || 0) + 1;
+              const idx = state.photoRuns[r.runId] - 1;
+              return { id: r.id, status: 'saved', verdict: demoPhotoVerdict(r, idx) };
+            }
             return { id: r.id, status: 'saved' };
           });
           return json(res, { ok: true, results });
+        }
+        if (b.action === 'photoRecheck') {
+          // Ручная смена зоны: перепроверяем «по критериям новой зоны».
+          const floor = String(b.floor || '1');
+          const zones = DEMO_ZONES[floor] || DEMO_ZONES['1'];
+          if (!zones.includes(b.zone)) return json(res, { ok: false, error: 'Такой зоны нет в таблице зон' });
+          const level = b.zone === 'Бар' ? 'ok' : 'warn';
+          return json(res, {
+            ok: true,
+            photo: {
+              level, verdict: level, confidence: 0.8,
+              notes: level === 'ok' ? '' : 'warn: ведро стоит не на месте',
+              issues: level === 'ok' ? '' : 'warn: ведро стоит не на месте',
+              items: [], model: 'gemini-flash-lite-latest',
+              checkedAt: new Date().toISOString(), reference: '', references: [], error: '',
+              zone: b.zone, zoneAuto: false, zoneConfidence: null, floor, runId: String(b.runId || ''),
+            },
+          });
         }
         return json(res, { ok: true });
       }
@@ -308,7 +383,7 @@ const server = http.createServer((req, res) => {
       if (action === 'config') return json(res, config());
       if (action === 'stopList') return json(res, demoStopList(true));
       if (action === 'openActs') return json(res, { ok: true, acts: [] });
-      if (action === 'photos') return json(res, { ok: true, photos: [] });
+      if (action === 'photos') return json(res, { ok: true, photos: demoPhotos() });
       if (action === 'questions') return json(res, { ok: true, questions: [], version: 'demo' });
       if (action === 'ping') return json(res, { ok: true });
       return json(res, { ok: true });
@@ -319,9 +394,11 @@ const server = http.createServer((req, res) => {
   if (url.pathname === '/__state') {
     for (const [k, v] of url.searchParams.entries()) {
       if (k === 'pairs') state.pairsOn = v !== 'off';
+      else if (k === 'photoundef') state.photoUndef = v !== '0';
+      else if (k === 'resetphotos') { state.photoRuns = {}; state.photoUndef = false; }
       else if (k in state.features) state.features[k] = v !== 'off';
     }
-    return json(res, { ok: true, features: state.features, pairsOn: state.pairsOn });
+    return json(res, { ok: true, features: state.features, pairsOn: state.pairsOn, photoUndef: state.photoUndef });
   }
   if (url.pathname === '/__log') return json(res, { ok: true, posts: state.posts });
   if (url.pathname === '/__clear-log') { state.posts = []; return json(res, { ok: true }); }

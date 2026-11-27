@@ -1952,6 +1952,9 @@ function savePhoto_(ss, sheet, auth, rec, id, created, received, comment) {
     }
     const summary = stopPhotoSummary_(res, saved);
     writeStopPhotoVerdict_(sheet, photoRow, res, summary);
+    // Проход пишем и для стоп-листа: он может уйти одной пачкой с кадрами зон,
+    // и в истории должен быть в той же смене.
+    writePhotoRun_(sheet, photoRow, { runId: runId, zoneAuto: 'нет', zoneConfidence: '' });
     return {
       id, status: 'saved', fileId: file.getId(), zone: zoneText,
       verdict: {
@@ -2006,10 +2009,10 @@ function savePhoto_(ss, sheet, auth, rec, id, created, received, comment) {
   let ref = null;
   let refList = [];
   try {
-    ref = photoRefFor_(photoRefs_(ss), zoneText);
-    refList = photoRefPhotosFor_(ss, zoneText).forCheck;
+    const found = photoCheckRefs_(ss, zoneText);
+    ref = found.ref;
+    refList = found.list;
   } catch (e) { log_('Проверка фото', 'эталоны не прочитаны: ' + e); }
-  if (!refList.length && ref && ref.fileId) refList = [ref];
   const checkFloor = floor || (ref ? ref.floor : '');
   let verdict;
   try {
@@ -2664,6 +2667,10 @@ const PHOTO_CONFIDENCE_MIN = 0.5;      // ниже — общий вердикт
 // Порог определения зоны: ниже — зона считается неопределённой, проверка
 // чистоты не запускается (иначе модель «выдумает» вердикт для чужой зоны).
 const PHOTO_ZONE_MIN_CONF = 0.6;
+// Как определяем зону: 'text' — по названиям и критериям зон, 'refs' — с
+// эталонами (по одному снимку на зону этажа). Выбор сделан по замеру:
+// см. docs/photo-run/ОТЧЁТ.md, §«Эталоны и замер вариантов».
+const PHOTO_ZONE_MODE = 'text';
 const PHOTO_ZONE_UNKNOWN = 'зона не определена';
 const PHOTO_MAX_ITEMS = 30;            // больше пунктов от модели не принимаем
 const PHOTO_GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta';
@@ -2762,7 +2769,7 @@ function ensurePhotoColumns_(sheet) {
   return cols;
 }
 
-/** Эталоны: { 'бар': { zone, what, fileId, url, floor } } */
+/** Эталоны: { 'бар': { zone, what, fileId, url, raw, floor } } */
 function photoRefs_(ss) {
   const out = {};
   const sh = ss.getSheetByName(SHEETS.refs);
@@ -2772,15 +2779,74 @@ function photoRefs_(ss) {
   rows_(ss, SHEETS.refs).forEach(r => {
     const zone = str_(r[cols.zone - 1]);
     if (!zone) return;
+    const raw = cols.photo ? str_(r[cols.photo - 1]) : '';
     out[photoZoneKey_(zone)] = {
       zone: zone,
       what: cols.what ? str_(r[cols.what - 1]) : '',
-      fileId: cols.photo ? driveId_(r[cols.photo - 1]) : '',
-      url: cols.photo ? str_(r[cols.photo - 1]) : '',
+      fileId: driveId_(raw),
+      url: raw,
+      raw: raw,
       floor: cols.floor ? photoFloorNorm_(r[cols.floor - 1]) : '',
     };
   });
   return out;
+}
+
+/**
+ * Файлы эталона из значения ячейки. Владелец может положить ссылку на файл,
+ * ссылку на папку (тогда берём первые фото из неё), ID или просто имя файла —
+ * как в его шаблонах («1_этаж_Бар.jpg»). Результат запоминается на время
+ * выполнения, чтобы не искать одно и то же имя несколько раз за запрос.
+ */
+const PHOTO_REF_MEMO = {};
+
+function photoRefFiles_(value, max) {
+  const raw = str_(value);
+  const limit = Math.max(1, Math.min(PHOTO_MAX_REFS, Number(max) || 1));
+  if (!raw) return [];
+  const memoKey = raw + '|' + limit;
+  if (PHOTO_REF_MEMO[memoKey]) return PHOTO_REF_MEMO[memoKey];
+  const out = [];
+  const addFiles = (it) => {
+    while (it.hasNext() && out.length < limit) {
+      const f = it.next();
+      if (/^image\//.test(f.getMimeType())) out.push({ fileId: f.getId(), name: f.getName() });
+    }
+  };
+  const id = driveId_(raw);
+  if (id) {
+    try {
+      const f = DriveApp.getFileById(id);
+      out.push({ fileId: f.getId(), name: f.getName() });
+    } catch (e) {
+      // Возможно, это папка с шаблонами.
+      try { addFiles(DriveApp.getFolderById(id).getFiles()); } catch (e2) { /* ни файл, ни папка */ }
+    }
+  } else {
+    const name = raw.replace(/^["'«]+|["'»]+$/g, '').trim();
+    const candidates = [name];
+    if (/\.(jpe?g|png|webp)$/i.test(name)) candidates.push(name.replace(/\.(jpe?g|png|webp)$/i, ''));
+    else candidates.push(name + '.jpg');
+    for (const candidate of candidates) {
+      if (out.length) break;
+      try { addFiles(DriveApp.getFilesByName(candidate)); } catch (e) { /* поиск не удался */ }
+    }
+    if (!out.length) {
+      try {
+        const fi = DriveApp.getFoldersByName(name);
+        if (fi.hasNext()) addFiles(fi.next().getFiles());
+      } catch (e) { /* не папка */ }
+    }
+  }
+  PHOTO_REF_MEMO[memoKey] = out;
+  if (out.length) log_('Проверка фото', 'эталон найден: ' + raw.slice(0, 80) + ' → ' + out[0].fileId);
+  return out;
+}
+
+/** Один эталон (или папка) из «Эталонов уборки» → до 3 файлов. */
+function photoRefSingleFiles_(ref) {
+  if (!ref) return [];
+  return photoRefFiles_(ref.raw || ref.url || ref.fileId, PHOTO_MAX_REFS);
 }
 
 function photoZoneKey_(zone) {
@@ -2789,6 +2855,26 @@ function photoZoneKey_(zone) {
 
 function photoRefFor_(refs, zone) {
   return (refs && refs[photoZoneKey_(zone)]) || null;
+}
+
+/**
+ * Эталоны для проверки конкретной зоны: до трёх из «Эталонов — фото»
+ * (ссылки или имена файлов), иначе одиночный эталон из «Эталонов уборки».
+ */
+function photoCheckRefs_(ss, zone) {
+  let ref = null;
+  let list = [];
+  try {
+    ref = photoRefFor_(photoRefs_(ss), zone);
+    list = photoRefPhotosFor_(ss, zone).forCheck;
+  } catch (e) { log_('Проверка фото', 'эталоны не прочитаны: ' + e); }
+  list = (list || []).map(r => {
+    if (r.fileId) return r;
+    const files = photoRefFiles_(r.url || r.raw, 1);
+    return files.length ? Object.assign({}, r, { fileId: files[0].fileId, url: r.url || r.raw }) : null;
+  }).filter(Boolean);
+  if (!list.length && ref) list = photoRefSingleFiles_(ref);
+  return { ref: ref, list: list };
 }
 
 /* --- колонки и этажи «Эталонов уборки» ----------------------------- */
@@ -3213,6 +3299,147 @@ function geminiPhotoZone_(key, floor, zones, blob, fileId) {
  * Возвращает {zone, confidence, model, reason, elapsedMs}. zone пустой —
  * зона считается неопределённой (в т. ч. при низкой уверенности).
  */
+/* --- вариант A: классификация по эталонам (по одному снимку на зону) --- */
+
+/** Одна картинка эталона: превью 512 px (быстро) или полный файл. */
+function photoRefInlinePart_(fileId, small) {
+  if (!fileId) return null;
+  try {
+    const file = DriveApp.getFileById(fileId);
+    if (small) {
+      const th = file.getThumbnail();
+      const bytes = th && th.getBytes();
+      if (bytes && bytes.length) {
+        return { inline_data: { mime_type: th.getContentType() || 'image/jpeg', data: Utilities.base64Encode(bytes) } };
+      }
+    }
+    const b = file.getBlob();
+    return { inline_data: { mime_type: b.getContentType(), data: Utilities.base64Encode(b.getBytes()) } };
+  } catch (e) {
+    log_('Определение зоны', 'эталон не открылся (' + fileId + '): ' + e);
+    return null;
+  }
+}
+
+/** Файлы эталонов зоны (из «Эталонов — фото», иначе из «Эталонов уборки»). */
+function photoRefImagesForZone_(ss, zone) {
+  const out = [];
+  try {
+    photoRefPhotosFor_(ss, zone).forCheck.forEach(r => {
+      if (r.fileId) out.push({ fileId: r.fileId, name: '' });
+      else photoRefFiles_(r.url || r.raw, 1).forEach(f => out.push(f));
+    });
+  } catch (e) { /* эталоны-фото не прочитались */ }
+  if (!out.length) photoRefSingleFiles_(photoRefFor_(photoRefs_(ss), zone)).forEach(f => out.push(f));
+  return out.slice(0, PHOTO_MAX_REFS);
+}
+
+/** По одному эталону на зону этажа: [{zone, fileId, name}]. */
+function photoZoneRefEntries_(ss, zones) {
+  return (zones || []).map(z => {
+    const files = photoRefImagesForZone_(ss, z.zone);
+    return { zone: z.zone, fileId: files.length ? files[0].fileId : '', name: files.length ? files[0].name : '' };
+  });
+}
+
+function buildPhotoZoneRefsPrompt_(floor, entries) {
+  const list = entries || [];
+  const lines = [
+    'Ты определяешь, какая зона бара на фото. Этаж: ' + photoFloorLabel_(floor) + '.',
+    'На изображении 1 — фото смены, которое надо отнести к зоне.',
+    'Дальше идут эталоны зон этого этажа — как выглядит каждая зона.',
+    'Зоны (выбирай ТОЛЬКО из списка, название — дословно):',
+  ];
+  list.forEach((e, i) => lines.push((i + 1) + ') «' + e.zone + '» — эталон: изображение ' + (i + 2)));
+  lines.push(
+    '',
+    'Сравни фото с эталонами: оборудование, мебель, стены, окно/дверь, полки, пол, ракурс.',
+    'Эталон — образец состава и порядка, а не шаблон для попиксельного сравнения: ракурс, свет и расстановка могут отличаться.',
+    'Правила:',
+    '1. Назови ровно одну зону из списка выше. Не придумывай зон, не сокращай название и не переставляй в нём слова.',
+    '2. Если фото не про зону из списка (крупный план предмета или посуды, человек, улица, экран, пол) — верни zone "не определено" и zone_confidence ниже 0.3.',
+    '3. zone_confidence — 0…1: насколько уверен, что кадр снят именно в этой зоне. Сомневаешься — ниже 0.6.',
+    '4. Не проверяй чистоту и не перечисляй беспорядок.',
+    '5. Верни ТОЛЬКО JSON: {"zone":"название зоны из списка или не определено","zone_confidence":0.0}',
+  );
+  return lines.join('\n');
+}
+
+/**
+ * Запрос классификации с эталонами: изображение 1 — фото смены, далее до
+ * PHOTO_MAX_REFS эталонов. Эталоны отправляются превью 512 px — так запрос
+ * втрое меньше и быстрее, а для выбора зоны разрешения хватает.
+ */
+function geminiPhotoZoneRefs_(key, floor, zones, blob, fileId, entriesOverride) {
+  const entries = (Array.isArray(entriesOverride) && entriesOverride.length)
+    ? entriesOverride
+    : photoZoneRefEntries_(ss_(), zones).filter(e => e.fileId);
+  const parts = [
+    { text: buildPhotoZoneRefsPrompt_(floor, entries.length ? entries : zones.map(z => ({ zone: z.zone }))) },
+    { inline_data: { mime_type: blob.getContentType(), data: Utilities.base64Encode(blob.getBytes()) } },
+  ];
+  const refParts = [];
+  entries.forEach(e => {
+    const p = photoRefInlinePart_(e.fileId, true);
+    if (p) { parts.push(p); refParts.push(p); }
+    else log_('Определение зоны', 'эталон зоны «' + e.zone + '» пропущен: файл не открылся');
+  });
+  const generationConfig = {
+    temperature: 0,
+    responseMimeType: 'application/json',
+    responseSchema: {
+      type: 'OBJECT',
+      properties: {
+        zone: { type: 'STRING' },
+        zone_confidence: { type: 'NUMBER' },
+      },
+      required: ['zone', 'zone_confidence'],
+    },
+  };
+  const props = PropertiesService.getScriptProperties();
+  const saved = str_(props.getProperty('GEMINI_ZONE_MODEL'));
+  const models = (saved ? [saved] : []).concat(GEMINI_MODELS.filter(m => m !== saved));
+  const started = Date.now();
+  const answer = runGeminiModels_(models, key, parts, generationConfig,
+    () => {
+      const smallPhoto = fileId ? photoRefInlinePart_(fileId, true) : null;
+      const small = (smallPhoto ? [smallPhoto] : []).concat(refParts);
+      return small.length ? small : null;
+    }, 'Определение зоны');
+  const elapsedMs = Date.now() - started;
+  if (saved !== answer.model && elapsedMs < 30000) props.setProperty('GEMINI_ZONE_MODEL', answer.model);
+  log_('Определение зоны', 'Gemini ' + answer.model + ' + эталоны (' + refParts.length + '): ' + elapsedMs + ' мс' + (answer.usedSmall ? ', повтор 512 px' : ''));
+
+  const v = validateZoneAnswer_(answer.text, zones);
+  if (!v.ok) return { invalid: true, reason: v.reason, model: answer.model, elapsedMs: elapsedMs, images: refParts.length + 1 };
+  if (v.raw && !v.zone) log_('Определение зоны', 'модель назвала зону вне списка этажа: «' + v.raw + '»');
+  return { model: answer.model, zone: v.zone, confidence: v.confidence, raw: v.raw, elapsedMs: elapsedMs, images: refParts.length + 1 };
+}
+
+/** Общая сборка ответа «зона» для обоих вариантов. */
+function photoDetectZoneResult_(res, elapsedFallback) {
+  if (!res) return { zone: '', confidence: 0, model: '', elapsedMs: elapsedFallback || 0, reason: 'пустой ответ' };
+  if (res.invalid) {
+    return { zone: '', confidence: 0, model: res.model, elapsedMs: res.elapsedMs, raw: '', reason: 'ответ модели не разобран: ' + res.reason };
+  }
+  const conf = Number(res.confidence);
+  const confident = !!res.zone && isFinite(conf) && conf >= PHOTO_ZONE_MIN_CONF;
+  return {
+    zone: confident ? res.zone : '',
+    confidence: isFinite(conf) ? conf : 0,
+    model: res.model || '', elapsedMs: res.elapsedMs, raw: res.raw || '',
+    images: res.images || 0,
+    reason: res.raw && !res.zone ? 'модель назвала зону вне списка этажа' : '',
+  };
+}
+
+/**
+ * Определение зоны: никогда не бросает — иначе фото потеряется из-за проверки.
+ * Возвращает {zone, confidence, model, reason, elapsedMs}. zone пустой —
+ * зона считается неопределённой (в т. ч. при низкой уверенности).
+ * PHOTO_ZONE_MODE выбирает вариант: 'text' — по названиям и критериям,
+ * 'refs' — с эталонами (по одному снимку на зону этажа).
+ */
 function photoDetectZone_(floor, blob, fileId) {
   const started = Date.now();
   let zones = [];
@@ -3223,16 +3450,10 @@ function photoDetectZone_(floor, blob, fileId) {
   const key = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
   if (!key) return { zone: '', confidence: 0, model: '', elapsedMs: 0, reason: 'не задан ключ GEMINI_API_KEY' };
   try {
-    const res = geminiPhotoZone_(key, floor, zones, blob, fileId);
-    if (res.invalid) return { zone: '', confidence: 0, model: res.model, elapsedMs: res.elapsedMs, raw: '', reason: 'ответ модели не разобран: ' + res.reason };
-    const conf = Number(res.confidence);
-    const confident = !!res.zone && isFinite(conf) && conf >= PHOTO_ZONE_MIN_CONF;
-    return {
-      zone: confident ? res.zone : '',
-      confidence: isFinite(conf) ? conf : 0,
-      model: res.model || '', elapsedMs: res.elapsedMs, raw: res.raw || '',
-      reason: res.raw && !res.zone ? 'модель назвала зону вне списка этажа' : '',
-    };
+    const res = PHOTO_ZONE_MODE === 'refs'
+      ? geminiPhotoZoneRefs_(key, floor, zones, blob, fileId)
+      : geminiPhotoZone_(key, floor, zones, blob, fileId);
+    return photoDetectZoneResult_(res, Date.now() - started);
   } catch (e) {
     const msg = String(e && e.message || e);
     log_('Определение зоны', 'Gemini: ' + msg.slice(0, 300));
@@ -3606,6 +3827,25 @@ function photoPublic_(v) {
 }
 
 /**
+ * Колонки прохода T–V: проход, «зона определена автоматически», уверенность
+ * зоны. Пишутся и для обычного кадра, и для снимка стоп-листа (тогда
+ * zoneAuto = «нет»), чтобы история группировала всю смену по runId.
+ */
+function writePhotoRun_(sheet, row, extra, colsIn) {
+  try {
+    const cols = colsIn || ensurePhotoColumns_(sheet);
+    const ex = extra || {};
+    if (cols.runId) sheet.getRange(row, cols.runId).setValue(str_(ex.runId));
+    if (cols.zoneAuto) sheet.getRange(row, cols.zoneAuto).setValue(str_(ex.zoneAuto));
+    if (cols.zoneConfidence) sheet.getRange(row, cols.zoneConfidence).setValue(
+      ex.zoneConfidence === '' || ex.zoneConfidence === null || ex.zoneConfidence === undefined
+        ? '' : Number(ex.zoneConfidence));
+  } catch (e) {
+    log_('Проверка фото', 'колонки прохода не записались: ' + e);
+  }
+}
+
+/**
  * Запись вердикта в строку листа. Старые H/I заполняем человеческим текстом,
  * новые M–V — машинными полями. Ошибка записи не отменяет сохранение фото.
  * extra (необязательно): {zoneAuto:'да'|'нет', zoneConfidence, runId}.
@@ -3654,12 +3894,7 @@ function writePhotoVerdict_(sheet, row, v, floor, extra) {
     if (cols.floor) sheet.getRange(row, cols.floor).setValue(str_(floor));
     // Проход и автоматическое определение зоны: T–V. Старые строки не трогаем —
     // запись идёт только при сохранении фото или ручной перепроверке.
-    const ex = extra || {};
-    if (cols.runId) sheet.getRange(row, cols.runId).setValue(str_(ex.runId));
-    if (cols.zoneAuto) sheet.getRange(row, cols.zoneAuto).setValue(str_(ex.zoneAuto));
-    if (cols.zoneConfidence) sheet.getRange(row, cols.zoneConfidence).setValue(
-      ex.zoneConfidence === '' || ex.zoneConfidence === null || ex.zoneConfidence === undefined
-        ? '' : Number(ex.zoneConfidence));
+    writePhotoRun_(sheet, row, extra || {}, cols);
   } catch (e) {
     log_('Проверка фото', 'вердикт не записался в лист: ' + e);
   }
@@ -3802,10 +4037,10 @@ function photoRecheck_(body) {
     let ref = null;
     let refList = [];
     try {
-      ref = photoRefFor_(photoRefs_(ss), zone);
-      refList = photoRefPhotosFor_(ss, zone).forCheck;
+      const found = photoCheckRefs_(ss, zone);
+      ref = found.ref;
+      refList = found.list;
     } catch (e) { log_('Проверка фото', 'эталоны не прочитаны: ' + e); }
-    if (!refList.length && ref && ref.fileId) refList = [ref];
 
     let blob;
     try { blob = DriveApp.getFileById(fileId).getBlob(); }

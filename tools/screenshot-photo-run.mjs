@@ -30,11 +30,14 @@ const IMGS = [
   path.join(ROOT, 'docs', 'photo-check', 'test', 'ref2-bar-royaloak.jpg'),
   path.join(ROOT, 'docs', 'photo-check', 'test', 'shift-dirty-dishes.jpg'),
 ];
+const STOP_IMG_SRC = path.join(ROOT, 'docs', 'photo-check', 'test', 'ref3-bar-deutsches.jpg');
 const TMP_IMGS = IMGS.map((src, i) => {
   const dst = path.join(os.tmpdir(), 'photo-run-shot' + (i + 1) + path.extname(src));
   fs.copyFileSync(src, dst);
   return dst;
 });
+const TMP_STOP = path.join(os.tmpdir(), 'photo-run-stop' + path.extname(STOP_IMG_SRC));
+fs.copyFileSync(STOP_IMG_SRC, TMP_STOP);
 
 // ---------- минимальный CDP-клиент ----------
 class CDP {
@@ -140,6 +143,16 @@ async function main() {
     if (!nodeId) throw new Error('Не нашли поле камеры');
     await send('DOM.setFileInputFiles', { nodeId, files: [file] });
   };
+  // Поле ввода по порядку в документе: 0 — камера зон, 1 — галерея зон,
+  // 2 — камера стоп-листа, 3 — галерея стоп-листа.
+  const setFileIndex = async (index, file) => {
+    const { root } = await send('DOM.getDocument', { depth: -1 });
+    const { nodeIds } = await send('DOM.querySelectorAll', {
+      nodeId: root.nodeId, selector: 'input[type=file]',
+    });
+    if (!nodeIds[index]) throw new Error('Не нашли поле ввода №' + index);
+    await send('DOM.setFileInputFiles', { nodeId: nodeIds[index], files: [file] });
+  };
   const goto = async url => {
     await send('Page.navigate', { url });
     await waitFor('document.readyState === "complete"', 20000, 'загрузка страницы');
@@ -169,18 +182,26 @@ async function main() {
   await waitFor('document.querySelector(".photo-shutter")', 15000, 'экран съёмки');
 
   await setFile(TMP_IMGS[0]);
-  await waitFor('document.querySelectorAll(".photo-shot-slot").length === 1', 15000, 'первый кадр');
+  await waitFor('document.querySelectorAll(".photo-shot-grid .photo-shot-slot").length === 1', 15000, 'первый кадр');
   await setFile(TMP_IMGS[1]);
-  await waitFor('document.querySelectorAll(".photo-shot-slot").length === 2', 15000, 'второй кадр');
+  await waitFor('document.querySelectorAll(".photo-shot-grid .photo-shot-slot").length === 2', 15000, 'второй кадр');
   await waitFor('document.querySelector(".photo-shot-counter").textContent.trim() === "2 из 3"', 5000, 'счётчик 2 из 3');
   await shot('01-shoot-three-375.png');
 
-  // ---------- 2. Сводка: три вердикта ----------
+  // ---------- 1b. Блок «Стоп-лист»: отдельный снимок в том же проходе ----------
+  await setFileIndex(3, TMP_STOP);
+  await waitFor('document.querySelector(".photo-stop-preview img")', 15000, 'снимок стоп-листа');
+  await sleep(300);
+  await shot('06-stop-block-375.png');
+
+  // ---------- 2. Сводка: три вердикта + итог стоп-листа ----------
   await setFile(TMP_IMGS[2]);
-  await waitFor('document.querySelectorAll(".photo-shot-slot").length === 3', 15000, 'третий кадр');
+  await waitFor('document.querySelectorAll(".photo-shot-grid .photo-shot-slot").length === 3', 15000, 'третий кадр');
   await clickText('Отправить');
   await waitFor('document.querySelector(".photo-run-list") && document.querySelectorAll(".photo-run-row").length === 3', 40000, 'сводка');
   await waitFor('[...document.querySelectorAll(".photo-run-badge")].filter(b => /критично|замечания|чисто/.test(b.textContent)).length === 3', 20000, 'три вердикта');
+  await waitFor('document.querySelector(".photo-stop-result.ok") || document.querySelector(".photo-stop-result.bad")', 40000, 'итог стоп-листа');
+  await sleep(300);
   await shot('02-summary-three-375.png');
 
   // ---------- 3. История: группировка по проходу ----------
@@ -199,9 +220,9 @@ async function main() {
   await clickText('1 этаж', '.floor-name');
   await waitFor('document.querySelector(".photo-shutter")', 15000, 'экран съёмки');
   for (const img of TMP_IMGS) {
-    const n = await evaluate('document.querySelectorAll(".photo-shot-slot").length');
+    const n = await evaluate('document.querySelectorAll(".photo-shot-grid .photo-shot-slot").length');
     await setFile(img);
-    await waitFor('document.querySelectorAll(".photo-shot-slot").length === ' + (n + 1), 15000, 'кадр ' + (n + 1));
+    await waitFor('document.querySelectorAll(".photo-shot-grid .photo-shot-slot").length === ' + (n + 1), 15000, 'кадр ' + (n + 1));
   }
   await clickText('Отправить');
   await waitFor('document.querySelector(".photo-run-list") && document.querySelectorAll(".photo-run-row").length === 3', 40000, 'сводка');

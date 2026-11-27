@@ -71,6 +71,9 @@ function demoPhotos() {
     { id: 'demo-run-1-c', at: at(6), zone: 'За баром', level: 'crit', verdict: 'crit',
       notes: 'crit: коробка и тряпка на полу', floor: '1', runId: 'demo-run-1', zoneAuto: true, zoneConfidence: 0.79,
       model: 'gemini-flash-lite-latest' },
+    { id: 'demo-run-1-stop', at: at(5), zone: 'Стоп-лист', level: 'stoplist', verdict: 'стоп-лист',
+      notes: 'в стопе: 5, из них по остатку 0: 1, остатки: 4, кухня отсечена: 3', floor: '1',
+      runId: 'demo-run-1', zoneAuto: false, zoneConfidence: null, model: 'gemini-flash-lite-latest' },
     { id: 'demo-old-1', at: at(1500), zone: 'Окно', level: 'ok', verdict: 'ok', notes: '',
       floor: '2', runId: '', zoneAuto: false, zoneConfidence: null, model: 'gemini-flash-lite-latest' },
   ];

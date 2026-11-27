@@ -1168,8 +1168,15 @@ function screenPhoto(initialArg) {
 /**
  * Съёмка прохода: до трёх кадров и ОДНА отправка.
  * opts.zone — режим «переснять конкретный кадр» (зону уже знаем, кадр один).
+ *
+ * Здесь же блок «Стоп-лист»: один снимок экрана планшета, свой этаж и свой
+ * путь обработки (распознавание текста, дни в стопе). Он не входит в три
+ * кадра зон и не проверяется на чистоту; уходит тем же `runId`, что и кадры,
+ * чтобы в истории проход был одной сменой.
  */
 function screenPhotoShoot(floor, opts = {}) {
+  const groups = photoZoneGroups();
+  const floors = groups.floors.length ? groups.floors : ['1'];
   const form = {
     floor: String(floor || '1'),
     zone: String(opts.zone || ''),
@@ -1177,7 +1184,11 @@ function screenPhotoShoot(floor, opts = {}) {
     retake: -1,
     comment: '',
     sending: false,
+    stop: '',                 // data-URL снимка стоп-листа
+    stopFloor: String(opts.stopFloor || floor || '1'),
+    stopFloorOpen: false,
   };
+  if (floors.indexOf(form.stopFloor) < 0) form.stopFloor = floors[0];
   const max = form.zone ? 1 : PHOTO_RUN_MAX;
   const root = h('main', { class: 'screen' }, header(form.zone ? 'Переснять кадр' : 'Фото уборки'));
   const counter = h('p', { class: 'photo-shot-counter' });
@@ -1215,6 +1226,61 @@ function screenPhotoShoot(floor, opts = {}) {
   camInput.addEventListener('change', e => { const files = [...e.target.files]; e.target.value = ''; addFiles(files); });
   galInput.addEventListener('change', e => { const files = [...e.target.files]; e.target.value = ''; addFiles(files); });
 
+  // ---------- стоп-лист: отдельный снимок, свой путь обработки ----------
+  const stopCamInput = h('input', { type: 'file', accept: 'image/*', capture: 'environment', hidden: true });
+  const stopGalInput = h('input', { type: 'file', accept: 'image/*', hidden: true });
+  const stopCard = h('section', { class: 'photo-stop-block', hidden: !!form.zone });
+  const stopPreview = h('div', { class: 'photo-stop-preview' });
+  const stopChoose = h('div', { class: 'photo-stop-choose' },
+    h('button', { class: 'secondary', type: 'button', onclick: () => { stopCamInput.click(); } }, '📷 Снять'),
+    h('button', { class: 'secondary', type: 'button', onclick: () => { stopGalInput.click(); } }, '🖼 Из галереи'));
+  const stopFloorLine = h('p', { class: 'photo-stop-floor' });
+  const stopFloorChips = h('div', { class: 'chips photo-stop-floors' });
+  const stopHead = h('div', { class: 'photo-stop-head' },
+    h('div', {},
+      h('p', { class: 'label' }, 'Стоп-лист'),
+      stopFloorLine),
+    h('span', { class: 'photo-stop-badge' }, 'не входит в 3 кадра'));
+
+  async function addStopFiles(files) {
+    const file = files && files[0];
+    if (!file) return;
+    try { form.stop = await compressImage(file); } catch (e) { toast('Не удалось обработать фото', 'bad'); return; }
+    draw();
+  }
+  stopCamInput.addEventListener('change', e => { const files = [...e.target.files]; e.target.value = ''; addStopFiles(files); });
+  stopGalInput.addEventListener('change', e => { const files = [...e.target.files]; e.target.value = ''; addStopFiles(files); });
+
+  function drawStop() {
+    const on = !!form.stop;
+    stopPreview.replaceChildren(...(on ? [
+      h('div', { class: 'photo-shot-slot' },
+        h('img', { src: form.stop, alt: 'Снимок стоп-листа' }),
+        h('div', { class: 'photo-shot-tools' },
+          h('button', {
+            class: 'photo-shot-tool', type: 'button', 'aria-label': 'Переснять стоп-лист',
+            onclick: () => { stopCamInput.click(); },
+          }, '↻'),
+          h('button', {
+            class: 'photo-shot-tool', type: 'button', 'aria-label': 'Убрать снимок стоп-листа',
+            onclick: () => { form.stop = ''; draw(); },
+          }, '✕'))),
+    ] : []));
+    stopChoose.hidden = on;
+    stopFloorLine.replaceChildren(
+      'Этаж: ', h('b', {}, floorLabel(form.stopFloor)), ' · ',
+      h('button', {
+        class: 'link photo-stop-floor-change', type: 'button',
+        onclick: () => { form.stopFloorOpen = !form.stopFloorOpen; draw(); },
+      }, 'изменить'));
+    stopFloorChips.replaceChildren(...floors.map(f =>
+      h('button', {
+        class: 'chip' + (f === form.stopFloor ? ' on' : ''), type: 'button',
+        onclick: () => { form.stopFloor = f; form.stopFloorOpen = false; draw(); },
+      }, floorLabel(f))));
+    stopFloorChips.hidden = !form.stopFloorOpen;
+  }
+
   function draw() {
     const n = form.photos.length;
     counter.textContent = n + ' из ' + max;
@@ -1230,14 +1296,15 @@ function screenPhotoShoot(floor, opts = {}) {
           h('button', { class: 'photo-shot-tool', type: 'button', 'aria-label': 'Убрать кадр ' + (i + 1), onclick: () => { form.photos.splice(i, 1); draw(); } }, '✕')))));
     shutter.hidden = n >= max;
     retakeBtn.disabled = n === 0;
-    sendBtn.disabled = n === 0 || form.sending;
+    sendBtn.disabled = (n === 0 && !form.stop) || form.sending;
     sendBtn.textContent = form.sending ? 'Отправляем…' : 'Отправить';
+    drawStop();
   }
 
   retakeBtn.addEventListener('click', () => { if (form.photos.length) openCamera(form.photos.length - 1); });
 
   sendBtn.addEventListener('click', async () => {
-    if (!form.photos.length || form.sending) return;
+    if ((!form.photos.length && !form.stop) || form.sending) return;
     form.sending = true;
     draw();
     const runId = newId();
@@ -1251,12 +1318,23 @@ function screenPhotoShoot(floor, opts = {}) {
         if (form.zone) rec.zone = form.zone; else rec.autoZone = true;
         records.push(await enqueue(rec));
       }
+      // Снимок стоп-листа идёт существующим путём: stopList + свой этаж.
+      if (form.stop) {
+        records.push(await enqueue({
+          type: 'photo', name: session.name, pin: session.pin,
+          runId, floor: form.stopFloor, zone: STOP_ZONE_NAME, stopList: true,
+          image: form.stop, comment: form.comment.trim(),
+        }));
+      }
     } catch (e) {
       form.sending = false;
       draw();
       return toast('Не удалось сохранить фото', 'bad');
     }
-    const meta = { floor: form.floor, runId, zone: form.zone || '' };
+    const meta = {
+      floor: form.floor, runId, zone: form.zone || '',
+      stop: !!form.stop, stopFloor: form.stopFloor,
+    };
     if (!navigator.onLine) { resetTo(screenPhotoSent, records, meta, { offline: true }); return; }
     resetTo(screenPhotoChecking, records, meta);
   });
@@ -1274,12 +1352,19 @@ function screenPhotoShoot(floor, opts = {}) {
       h('button', { class: 'secondary', type: 'button', onclick: () => galInput.click() }, '🖼 Из галереи')),
     slots,
     camInput, galInput,
+    h('div', { class: 'photo-stop-wrap', hidden: !!form.zone },
+      stopCard,
+      h('p', { class: 'muted photo-stop-hint' },
+        'Сфотографируйте экран планшета с колонками «Блюда на остатке» и «СТОП-ЛИСТ»: распознаем позиции и дни в стопе. Проверка чистоты не запускается.')),
+    stopCamInput, stopGalInput,
     comment,
     sendBtn,
   );
+  stopCard.append(stopHead, stopChoose, stopPreview, stopFloorChips);
   draw();
   return root;
 }
+
 
 // ---------------------------------------------------------------------
 //  Проверка прохода: «Проверяем…» → сводка по трём кадрам.
@@ -1407,15 +1492,28 @@ function remarksWord(n) {
   return 'замечаний';
 }
 
+/** «1 позиция», «2 позиции», «5 позиций». */
+function stopPositionsWord(n) {
+  const d = n % 10, dd = n % 100;
+  if (d === 1 && dd !== 11) return 'позиция';
+  if (d >= 2 && d <= 4 && (dd < 12 || dd > 14)) return 'позиции';
+  return 'позиций';
+}
+
 function screenPhotoRunSummary(records, verdicts, meta) {
   meta = meta || {};
   const byId = new Map((verdicts || []).map(v => [v.id, v]));
   const items = records.map(rec => ({ rec, v: byId.get(rec.id) || null, picker: false, busy: false }));
+  // Стоп-лист идёт своим путём: не входит в три кадра и не считается в итоге
+  // по чистоте, поэтому показываем его отдельной карточкой.
+  const stopItems = items.filter(it => it.rec.stopList === true);
+  const zoneItems = items.filter(it => it.rec.stopList !== true);
   const floorZones = photoZoneGroups().groups.get(String(meta.floor)) || [];
   const root = h('main', { class: 'screen' }, header('Результат проверки', { showBack: false }));
   const list = h('div', { class: 'photo-run-list' });
   const totalBox = h('section', { class: 'photo-run-total' });
   const noteBox = h('div', { class: 'photo-run-notes' });
+  const stopBox = h('div', { class: 'photo-stop-results' });
 
   const levelOf = it => (it.v ? (it.v.zone === PHOTO_ZONE_UNKNOWN ? 'unclear' : (it.v.level || 'unclear')) : 'pending');
   const hasZone = it => !!(it.v && it.v.zone && it.v.zone !== PHOTO_ZONE_UNKNOWN);
@@ -1514,12 +1612,49 @@ function screenPhotoRunSummary(records, verdicts, meta) {
         it.picker ? zonePicker(it) : null));
   }
 
+  function stopCardEl() {
+    const it = stopItems[0];
+    if (!it) return null;
+    const v = it.v;
+    const sl = v && v.stoplist;
+    const pending = !v;
+    const ok = !!(sl && sl.ok);
+    const positions = sl && Array.isArray(sl.stop) ? sl.stop.length : 0;
+    const zeroStock = sl && Array.isArray(sl.stop) ? sl.stop.filter(x => x.origin === 'stock').length : 0;
+    const kitchen = sl && Array.isArray(sl.excluded) ? sl.excluded.length : 0;
+    const reason = (sl && sl.reason) || (v && v.error) || 'неизвестная причина';
+    return h('section', { class: 'photo-stop-result' + (pending ? ' pending' : ok ? ' ok' : ' bad') },
+      h('div', { class: 'photo-stop-result-head' },
+        h('b', {}, 'Стоп-лист · ' + floorLabel(it.rec.floor || meta.stopFloor || '1')),
+        h('span', { class: 'photo-hist-badge ' + (pending ? 'pending' : ok ? 'stoplist' : 'unclear') },
+          pending ? 'распознаём' : ok ? 'распознан' : 'не распознан')),
+      pending
+        ? h('p', { class: 'photo-stop-result-text' }, 'Распознаём позиции…')
+        : null,
+      ok
+        ? h('p', { class: 'photo-stop-result-text' },
+            'распознано ' + positions + ' ' + stopPositionsWord(positions) + ', из них по нулевому остатку ' +
+            zeroStock + ', кухня отсечена ' + kitchen + '.')
+        : (!pending ? h('p', { class: 'photo-stop-result-text' }, 'Не удалось распознать: ' + reason) : null),
+      h('div', { class: 'photo-stop-result-actions' },
+        !pending && !ok
+          ? h('button', {
+              class: 'secondary', type: 'button',
+              onclick: () => go(screenStopListManual, it.rec.floor || meta.stopFloor || '1'),
+            }, 'Ввести позицию вручную')
+          : null,
+        h('button', { class: 'link', type: 'button', onclick: () => go(screenStopList) }, 'Открыть стоп-лист')));
+  }
+
   function draw() {
-    list.replaceChildren(...items.map(rowEl));
-    const crit = items.filter(it => levelOf(it) === 'crit').length;
-    const warn = items.filter(it => levelOf(it) === 'warn').length;
-    const pending = items.filter(it => !it.v).length;
-    const unknown = items.filter(it => it.v && !hasZone(it)).length;
+    list.replaceChildren(...zoneItems.map(rowEl));
+    // Проход без кадров зон (только стоп-лист): итог по чистоте не показываем.
+    totalBox.hidden = zoneItems.length === 0;
+    noteBox.hidden = zoneItems.length === 0;
+    const crit = zoneItems.filter(it => levelOf(it) === 'crit').length;
+    const warn = zoneItems.filter(it => levelOf(it) === 'warn').length;
+    const pending = zoneItems.filter(it => !it.v).length;
+    const unknown = zoneItems.filter(it => it.v && !hasZone(it)).length;
 
     totalBox.className = 'photo-run-total ' + (crit ? 'crit' : warn ? 'warn' : 'ok');
     let totalText;
@@ -1535,12 +1670,13 @@ function screenPhotoRunSummary(records, verdicts, meta) {
     totalBox.replaceChildren(
       h('p', { class: 'photo-run-total-title' }, totalText),
       h('p', { class: 'photo-run-total-meta' },
-        floorLabel(meta.floor || '1') + ' · кадров: ' + records.length +
-        (items.filter(it => it.v && it.v.zoneAuto).length ? ' · зоны определил ИИ' : '')));
+        floorLabel(meta.floor || '1') + ' · кадров: ' + zoneItems.length +
+        (stopItems.length ? ' · стоп-лист: ' + stopItems.length : '') +
+        (zoneItems.filter(it => it.v && it.v.zoneAuto).length ? ' · зоны определил ИИ' : '')));
 
     // Две фотографии одной зоны: обе сохраняются, но бармен должен знать.
     const counts = new Map();
-    items.forEach(it => {
+    zoneItems.forEach(it => {
       if (!hasZone(it)) return;
       counts.set(it.v.zone, (counts.get(it.v.zone) || 0) + 1);
     });
@@ -1548,12 +1684,15 @@ function screenPhotoRunSummary(records, verdicts, meta) {
     noteBox.replaceChildren(...dup.map(([zone, n]) =>
       h('p', { class: 'photo-run-note' },
         (n === 2 ? 'две фотографии одной зоны' : n + ' фотографии одной зоны') + ': ' + zone)));
+    const card = stopCardEl();
+    stopBox.replaceChildren(...(card ? [card] : []));
   }
 
   draw();
   root.append(
     h('section', { class: 'photo-step' }, totalBox, noteBox),
     list,
+    stopBox,
     h('div', { class: 'photo-verdict-actions' },
       h('button', { class: 'primary', onclick: () => resetTo(screenHome) }, 'Готово'),
       h('button', { class: 'link', onclick: () => go(screenPhotoHistory) }, 'История снимков')));

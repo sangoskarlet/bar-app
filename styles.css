@@ -752,6 +752,44 @@ textarea { margin-top: 16px; resize: vertical; }
   background: var(--panel-2); font-size: 13.5px; line-height: 1.35;
 }
 
+/* Стоп-лист на экране съёмки: отдельный снимок, свой этаж */
+.photo-stop-wrap { margin-top: 18px; }
+.photo-stop-wrap[hidden] { display: none; }
+.photo-stop-block {
+  padding: 14px; background: var(--panel); border: 1px solid var(--line);
+  border-left: 4px solid var(--muted); border-radius: var(--radius);
+}
+.photo-stop-block[hidden] { display: none; }
+.photo-stop-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
+.photo-stop-head .label { margin: 0; }
+.photo-stop-floor { margin: 4px 0 0; color: var(--muted); font-size: 14px; line-height: 1.35; }
+.photo-stop-floor b { color: var(--text); }
+.photo-stop-floor-change { padding: 0 2px; font-size: 13px; }
+.photo-stop-badge { font-size: 11px; color: var(--muted); white-space: nowrap; padding-top: 2px; }
+.photo-stop-choose { display: flex; gap: 8px; margin-top: 10px; }
+.photo-stop-choose .secondary { flex: 1; margin-top: 0; min-height: 48px; font-size: 15px; }
+.photo-stop-choose[hidden] { display: none; }
+.photo-stop-preview .photo-shot-slot { max-width: 132px; }
+.photo-stop-floors { margin-top: 8px; }
+.photo-stop-floors[hidden] { display: none; }
+.photo-stop-hint { margin: 8px 0 0; line-height: 1.4; }
+
+/* Итог стоп-листа на экране результата */
+.photo-stop-results:empty { display: none; }
+.photo-stop-result {
+  margin-top: 14px; padding: 14px 16px; background: var(--panel);
+  border: 1px solid var(--line); border-left: 4px solid var(--muted); border-radius: var(--radius);
+}
+.photo-stop-result.ok { border-left-color: var(--ok); }
+.photo-stop-result.bad { border-left-color: var(--bad); }
+.photo-stop-result.pending { border-left-color: var(--accent); }
+.photo-stop-result-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+.photo-stop-result-head b { font-size: 16px; }
+.photo-stop-result-text { margin: 8px 0 0; font-size: 14px; line-height: 1.4; overflow-wrap: anywhere; }
+.photo-stop-result-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 10px; }
+.photo-stop-result-actions .secondary { margin-top: 0; min-height: 42px; font-size: 14px; }
+.photo-stop-result-actions .link { font-size: 14px; }
+
 /* История: одна смена = одна запись с кадрами прохода */
 .photo-run-group { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
 .photo-run-group-row {

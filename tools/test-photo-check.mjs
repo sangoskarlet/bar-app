@@ -89,6 +89,9 @@ const state = {
   fetchCalls: [],
   fetchHandler: null,
   driveFiles: new Map(),
+  driveByName: new Map(),     // имя файла → [fakeFile]
+  driveFoldersByName: new Map(),
+  folderFiles: new Map(),     // id папки → [fakeFile]
   uploaded: [],
   photoSheet: null,
   refsSheet: null,
@@ -98,16 +101,25 @@ const state = {
   log: [],
 };
 
+/** Итератор Drive: hasNext/next. */
+function fakeIterator(items) {
+  let i = 0;
+  return { hasNext: () => i < items.length, next: () => items[i++] };
+}
+
 /** Файл «на Диске» для createFile/getFileById. */
 function fakeFile(id, name, bytes, mime) {
   const f = {
-    id, name, bytes: Uint8Array.from(bytes || []), mime: mime || 'image/jpeg',
+    id, name, bytes: Uint8Array.from(bytes || []),
+    mime: mime || (/\.png$/i.test(name) ? 'image/png' : 'image/jpeg'),
     getId() { return this.id; },
     getName() { return this.name; },
+    getMimeType() { return this.mime; },
+    getSize() { return this.bytes.length; },
     setName(v) { this.name = v; return this; },
     getUrl() { return 'https://drive.google.com/file/d/' + this.id + '/view'; },
     getBlob() { return { getContentType: () => f.mime, getBytes: () => Uint8Array.from(f.bytes) }; },
-    getThumbnail() { return null; },
+    getThumbnail() { return this.thumb === false ? null : { getContentType: () => 'image/jpeg', getBytes: () => Uint8Array.from(f.bytes) }; },
   };
   return f;
 }
@@ -117,7 +129,8 @@ function fakeFolder(id, name) {
   return {
     getId: () => id,
     getName: () => name,
-    getFoldersByName: () => ({ hasNext: () => false, next: () => null }),
+    getFiles: () => fakeIterator(state.folderFiles.get(id) || []),
+    getFoldersByName: () => fakeIterator([]),
     createFolder: (child) => fakeFolder('folder-' + child, child),
     createFile: (blob) => {
       const f = fakeFile('file-' + (++n) + '-' + Date.now(), blob.name || 'x.jpg',
@@ -175,6 +188,8 @@ const sandbox = {
     },
     getFolderById: (id) => fakeFolder(id, 'root'),
     createFolder: (name) => fakeFolder('created-' + name, name),
+    getFilesByName: (name) => fakeIterator(state.driveByName.get(name) || []),
+    getFoldersByName: (name) => fakeIterator(state.driveFoldersByName.get(name) || []),
   },
   SpreadsheetApp: {
     openById: () => ({
@@ -1131,6 +1146,80 @@ test('photoRecheck: чужая зона, чужое фото и чужой PIN �
     ['Пётр', '5678', 'бармен', true],
   ]);
   assert.match(sandbox.photoRecheck_({ id, zone: 'Бар', name: 'Пётр', pin: '5678' }).error, /другого сотрудника/);
+});
+
+// ---------- 4d. Эталоны: имена файлов, папки, вариант A ----------
+const constVal = name => vm.runInContext(name, sandbox);
+
+test('эталон по имени файла: с расширением, без него и по ссылке', () => {
+  const bar = fakeFile('refbarFILE0000000000001', '1_этаж_Бар.jpg', [1], 'image/jpeg');
+  state.driveByName.set('1_этаж_Бар.jpg', [bar]);
+  console.log('DBG1', JSON.stringify(sandbox.photoRefFiles_('1_этаж_Бар.jpg', 1)), JSON.stringify(bar.getId()), typeof bar.getMimeType);
+  assert.equal(sandbox.photoRefFiles_('1_этаж_Бар.jpg', 1)[0].fileId, 'refbarFILE0000000000001');
+  assert.equal(sandbox.photoRefFiles_('"1_этаж_Бар.jpg"', 1)[0].fileId, 'refbarFILE0000000000001');
+  state.driveFiles.set('refbarFILE0000000000001', { bytes: [1], mime: 'image/jpeg' });
+
+  const holo = fakeFile('refholoFILE000000000001', '1_этаж_холодильники', [2], 'image/jpeg');
+  state.driveByName.set('1_этаж_холодильники', [holo]);
+  assert.equal(sandbox.photoRefFiles_('1_этаж_холодильники', 1)[0].fileId, 'refholoFILE000000000001');
+
+  assert.equal(
+    sandbox.photoRefFiles_('https://drive.google.com/file/d/refbarFILE0000000000001/view', 1)[0].fileId,
+    'refbarFILE0000000000001');
+  // Несуществующее имя — пусто, без падения.
+  assert.deepEqual(JSON.parse(JSON.stringify(sandbox.photoRefFiles_('нет-такого-файла-123.jpg', 1))), []);
+});
+
+test('эталон-папка: берём до трёх картинок из папки', () => {
+  const folderId = 'folderPHOTOS0000000001';
+  state.folderFiles.set(folderId, [
+    fakeFile('imgA00000000000000000001', 'a.jpg', [1]),
+    fakeFile('imgB00000000000000000002', 'b.jpg', [2]),
+    fakeFile('imgC00000000000000000003', 'c.jpg', [3]),
+    fakeFile('imgD00000000000000000004', 'd.jpg', [4]),
+  ]);
+  const files = sandbox.photoRefFiles_(folderId, 3);
+  assert.equal(files.length, 3);
+  assert.equal(files[0].fileId, 'imgA00000000000000000001');
+});
+
+test('photoCheckRefs_: имя файла из «Эталонов уборки» попадает в проверку', () => {
+  zoneFixture();
+  state.refsSheet = new FakeSheet(['этаж', 'зона', 'критерии', 'эталонное_фото'], [
+    ['1', 'Бар', 'Стойка сухая.', '1_этаж_Бар_проверка.jpg'],
+  ]);
+  state.refPhotosSheet = new FakeSheet(REF_PHOTO_HEADERS);
+  state.driveByName.set('1_этаж_Бар_проверка.jpg', [
+    fakeFile('refbarCHECK00000000001', '1_этаж_Бар_проверка.jpg', [9]),
+  ]);
+  const got = sandbox.photoCheckRefs_(ss(), 'Бар');
+  assert.equal(got.list.length, 1);
+  assert.equal(got.list[0].fileId, 'refbarCHECK00000000001');
+  assert.equal(got.ref.what, 'Стойка сухая.');
+});
+
+test('вариант A: промпт с эталонами, по одному на зону, фото первым', () => {
+  const p = sandbox.buildPhotoZoneRefsPrompt_('1', [{ zone: 'Бар' }, { zone: 'Холодильники' }]);
+  assert.match(p, /изображении 1 — фото смены/);
+  assert.match(p, /«Бар» — эталон: изображение 2/);
+  assert.match(p, /«Холодильники» — эталон: изображение 3/);
+  assert.match(p, /ТОЛЬКО из списка/);
+  assert.match(p, /ниже 0.3/);
+  assert.match(p, /ТОЛЬКО JSON/);
+  // В бою выбран текстовый вариант (B): замер — в docs/photo-run/ОТЧЁТ.md.
+  assert.equal(String(constVal('PHOTO_ZONE_MODE')), 'text');
+});
+
+test('writePhotoRun_: проход и зона пишутся в T–V отдельно от вердикта', () => {
+  const sheet = new FakeSheet(PHOTO_FULL_HEADERS);
+  sandbox.writePhotoRun_(sheet, 2, { runId: 'run-stop-1', zoneAuto: 'нет', zoneConfidence: 0.42 });
+  assert.equal(sheet.get(2, 20), 'run-stop-1');
+  assert.equal(sheet.get(2, 21), 'нет');
+  assert.equal(sheet.get(2, 22), 0.42);
+  // Пустая уверенность — пустая ячейка, а не 0.
+  sandbox.writePhotoRun_(sheet, 3, { runId: '', zoneAuto: 'нет', zoneConfidence: '' });
+  assert.equal(sheet.get(3, 20), '');
+  assert.equal(sheet.get(3, 22), '');
 });
 
 // ---------- итог ----------
